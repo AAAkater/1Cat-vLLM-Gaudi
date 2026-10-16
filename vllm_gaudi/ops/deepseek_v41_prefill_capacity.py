@@ -10,7 +10,7 @@ PREFILL_COMPUTE_BUCKETS = (16384, 8192, 4096, 2048, 1024, 512, 256, 128)
 def prefill_capacity(scheduler_tokens, tensor_parallel_size=4):
     if scheduler_tokens < 1:
         raise ValueError("Prefill scheduler capacity must be positive")
-    maximum = MAX_PREFILL_TOKENS if tensor_parallel_size == 4 else DEFAULT_PREFILL_TOKENS
+    maximum = MAX_PREFILL_TOKENS if tensor_parallel_size in (4, 8) else DEFAULT_PREFILL_TOKENS
     return min(int(scheduler_tokens), maximum)
 
 

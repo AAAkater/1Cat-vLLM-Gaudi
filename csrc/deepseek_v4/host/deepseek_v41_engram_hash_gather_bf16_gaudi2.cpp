@@ -140,7 +140,7 @@ DeepseekV41EngramHashGatherBf16Gaudi2::GetGcDefinitions(
         return tpc_lib_api::GLUE_INCOMPATIBLE_INPUT_SIZE;
     }
     const auto localHeads = inDefs->outputTensors[0].geometry.maxSizes[1];
-    const auto heads = localHeads == 6 ? 6 : kHeads;
+    const auto heads = (localHeads == 3 || localHeads == 6) ? localHeads : kHeads;
     if (!HasShape2(inDefs->outputTensors[0], kWeightWidth, heads) ||
         !HasShape2(inDefs->outputTensors[1], kHistory, 1)) {
         SetShape2(inDefs->outputTensors[0], kWeightWidth, heads);

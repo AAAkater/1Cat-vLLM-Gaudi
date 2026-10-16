@@ -202,7 +202,7 @@ def tp_full_prefill_index_selection(
     """
     tokens = positions.numel()
     if (
-        tensor_parallel_size not in (2, 4)
+        tensor_parallel_size not in (2, 4, 8)
         or ratio not in (1, 2)
         or not 0 <= tp_rank < tensor_parallel_size
         or tokens < 1
@@ -332,7 +332,7 @@ def tp_prefill_reindex_selection(
     """Split independent candidate-slot selection and gather only final IDs."""
     tokens = positions.numel()
     if (
-        tensor_parallel_size not in (2, 4)
+        tensor_parallel_size not in (2, 4, 8)
         or ratio not in (1, 2)
         or not 0 <= tp_rank < tensor_parallel_size
         or tokens < 1
@@ -451,7 +451,7 @@ def _decoded_source_scores(query, weights, keys, positions, ratio, local_heads, 
         if count % 128:
             current = torch.cat((current, current.new_zeros((128 - count % 128, 128))), 0)
         if native_scores:
-            if local_heads not in (8, 16) or query.shape[1:] != (32, 128):
+            if local_heads not in (4, 8, 16) or query.shape[1:] != (32, 128):
                 raise ValueError("Native Reindex scoring requires the TP2/TP4 head contract")
             rows = torch.arange(source_start + start, source_start + start + current.shape[0],
                                 device=query.device, dtype=torch.int32)

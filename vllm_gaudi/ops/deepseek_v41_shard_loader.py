@@ -27,10 +27,10 @@ class PreparedV41Shard:
         tp_size = manifest.get("tensor_parallel_size")
         pp_size = manifest.get("pipeline_parallel_size")
         expected_ranges = [[0, 40]] if pp_size == 1 else [[0, 20], [20, 40]] if pp_size == 2 else None
-        if ((tp_size, pp_size) not in ((2, 2), (4, 1)) or not 0 <= pp_rank < pp_size or not 0 <= tp_rank < tp_size
+        if ((tp_size, pp_size) not in ((2, 2), (4, 1), (8, 1)) or not 0 <= pp_rank < pp_size or not 0 <= tp_rank < tp_size
                 or manifest["pp_layer_ranges"] != expected_ranges
                 or manifest["prepared_layout_version"] != LAYOUT_VERSION):
-            raise ValueError("Prepared V4.1 topology or layout version mismatch (expected TP4 x PP1; TP2 x PP2 legacy)")
+            raise ValueError("Prepared V4.1 topology or layout version mismatch (expected TP8/TP4 x PP1; TP2 x PP2 legacy)")
         if canonical_hash(self.plan) != manifest["plan_fingerprint"]:
             raise ValueError("Prepared plan differs from the published manifest")
         for key in ("model_revision", "quantization_fingerprint", "upstream_lock_sha256", "tensor_parallel_size",

@@ -154,7 +154,7 @@ class HPUWorker(WorkerBase):
             if self.profiler_summary_only:
                 raise ValueError("Raw Synapse capture requires offline parsing, not a Kineto summary")
             self.profiler = NativeTrace(
-                cpu_trace_dir=self.torch_profiler_dir if self.parallel_config.tensor_parallel_size == 4 else None,
+                cpu_trace_dir=self.torch_profiler_dir if self.parallel_config.tensor_parallel_size in (4, 8) else None,
                 scope_only=os.getenv("VLLM_HPU_DSV41_RAW_SCOPE_ONLY", "0") == "1",
             )
             return
@@ -355,13 +355,13 @@ class HPUWorker(WorkerBase):
                 stats["execution_path"] = (
                     "native_replay"
                     if owner is not None
-                    else "prepared_n256_tp4"
-                    if self.parallel_config.tensor_parallel_size == 4
+                    else f"prepared_n256_tp{self.parallel_config.tensor_parallel_size}"
+                    if self.parallel_config.tensor_parallel_size in (4, 8)
                     else "prepared_compiled"
                 )
                 stats["compiled_stage"] = self.model_runner.model.ordinary.audit
                 stats["compiled_input_calls"] = self.model_runner.model.compiled_input_calls
-                if self.parallel_config.tensor_parallel_size == 4:
+                if self.parallel_config.tensor_parallel_size in (4, 8):
                     program = self.model_runner.model.program
                     stats["tp4_decode_control"] = {
                         "groups": [
@@ -451,10 +451,10 @@ class HPUWorker(WorkerBase):
                             raise RuntimeError("Startup never executed its complete native decode stage")
                         if stats["tp4_direct_group_replays"]:
                             raise RuntimeError("Native stage startup used a per-group decode fallback")
-                    elif self.parallel_config.tensor_parallel_size == 4 and (
+                    elif self.parallel_config.tensor_parallel_size in (4, 8) and (
                         not stats["compiled_stage"]["calls"] or not stats["compiled_input_calls"]
                     ):
-                        raise RuntimeError("TP4 startup never executed its compiled decode stage")
+                        raise RuntimeError("TP-only startup never executed its compiled decode stage")
                 stats["moe"] = {
                     "n256_fp8_decode": gaudi_envs.VLLM_HPU_DSV41_EXPERT_N256_FP8,
                     "fused_quant": gaudi_envs.VLLM_HPU_DSV41_EXPERT_FUSED_QUANT,
@@ -534,8 +534,10 @@ class HPUWorker(WorkerBase):
 
             prepare_native_libraries()
             modules = os.environ["HABANA_VISIBLE_MODULES"].split(",")
-            if len(modules) != 4 or device_index >= len(modules):
-                raise RuntimeError("V4.1 requires four explicitly assigned HPU modules")
+            expected_devices = self.parallel_config.tensor_parallel_size * self.parallel_config.pipeline_parallel_size
+            if (len(modules) != expected_devices or len(set(modules)) != expected_devices
+                    or not 0 <= device_index < len(modules)):
+                raise RuntimeError(f"V4.1 requires {expected_devices} distinct explicitly assigned HPU modules")
             os.environ["HLS_MODULE_ID"] = modules[device_index]
             if "{rank}" in os.environ.get("PT_HPU_RECIPE_CACHE_CONFIG", ""):
                 os.environ["PT_HPU_RECIPE_CACHE_CONFIG"] = os.environ["PT_HPU_RECIPE_CACHE_CONFIG"].replace(

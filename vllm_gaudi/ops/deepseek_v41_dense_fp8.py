@@ -25,8 +25,8 @@ def projection_prefix(layer, projection):
 
 
 def shapes_for_tp(tp_size, projections=None):
-    if tp_size not in (2, 4):
-        raise ValueError("Dense FP8 preparation requires TP2 or TP4")
+    if tp_size not in (2, 4, 8):
+        raise ValueError("Dense FP8 preparation requires TP2, TP4 or TP8")
     shapes = {"wq_b": (32768 // tp_size, 1280), "wo_b": (5120, 8192 // tp_size),
               "wq_a": (1280, 5120), "wkv": (512, 5120),
               "shared_w1": (2304 // tp_size, 5120), "shared_w3": (2304 // tp_size, 5120),

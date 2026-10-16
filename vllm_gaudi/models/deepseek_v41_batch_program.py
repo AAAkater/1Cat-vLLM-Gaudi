@@ -14,7 +14,7 @@ class PreparedBatchLayerGroup(nn.Module):
             raise ValueError("Request batches use ordinary decode, not draft positions")
         self.layers = nn.ModuleList(list(stage.layers[start:stop]))
         self.input = PreparedInput(stage.weights.embed, stage.tp_rank, stage.reduce) if text_input else None
-        self.final = stage.pp_rank == 1 and stop == len(stage.layers)
+        self.final = getattr(stage, "is_last_stage", stage.pp_rank == 1) and stop == len(stage.layers)
         self.norm = stage.weights.norm if self.final else None
         config = stage.config["text_config"]
         self.eps = config["rms_norm_eps"]
@@ -56,7 +56,7 @@ class CompiledBatchStage:
     """Finite batch shapes; request lengths and page mappings remain inputs.
 
     The outer native replay owns capture/submission. This class only provides
-    the five four-layer recipes and their explicit inter-group tensors.
+    the owned four-layer recipes and their explicit inter-group tensors.
     """
 
     def __init__(self, stage, *, text_input=False, group_size=4, backend="hpu_backend"):

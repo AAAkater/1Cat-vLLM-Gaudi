@@ -13,7 +13,7 @@ using Pair = std::tuple<at::Tensor, at::Tensor>;
 habana::OutputMetaDataVector meta(const at::Stack& stack, bool quant) {
     const auto x = stack.at(0).toTensor();
     TORCH_CHECK(x.scalar_type() == at::kBFloat16 && x.dim() == 2 && x.size(0) >= 1 && x.size(0) <= 16384 &&
-                (x.size(1) == 576 || x.size(1) == 1152 || x.size(1) == 2048 || x.size(1) == 1280 ||
+                (x.size(1) == 576 || x.size(1) == 1024 || x.size(1) == 1152 || x.size(1) == 2048 || x.size(1) == 1280 ||
                  x.size(1) == 4096 || x.size(1) == 5120 || x.size(1) == 6144),
                 "Dense FP8 requires a supported block32-aligned BF16 input");
     for (const auto& item : stack) {
@@ -25,8 +25,8 @@ habana::OutputMetaDataVector meta(const at::Stack& stack, bool quant) {
     const auto w = stack.at(1).toTensor(), scale = stack.at(2).toTensor();
     TORCH_CHECK(w.dim() == 2, "Dense FP8 requires a matrix weight");
     const auto n = w.size(0);
-    TORCH_CHECK((x.size(1) == 1280 && (n == 8192 || n == 16384)) ||
-                ((x.size(1) == 576 || x.size(1) == 1152 || x.size(1) == 2048 || x.size(1) == 4096) && n == 5120) ||
+    TORCH_CHECK((x.size(1) == 1280 && (n == 4096 || n == 8192 || n == 16384)) ||
+                ((x.size(1) == 576 || x.size(1) == 1024 || x.size(1) == 1152 || x.size(1) == 2048 || x.size(1) == 4096) && n == 5120) ||
                 (x.size(1) == 6144 && n == 25600) ||
                 (x.size(1) == 5120 && (n == 512 || n == 576 || n == 1152 || n == 1280 || n == 1792 || n == 2304)),
                 "Dense FP8 weight does not match the prepared TP projection");

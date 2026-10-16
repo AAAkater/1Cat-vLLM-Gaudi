@@ -44,7 +44,7 @@ habana::OutputMetaDataVector metadata(const at::Stack& s) {
                 (offset==-1 || (offset>=0 && offset%512==0 && offset<=decoded.size(0)-512)),
                 "Q/KV publication requires positive normal epsilon and aligned decoded offset");
     TORCH_CHECK(w.scalar_type()==at::ScalarType::Float8_e4m3fn && w.dim()==2 &&
-                (w.size(0)==8192 || w.size(0)==16384) && w.size(1)==1280 &&
+                (w.size(0)==4096 || w.size(0)==8192 || w.size(0)==16384) && w.size(1)==1280 &&
                 scale.scalar_type()==at::kFloat && scale.sizes()==at::IntArrayRef({1,w.size(0)}),
                 "Q/KV publication requires prepared FP8 Q projection with TP-local channel scales");
     return {{at::kBFloat16,{rows,w.size(0)}},{at::kBFloat16,{rows,512}},

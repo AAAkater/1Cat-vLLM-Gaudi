@@ -12,7 +12,7 @@ tpc_lib_api::GlueCodeReturn DeepseekV41PrefillQScaleRopeGaudi2::GetGcDefinitions
     if (p->inputTensorNr != 5) return GLUE_INCOMPATIBLE_INPUT_COUNT;
     if (p->outputTensorNr != 1) return GLUE_INCOMPATIBLE_OUTPUT_COUNT;
     const auto& y = p->outputTensors[0].geometry;
-    if (y.dims != 2 || y.dataType != DATA_BF16 || (y.maxSizes[0] != 8192 && y.maxSizes[0] != 16384) ||
+    if (y.dims != 2 || y.dataType != DATA_BF16 || (y.maxSizes[0] != 4096 && y.maxSizes[0] != 8192 && y.maxSizes[0] != 16384) ||
         y.maxSizes[1] < 1 || y.maxSizes[1] > 16384) return GLUE_INCOMPATIBLE_OUTPUT_SIZE;
     const unsigned tokens = y.maxSizes[1];
     for (unsigned i = 0; i < 5; ++i) {

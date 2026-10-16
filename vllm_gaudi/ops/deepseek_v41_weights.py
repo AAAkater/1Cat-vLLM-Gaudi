@@ -305,8 +305,8 @@ def build_plan(catalog: dict[str, TensorSource],
                layers_per_stage=20,
                tensor_parallel_size=2,
                pipeline_parallel_size=2):
-    if (tensor_parallel_size, pipeline_parallel_size) not in ((2, 2), (4, 1)):
-        raise ValueError("The prepared V4.1 path supports TP4 x PP1 or legacy TP2 x PP2")
+    if (tensor_parallel_size, pipeline_parallel_size) not in ((2, 2), (4, 1), (8, 1)):
+        raise ValueError("The prepared V4.1 path supports TP8/TP4 x PP1 or legacy TP2 x PP2")
     ranks = {(pp, tp): {} for pp in range(pipeline_parallel_size) for tp in range(tensor_parallel_size)}
     groups = {}
     host_tables = {}
@@ -366,7 +366,7 @@ def build_plan(catalog: dict[str, TensorSource],
         for projection, n, k in (("w13", local_rows * 2, hidden), ("w2", hidden, local_rows)):
             # Gate and up are independently padded before concatenation.
             # Their split must coincide with W2's padded K, including TP4's
-            # 576 logical channels stored as 640 channels per projection.
+            # 576 logical channels stored as 640, or TP8's 288 stored as 384.
             blocks = (2 * math.ceil(local_rows / ROW_BLOCK) if projection == "w13" else math.ceil(n / ROW_BLOCK))
             padded_k = math.ceil(k / K_BLOCK) * K_BLOCK
             for kind, dtype, stream in (("q16", "I16", (padded_k // 2) * 64), ("s16", "BF16",

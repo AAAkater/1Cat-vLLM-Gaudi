@@ -26,7 +26,10 @@ def full_index_mme_select(query,
                           capacity,
                           publish_candidates=False,
                           key_ready=None,
-                          tiled_keys=False):
+                          tiled_keys=False,
+                          local_heads=16):
+    if local_heads not in (4, 8, 16):
+        raise ValueError("Full MME requires TP2/TP4/TP8 head groups")
     if ratio not in (1, 2) or capacity < FULL_MME_PREFIX_TOKENS // ratio:
         raise ValueError("Full MME scoring requires ratio 1/2 and the complete bounded prefix")
     ops = torch.ops.custom_op

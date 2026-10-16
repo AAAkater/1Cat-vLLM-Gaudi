@@ -13,7 +13,7 @@ using Outputs=std::tuple<at::Tensor,at::Tensor,at::Tensor,at::Tensor,at::Tensor>
 habana::OutputMetaDataVector meta(const at::Stack& s) {
     TORCH_CHECK(s.size()==7,"Peer post/norm requires its complete operands");
     const auto x=s[0].toTensor(),r=s[1].toTensor();
-    TORCH_CHECK(x.dim()==3 && (x.size(0)==1 || x.size(0)==2 || x.size(0)==4) &&
+    TORCH_CHECK(x.dim()==3 && (x.size(0)==1 || x.size(0)==2 || x.size(0)==4 || x.size(0)==8) &&
                 (x.size(1)>=1 && x.size(1)<=6) && x.size(2)==5120 && r.sizes()==at::IntArrayRef({x.size(1),4,5120}),
                 "Peer post/norm requires TP-parametric [P,C,5120] and C1-C6 residual");
     for(int i=0;i<6;++i) {

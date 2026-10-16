@@ -16,7 +16,7 @@ habana::OutputMetaDataVector metadata(const at::Stack& stack, bool reduce_only) 
     const auto rows = stack[reduce_only ? 3 : 4].toTensor();
     const auto ratio = stack[stack.size() - 2].toInt();
     const auto local_heads = stack.back().toInt();
-    TORCH_CHECK(local_heads == 8 || local_heads == 16, "Index requires TP2/TP4 head groups");
+    TORCH_CHECK(local_heads == 4 || local_heads == 8 || local_heads == 16, "Index requires TP2/TP4 head groups");
     TORCH_CHECK(x.scalar_type() == at::kBFloat16 && x.dim() == 3 &&
                 x.size(0) >= 1 && x.size(0) <= 16384 && x.size(1) == 32,
                 "Prefill index requires BF16 [T,32,K] with T1..16384");

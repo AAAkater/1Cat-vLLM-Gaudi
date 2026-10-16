@@ -47,23 +47,29 @@ _library.define("pp_exchange_peer_graph(Tensor partial) -> Tensor")
 _library.define("tp2_allreduce_plain(Tensor partial) -> Tensor")
 _library.define("tp4_allreduce_plain(Tensor partial) -> Tensor")
 _library.define("tp4_allgather_plain(Tensor partial) -> Tensor")
+_library.define("tp8_allreduce_plain(Tensor partial) -> Tensor")
+_library.define("tp8_allgather_plain(Tensor partial) -> Tensor")
 
 
 def initialize_tp4_allreduce_runtime():
-    """Bind the existing queued adapter to a verified four-rank communicator."""
+    """Bind the queued adapter to a verified four- or eight-rank communicator."""
     if getattr(torch, _TP4_RUNTIME_ATTR, None) is not None:
         return
     group = get_tp_group().device_group
-    if dist.get_world_size(group) != 4:
-        raise RuntimeError("TP4 native AllReduce requires a four-rank tensor group")
+    tp_size = dist.get_world_size(group)
+    if tp_size not in (4, 8):
+        raise RuntimeError("Native stock collectives require a four- or eight-rank tensor group")
     path = Path(os.environ["VLLM_HPU_TP2_FUSED_AR_NORM_BRIDGE"]).resolve()
     bridge = _load_bridge(path)
     _verify_prepared_runtime(path)
     if not hasattr(bridge, "tp4_allreduce_current_stream"):
         raise RuntimeError("Rebuild the queued adapter with the TP4 AllReduce entry")
+    if tp_size == 8 and not (hasattr(bridge, "native_tp8_decode_graph_available")
+                             and bridge.native_tp8_decode_graph_available()):
+        raise RuntimeError("TP8 requires the matching eight-rank bridge and HCL runtime")
     probe = torch.ones(128, dtype=torch.bfloat16, device="hpu")
     dist.all_reduce(probe, group=group)
-    if not torch.equal(probe.cpu(), torch.full((128,), 4, dtype=torch.bfloat16)):
+    if not torch.equal(probe.cpu(), torch.full((128,), tp_size, dtype=torch.bfloat16)):
         raise RuntimeError("TP4 native communicator initialization failed")
     backend = group._get_backend(torch.device("hpu"))
     setattr(torch, _TP4_RUNTIME_ATTR, (bridge, backend, bridge.communicator_id(backend)))
@@ -203,6 +209,9 @@ def initialize_tp2_fused_ar_norm_runtime() -> None:
 
     log.info("TP2 prepared runtime: loading native adapter")
     bridge = _load_bridge(bridge_path)
+    if tp_size == 8 and not (hasattr(bridge, "native_tp8_decode_graph_available")
+                             and bridge.native_tp8_decode_graph_available()):
+        raise RuntimeError("TP8 requires the matching eight-rank bridge and HCL runtime")
     bridge.set_use_tensor_ids(use_tensor_ids == "1")
     backend = tp_group._get_backend(torch.device("hpu"))
     communicator_id = bridge.communicator_id(backend)
@@ -555,11 +564,15 @@ def _tp_peer_allgather_fake(partial, tp_size):
 
 def _tp_peer_allgather_impl(partial, tp_size):
     bridge, backend, _ = _resolve_runtime()
-    # Match the opt-in DSpark bridge's existing full-vocabulary C6 wire.
-    # Its expanded capacity is currently registered only for a four-rank
-    # group; ordinary peer exchange and C1 retain their original limit.
-    maximum = (387840 if tp_size == 4 and
-               os.environ.get("VLLM_HPU_DSV41_DSPARK_LARGE_HCCL") == "1" else 32768)
+    # Larger TP4 request batches need one hidden row per active lane. The
+    # bridge declares its actual bound so an older binary fails before DMA.
+    maximum = 32768
+    if tp_size in (4, 8):
+        if os.environ.get("VLLM_HPU_DSV41_BATCH_DECODE", "0").lower() in ("1", "true"):
+            maximum = 64 * 5120
+        if os.environ.get("VLLM_HPU_DSV41_DSPARK_LARGE_HCCL") == "1":
+            maximum = max(maximum, 387840)
+        maximum = min(maximum, getattr(bridge, "tp4_peer_max_elements", 32768))
     if (partial.ndim != 2 or partial.shape[0] != 1 or not 0 < partial.numel() <= maximum
             or partial.dtype != torch.bfloat16 or not partial.is_contiguous()
             or backend.size() != tp_size):
@@ -798,3 +811,34 @@ def tp2_allreduce_residual_rms_norm(
         communicator_id,
     )
     return packed[0], packed[1]
+
+
+def _tp8_allreduce_plain_impl(partial):
+    runtime = getattr(torch, _TP4_RUNTIME_ATTR, None)
+    if runtime is None or runtime[1].size() != 8:
+        raise RuntimeError("TP8 reduction requires the verified eight-rank runtime")
+    if (partial.ndim != 2 or partial.shape[0] != 1 or partial.numel() % 8
+            or not 0 < partial.numel() <= 32768 or partial.dtype != torch.bfloat16
+            or not partial.is_contiguous()):
+        raise RuntimeError("TP8 reduction requires a bounded, contiguous BF16 row")
+    return runtime[0].tp4_allreduce_current_stream(runtime[1], partial, torch.empty_like(partial))
+
+
+def _tp8_allgather_plain_fake(partial):
+    return torch.empty((1, partial.numel() * 8), dtype=partial.dtype, device=partial.device)
+
+
+def _tp8_allgather_plain_impl(partial):
+    runtime = getattr(torch, _TP4_RUNTIME_ATTR, None)
+    if runtime is None or runtime[1].size() != 8:
+        raise RuntimeError("TP8 gather requires the verified eight-rank runtime")
+    if (partial.ndim != 2 or partial.shape[0] != 1 or not 0 < partial.numel() <= 32768
+            or partial.dtype != torch.bfloat16 or not partial.is_contiguous()):
+        raise RuntimeError("TP8 gather requires a bounded, contiguous BF16 row")
+    return runtime[0].tp4_allgather_current_stream(runtime[1], partial, _tp8_allgather_plain_fake(partial))
+
+
+_library.impl("tp8_allreduce_plain", _tp8_allreduce_plain_impl, dispatch_key="HPU")
+_library._register_fake("tp8_allreduce_plain", _tp2_exchange_peer_fake)
+_library.impl("tp8_allgather_plain", _tp8_allgather_plain_impl, dispatch_key="HPU")
+_library._register_fake("tp8_allgather_plain", _tp8_allgather_plain_fake)

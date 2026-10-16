@@ -486,8 +486,8 @@ def prepare_device_grouped_prefill_recipes(normal_scales: bool = True, *, tensor
     if rows != 128:
         return
     device = torch.device("hpu")
-    if tensor_parallel_size not in (2, 4):
-        raise ValueError("Grouped prefill requires TP2 or TP4")
+    if tensor_parallel_size not in (2, 4, 8):
+        raise ValueError("Grouped prefill requires TP2, TP4 or TP8")
     intermediate = ((2304 // tensor_parallel_size + 127) // 128) * 128
     blocks13 = intermediate * 2 // 256
     q13 = torch.empty((experts, blocks13, 327680), dtype=torch.int16, device=device)

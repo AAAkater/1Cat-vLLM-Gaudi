@@ -22,8 +22,16 @@ class BatchExecution:
         self.runner, self.capacity = runner, capacity
         self.model, self.device = runner.model, runner.device
         self.bank = self.model.batch_state
+        self.first_stage = runner.pp.group.is_first_rank
+        self.last_stage = runner.pp.group.is_last_rank
+        self.single_stage = self.first_stage and self.last_stage
         self.buckets = tuple(b for b in (1, 2, 4, 8, 16, 32, 64) if b <= 1 << (capacity - 1).bit_length())
         self.buffers, self.samplers = {}, {}
+        sampler_backend = "hpu_backend"
+        if self.model.tensor_parallel_size in (4, 8):
+            from vllm_gaudi.compilation.deepseek_v41_tp4 import make_backend
+
+            sampler_backend = make_backend()
         for b in self.buckets:
             host = torch.zeros(3, b, dtype=torch.int32).pin_memory("hpu")
             meta = torch.zeros_like(host, device=self.device)
@@ -34,9 +42,9 @@ class BatchExecution:
             token = torch.zeros(b, 1, dtype=torch.int32, device=self.device)
             token_host = torch.zeros(b, 1, dtype=torch.int32).pin_memory("hpu")
             self.buffers[b] = (host, meta, pages, packet, hidden, pre, token, token_host)
-            if self.model.pp_rank == 1:
+            if self.last_stage:
                 self.samplers[b] = torch.compile(self.model.program.sample_greedy_token,
-                                                 backend="hpu_backend",
+                                                 backend=sampler_backend,
                                                  fullgraph=True,
                                                  dynamic=False)
         self.generation = 0
@@ -46,12 +54,14 @@ class BatchExecution:
             raise ValueError("Ordinary PP decode supports one batch or two owned microbatches")
         self.pipeline = None
         if envs.VLLM_HPU_DSV41_PP_MICROBATCHES == 2:
+            if self.single_stage:
+                raise ValueError("Two pipeline microbatches require two pipeline stages")
             from vllm_gaudi.v1.worker.deepseek_v41_pipeline_batch import TwoMicrobatchPipeline
             self.pipeline = TwoMicrobatchPipeline(self)
 
     def execute(self, requests):
         requests = tuple(requests)
-        if not getattr(self.runner, "trace_enabled", False):
+        if not self._request_trace_enabled():
             return self._execute(requests)
         with self._trace_requests(requests, "batch"):
             return self._execute(requests)
@@ -65,7 +75,7 @@ class BatchExecution:
 
     @contextmanager
     def _trace_requests(self, requests, execution_kind):
-        if not getattr(self.runner, "trace_enabled", False):
+        if not self._request_trace_enabled():
             yield
             return
         if not hasattr(self, "_request_trace"):
@@ -102,8 +112,18 @@ class BatchExecution:
         finally:
             record["end_ns"] = time.perf_counter_ns()
             record["end_raw_ns"] = time.clock_gettime_ns(time.CLOCK_MONOTONIC_RAW)
+            for item in record["requests"]:
+                owner = self.bank.slots.owners.get(item["request_id"])
+                item["slot_index"] = None if owner is None else owner.index
+                item["slot_generation"] = None if owner is None else owner.generation
             record["generation"] = self.generation
+            record["batch_bucket_calls"] = dict(self.runner.audit.get("batch_bucket_calls", {}))
+            record["native_single_steps"] = self.runner.audit.get("native_single_steps", 0)
             self._request_trace.write(json.dumps(record, separators=(",", ":")) + "\n")
+
+    def _request_trace_enabled(self):
+        # Lightweight request evidence is independent of the full device profiler.
+        return getattr(self.runner, "trace_enabled", False) or os.environ.get("DSV41_REQUEST_TRACE") == "1"
 
     def _execute(self, requests):
         if not requests or len(requests) > self.capacity:
@@ -136,12 +156,14 @@ class BatchExecution:
         ids, positions, slots = meta.unbind(0)
         torch.index_select(self.bank.pages, 0, slots.clamp_min(0).long(), out=pages)
         pp = self.runner.pp.group
-        if self.model.pp_rank == 0:
+        sent = None
+        if self.first_stage:
             values = self.model.forward_request_batch(ids, positions, slots, pages, spans)
-            hidden.copy_(values["hidden_states"])
-            pre.copy_(values["pre_mix"])
-            sent = dist.isend(packet, dst=pp.ranks[1], group=pp.device_group)
-            self.runner.pp.sends = getattr(self.runner.pp, "sends", 0) + 1
+            if not self.single_stage:
+                hidden.copy_(values["hidden_states"])
+                pre.copy_(values["pre_mix"])
+                sent = dist.isend(packet, dst=pp.ranks[1], group=pp.device_group)
+                self.runner.pp.sends = getattr(self.runner.pp, "sends", 0) + 1
         else:
             received = dist.irecv(packet, src=pp.ranks[0], group=pp.device_group)
             received.wait()
@@ -151,16 +173,18 @@ class BatchExecution:
                                                           "hidden_states": hidden,
                                                           "pre_mix": pre
                                                       }))
-            if any(req.sampling_params.temperature != 0 for req in requests):
+        if self.last_stage:
+            if any(req.sampling_params is not None and req.sampling_params.temperature != 0 for req in requests):
                 token.copy_(self.runner._sample_requests(values, requests))
             else:
                 token.copy_(self.samplers[b](values))
-        pp.broadcast(token, src=1)
+        if not self.single_stage:
+            pp.broadcast(token, src=1)
         token_host.copy_(token, non_blocking=True)
         done = torch.hpu.Event()
         done.record()
         done.synchronize()
-        if self.model.pp_rank == 0:
+        if sent is not None:
             sent.wait()
         outputs = token_host[:len(requests)].tolist()
         self.model.complete_request_batch([1] * len(requests))
@@ -177,17 +201,19 @@ class BatchExecution:
         buckets[b] = buckets.get(b, 0) + 1
         self.runner.audit["batch_padding_rows"] = self.runner.audit.get("batch_padding_rows", 0) + b - len(requests)
         self.runner.audit["batch_pp_payload_bytes"] = (self.runner.audit.get("batch_pp_payload_bytes", 0) +
-                                                       packet.numel() * packet.element_size())
+                                                       (0 if self.single_stage else
+                                                        packet.numel() * packet.element_size()))
         ids = [request.req_id for request in requests]
         return (ModelRunnerOutput(
             req_ids=ids, req_id_to_index={
                 name: i
                 for i, name in enumerate(ids)
-            }, sampled_token_ids=outputs) if self.model.pp_rank == 1 else None)
+            }, sampled_token_ids=outputs) if self.last_stage else None)
 
     def warmup(self):
         from vllm_gaudi.v1.worker.deepseek_v41_runner import RequestState
         for b in self.buckets:
+            self._record_warmup_memory(b, "before")
             requests = [
                 RequestState(f"__batch_warm_{i}", [1 + i], [], None, ([1 + i], )) for i in range(min(b, self.capacity))
             ]
@@ -204,4 +230,28 @@ class BatchExecution:
                 if self.model.engram_host is not None:
                     self.model.engram_host.release_request(request.req_id)
             self.runner.graphed_buckets.add(b)
+            self._record_warmup_memory(b, "after")
         self.runner.pp.group.barrier()
+
+    def _record_warmup_memory(self, bucket, phase):
+        if os.environ.get("DSV41_REQUEST_TRACE") != "1":
+            return
+        from vllm_gaudi.ops.deepseek_v41_memory_audit import read_synapse_memory
+
+        torch.hpu.synchronize()
+        row = dict(bucket=bucket, phase=phase, capacity=self.capacity,
+                   rank=dist.get_rank(), time_unix=time.time(),
+                   allocated_slot_capacity=self.bank.capacity,
+                   allocated_page_table_shape=list(self.bank.pages.shape),
+                   allocated_candidate_shape=list(self.bank.candidates.shape),
+                   allocated_bytes=torch.hpu.memory_allocated(),
+                   allocator_pool_bytes=torch.hpu.memory_reserved(),
+                   allocator_free_total_bytes=list(torch.hpu.mem_get_info()),
+                   synapse_global_memory=read_synapse_memory(),
+                   cumulative_peak_allocated_bytes=torch.hpu.max_memory_allocated())
+        # Do not reset the allocator high-water mark; native allocations require
+        # the separate device telemetry and are not included in these counters.
+        self.runner.audit.setdefault("batch_warmup_memory", []).append(row)
+        path = Path(os.environ["DSV41_RUN_EVIDENCE"]) / f"rank{dist.get_rank()}-batch-warmup-memory.jsonl"
+        with path.open("a") as stream:
+            stream.write(json.dumps(row, separators=(",", ":")) + "\n")

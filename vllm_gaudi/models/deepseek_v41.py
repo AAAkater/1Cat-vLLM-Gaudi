@@ -42,7 +42,7 @@ class HpuDeepseekV41ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
         if not envs.VLLM_HPU_DSV41_PREPARED_SHARDS:
             raise RuntimeError("V4.1 HPU execution requires VLLM_HPU_DSV41_PREPARED_SHARDS=1")
         parallel = vllm_config.parallel_config
-        if (parallel.tensor_parallel_size, parallel.pipeline_parallel_size) not in ((2, 2), (4, 1)):
+        if (parallel.tensor_parallel_size, parallel.pipeline_parallel_size) not in ((2, 2), (4, 1), (8, 1)):
             raise ValueError("The prepared V4.1 profile requires TP2 x PP2 or TP4 x PP1")
         self.tensor_parallel_size = parallel.tensor_parallel_size
         self.pipeline_parallel_size = parallel.pipeline_parallel_size
@@ -128,10 +128,10 @@ class HpuDeepseekV41ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
         )
         self.program.replay_owner = (StageReplay(self.program, greedy_tail=not self.program.dspark)
                                      if self.native else None)
-        self.ordinary = CompiledStage(self.program, prepared_tp4=not self.native and self.tensor_parallel_size == 4)
+        self.ordinary = CompiledStage(self.program, prepared_tp4=not self.native and self.tensor_parallel_size in (4, 8))
         self.compiled_input = None
         self.compiled_input_calls = 0
-        if (not self.native and self.tensor_parallel_size == 4) or (
+        if (not self.native and self.tensor_parallel_size in (4, 8)) or (
             envs.VLLM_HPU_DSV41_DEVICE_ROUNDS and self.program.dspark and self.is_first_stage
         ):
             from vllm_gaudi.compilation.deepseek_v41_tp4 import make_backend
@@ -388,7 +388,7 @@ class HpuDeepseekV41ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
         hidden, pre, _ = self.batch_replay_lanes[lane](
             hidden, pre, positions, input_ids, engram, slots, pages, host_positions=host_positions
         )
-        if self.pp_rank == 0:
+        if not self.program.is_last_stage:
             return IntermediateTensors({"hidden_states": hidden, "pre_mix": pre})
         return hidden
 
@@ -409,7 +409,7 @@ class HpuDeepseekV41ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
         )
 
     def begin_decode_prefix(self, input_ids, positions):
-        if not self.native and self.tensor_parallel_size == 4:
+        if not self.native and self.tensor_parallel_size in (4, 8):
             if (
                 not self.decode_prefix_ready(self.program.search_length)
                 or input_ids.numel() != 1
@@ -457,7 +457,7 @@ class HpuDeepseekV41ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
 
     def decode_prefix_ready(self, search_length):
         """Whether segmented PP0 replay is safe for the next search bucket."""
-        if not self.native and self.tensor_parallel_size == 4:
+        if not self.native and self.tensor_parallel_size in (4, 8):
             return (
                 envs.VLLM_HPU_DSV41_V2_SEGMENTED_PREFIX
                 and not self.program.dspark
@@ -496,7 +496,7 @@ class HpuDeepseekV41ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
             and inputs_embeds is None
             and not fused_text_io
         )
-        tp4_prefix = not self.native and self.tensor_parallel_size == 4 and self._decode_prefix is not None
+        tp4_prefix = not self.native and self.tensor_parallel_size in (4, 8) and self._decode_prefix is not None
         if self.pp_rank == 0:
             if self.step_ticket is None:
                 raise RuntimeError("V4.1 input metadata was not prepared by its worker")
@@ -529,7 +529,7 @@ class HpuDeepseekV41ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
                 from vllm_gaudi.ops.deepseek_v41_prefill_sequence_state import can_sequence_prefill_state
 
                 if (
-                    self.tensor_parallel_size == 4
+                    self.tensor_parallel_size in (4, 8)
                     and input_ids.numel() == 16384
                     and not self.step_use_replay
                     and self.program.start == 0
@@ -554,7 +554,7 @@ class HpuDeepseekV41ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
             # Ordinary startup and request entry must bind the same BF16
             # rows as the device producer used by subsequent rounds.
             engram = tuple(row if row.dtype == torch.bfloat16 else unpack_swa(row, 256) for row in engram)
-        compiled_tp4 = self.tensor_parallel_size == 4 and 1 <= input_ids.numel() <= 6
+        compiled_tp4 = self.tensor_parallel_size in (4, 8) and 1 <= input_ids.numel() <= 6
         if self.program.length > 512 and not self.step_use_replay and not compiled_tp4:
             # Keep prompt geometries out of the shape-specialized compile
             # cache in the 1M profile. Prefill preserves the scheduler chunk;
@@ -603,7 +603,7 @@ class HpuDeepseekV41ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
         else:
             if (
                 execute is self.program
-                and self.tensor_parallel_size == 4
+                and self.tensor_parallel_size in (4, 8)
                 and input_ids.numel() > 6
                 and (envs.VLLM_HPU_DSV41_PREFILL_GROUPED or envs.VLLM_HPU_DSV41_PREFILL_MXFP4)
             ):

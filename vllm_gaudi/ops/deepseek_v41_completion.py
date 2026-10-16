@@ -29,12 +29,12 @@ def resolve_device_runtime(tensor_parallel_size):
         from vllm_gaudi.distributed.tp2_fused_ar_norm import _resolve_runtime
         bridge, backend, _ = _resolve_runtime()
         return bridge, backend
-    if tensor_parallel_size != 4:
-        raise ValueError("Device continuation requires TP2 or TP4")
+    if tensor_parallel_size not in (4, 8):
+        raise ValueError("Device continuation requires TP2, TP4 or TP8")
     import torch
     from vllm.distributed import get_tp_group
     group = get_tp_group()
-    if group.world_size != 4:
+    if group.world_size != tensor_parallel_size:
         raise RuntimeError("Device continuation TP4 communicator is not initialized")
     return _control_bridge(), group.device_group._get_backend(torch.device("hpu"))
 

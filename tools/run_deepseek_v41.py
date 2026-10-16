@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Lease four idle Gaudi2 modules and archive one prepared V4.1 invocation."""
+"""Lease idle Gaudi2 modules and archive one prepared V4.1 invocation."""
 
 import argparse
 from datetime import datetime, timezone
@@ -362,7 +362,7 @@ def main():
     parser.add_argument(
         "--devices",
         type=int,
-        choices=(1, 2, 4),
+        choices=(1, 2, 4, 8),
         default=4,
         help="Four for normal serving; fewer only for bounded component diagnostics",
     )

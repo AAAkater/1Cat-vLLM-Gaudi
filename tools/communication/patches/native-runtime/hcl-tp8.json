@@ -1,0 +1,38 @@
+{
+  "schema": 1,
+  "scope": "TP4 stock-phase native HCL extended to TP8; same patched baseline and existing object files",
+  "patch": "hcl-tp8.patch",
+  "patch_sha256": "c16c764dc571dd3b70e5ac5a3984c6ca1b044b37d14113e1f8380c2acac0051f",
+  "baseline_binary": {
+    "path": "/data/dsv41-deployment/batch-candidate/hcl-build/lib/libhcl.so",
+    "sha256": "068cb65e7af6959f2c1b70bf423548638906c0c42eed4f84a25175182dee4379"
+  },
+  "binary_sha256": "878bd85911d366fa1877c8aba6457bc6ef8961677ae8192ee8d87b329c2d035b",
+  "source": [
+    {
+      "path": "/data/dsv41-deployment/batch-candidate/hcl-source/hcl/src/collective_interface/collectives/all_reduce.cpp",
+      "sha256": "5693ce09cb93f90339c2d76d4f88168f5634045dd3b3502e4003e0bef77b03a6",
+      "private": "/data/dsv41-deployment/state/tp8-concurrency-20261013/hcl-native-02/0-all_reduce.cpp",
+      "private_sha256": "5fa746e20d956292f62288ecdb3ee722d639b1d393dd1cb4b80724553dcc5016"
+    },
+    {
+      "path": "/data/dsv41-deployment/batch-candidate/hcl-source/hcl/src/hccl/hccl.cpp",
+      "sha256": "73bdfcdf66af70026ab9af527ea63d9c98372ff7356292f92d3d9be8901057db",
+      "private": "/data/dsv41-deployment/state/tp8-concurrency-20261013/hcl-native-02/1-hccl.cpp",
+      "private_sha256": "4ec5e6e2b76b4e94c7ea0a550a6a935851d736f8ceac5a7d8395a1e5781f033b"
+    },
+    {
+      "path": "/data/dsv41-deployment/batch-candidate/hcl-source/hcl/src/platform/gaudi2/context_manager.cpp",
+      "sha256": "691debabdf4e2e9fe75a97221694e6ed7ea68974b5ffd57447f6794ecb8434a5",
+      "private": "/data/dsv41-deployment/state/tp8-concurrency-20261013/hcl-native-02/2-context_manager.cpp",
+      "private_sha256": "92b0aa423989bd84b222f20c9852e32ad0796955e0199f624eae9b35276516eb"
+    },
+    {
+      "path": "/data/dsv41-deployment/batch-candidate/hcl-source/hcl/src/platform/gen2_arch_common/hcl_collective_routines.cpp",
+      "sha256": "4836e55c6834bd5c6bdead28e93c8a4103957a359f171549592ff2548e414f8b",
+      "private": "/data/dsv41-deployment/state/tp8-concurrency-20261013/hcl-native-02/3-hcl_collective_routines.cpp",
+      "private_sha256": "8a908144322ebf5806c74321c4551f03fb3ecf9a83c604e12d124c8f39c4121f"
+    }
+  ],
+  "gate": "results/tp8-native-collectives-20261013-02: 8/8 ranks passed; 94 native replays/rank; not full model qualification"
+}

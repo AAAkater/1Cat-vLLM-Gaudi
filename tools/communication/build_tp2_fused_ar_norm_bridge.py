@@ -142,9 +142,12 @@ def main() -> None:
         bridge_dependencies[name] = {"path": str(actual), "sha256": digest(actual)}
     metadata = {
         "schema": 1,
+        "tp8_prepared_group_version": getattr(module, "tp8_prepared_group_version", 0),
+        "tp8_native_graph_available": module.native_tp8_decode_graph_available(),
         "device_engram_shared_mapping_version": getattr(module, "device_engram_shared_mapping_version", 0),
         "prepared_position_bank_version": getattr(module, "prepared_position_bank_version", 0),
         "tp4_index_gather_pair_version": getattr(module, "tp4_index_gather_pair_version", 0),
+        "tp4_peer_max_elements": getattr(module, "tp4_peer_max_elements", 32768),
         "address_sanitizer": args.address_sanitizer,
         "torch_version": torch.__version__,
         "binary_sha256": digest(binary),

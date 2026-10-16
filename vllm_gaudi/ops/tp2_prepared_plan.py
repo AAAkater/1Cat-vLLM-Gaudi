@@ -120,7 +120,8 @@ def _runtime():
 def _tp4_runtime():
     from vllm_gaudi.ops.deepseek_v41_completion import resolve_device_runtime
 
-    return resolve_device_runtime(4)
+    from vllm.distributed import get_tp_group
+    return resolve_device_runtime(get_tp_group().world_size)
 
 
 def native_decode_graph_qualification_groups():
@@ -553,7 +554,8 @@ def _eligible(graph, *, tp4=False):
     )
     gather = torch.ops.vllm_gaudi.tp4_allgather_plain.default
     targets = (
-        (plain, gather)
+        (plain, gather, torch.ops.vllm_gaudi.tp8_allreduce_plain.default,
+         torch.ops.vllm_gaudi.tp8_allgather_plain.default)
         if tp4
         else (
             collective,
@@ -564,6 +566,8 @@ def _eligible(graph, *, tp4=False):
             plain,
             torch.ops.vllm_gaudi.tp4_allreduce_plain.default,
             gather,
+            torch.ops.vllm_gaudi.tp8_allreduce_plain.default,
+            torch.ops.vllm_gaudi.tp8_allgather_plain.default,
         )
     )
     count = sum(node.target in targets for node in graph.graph.nodes)
@@ -573,7 +577,7 @@ def _eligible(graph, *, tp4=False):
         # Wider buckets remain ordinary compiled execution until their
         # ownership and scheduling contract is qualified separately.
         for node in graph.graph.nodes:
-            if node.target in (plain, gather):
+            if node.target in targets:
                 value = node.args[0].meta.get("val")
                 if (
                     not isinstance(value, torch.Tensor)
@@ -581,8 +585,8 @@ def _eligible(graph, *, tp4=False):
                     or value.shape[0] != 1
                     or value.dtype != torch.bfloat16
                     or not 0 < value.numel() <= 32768
-                    or node.target == plain
-                    and value.numel() % 4
+                    or node.target in (plain, torch.ops.vllm_gaudi.tp8_allreduce_plain.default)
+                    and value.numel() % (8 if node.target == torch.ops.vllm_gaudi.tp8_allreduce_plain.default else 4)
                 ):
                     return False
     # V1 only captures groups already qualified for destination-bound GDN.
@@ -790,6 +794,8 @@ class PreparedGroupModule(torch.nn.Module):
                 plain,
                 wide_plain,
                 gather,
+                torch.ops.vllm_gaudi.tp8_allreduce_plain.default,
+                torch.ops.vllm_gaudi.tp8_allgather_plain.default,
             ):
                 arguments = slots(resolve(node.args[:1]))
                 ready_outputs = (
@@ -814,9 +820,9 @@ class PreparedGroupModule(torch.nn.Module):
                 result = slot(actual, planned=torch.empty_like(actual))
                 add_collective = (
                     native.add_all_gather
-                    if node.target in (gather, peers, peers_scheduled)
+                    if node.target in (gather, peers, peers_scheduled, torch.ops.vllm_gaudi.tp8_allgather_plain.default)
                     else native.add_all_reduce
-                    if node.target in (plain, wide_plain)
+                    if node.target in (plain, wide_plain, torch.ops.vllm_gaudi.tp8_allreduce_plain.default)
                     else native.add_peer_exchange
                 )
                 add_collective(arguments[0].index, result.index)

@@ -14,7 +14,7 @@ habana::OutputMetaDataVector meta(const at::Stack& s, bool projection, bool rope
     const auto x = s.at(0).toTensor();
     TORCH_CHECK(x.dim() == 3, "WO handoff requires a batched tensor");
     const auto groups = projection ? x.size(1) / (rope ? 8 : 1) : x.size(0);
-    TORCH_CHECK((groups == 2 || groups == 4) && x.size(projection ? 0 : 1) >= 1 && x.size(projection ? 0 : 1) <= 6 &&
+    TORCH_CHECK((groups == 1 || groups == 2 || groups == 4) && x.size(projection ? 0 : 1) >= 1 && x.size(projection ? 0 : 1) <= 6 &&
                 x.sizes() == (projection ? (rope ? at::IntArrayRef({x.size(0),groups*8,512}) : at::IntArrayRef({x.size(0),groups,4096})) : at::IntArrayRef({groups,x.size(1),1024})) &&
                 x.scalar_type() == (projection ? at::kBFloat16 : at::kFloat),
                 "WO handoff requires the TP-parametric C1-C6 projection geometry");

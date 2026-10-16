@@ -51,7 +51,7 @@ def tensor_parallel_size(config):
 
 
 def is_tp4(config):
-    return tensor_parallel_size(config) == 4
+    return tensor_parallel_size(config) in (4, 8)
 
 
 def validate_v2(config):
@@ -123,8 +123,9 @@ def configure(config):
     if parallel.data_parallel_size != 1 or (parallel.tensor_parallel_size, parallel.pipeline_parallel_size) not in (
         (2, 2),
         (4, 1),
+        (8, 1),
     ):
-        raise ValueError("The V4.1 prepared profile requires TP2 x PP2 or TP4 x PP1, DP1")
+        raise ValueError("The V4.1 prepared profile requires TP2 x PP2, TP4 x PP1 or TP8 x PP1, DP1")
     if not 1 <= config.model_config.max_model_len <= 1048576:
         raise ValueError("V4.1 supports context lengths up to the checkpoint's 1M limit")
     paged = config.model_config.max_model_len > 512

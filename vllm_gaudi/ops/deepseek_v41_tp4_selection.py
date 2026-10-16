@@ -25,7 +25,7 @@ def invalidate_local_index_queries(owner):
 def prepare_local_index_queries(owner, *, release_local=False, joint=False):
     """Prepare immutable rank-ordered projection shards outside execution."""
     tp_size = owner.tensor_parallel_size
-    if tp_size not in (2, 4) or not owner.owns_index:
+    if tp_size not in (2, 4, 8) or not owner.owns_index:
         raise ValueError("Replicated index projections require a supported TP index owner")
     if owner.tp4_local_index_queries or any(
             getattr(owner, f"_tp4_index_{kind}_shard_{rank}", None) is not None

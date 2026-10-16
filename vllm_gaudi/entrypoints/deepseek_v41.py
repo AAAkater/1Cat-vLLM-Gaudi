@@ -367,12 +367,14 @@ _DSPARK_SINGLE_STAGE_DEFAULTS = {
 
 def prepare_default_fastpaths(model, sidecars=None, tensor_parallel_size=4, pipeline_parallel_size=1):
     """Select prepared execution defaults for the requested four-card topology."""
-    if (tensor_parallel_size, pipeline_parallel_size) not in ((2, 2), (4, 1)):
-        raise ValueError("The prepared V4.1 path supports TP4 x PP1 or legacy TP2 x PP2")
+    if (tensor_parallel_size, pipeline_parallel_size) not in ((2, 2), (4, 1), (8, 1)):
+        raise ValueError("The prepared V4.1 path supports TP4/TP8 x PP1 or legacy TP2 x PP2")
     if not _enabled(os.environ.get("VLLM_HPU_DSV41_DEFAULT_FASTPATHS", "1")):
         return
     os.environ.setdefault("VLLM_HPU_DSV41_DSPARK", "0")
     if _enabled(os.environ["VLLM_HPU_DSV41_DSPARK"]):
+        if tensor_parallel_size == 8:
+            raise ValueError("TP8 currently requires ordinary decoding; speculative operators need separate qualification")
         defaults = dict(_DSPARK_FASTPATH_DEFAULTS)
         if pipeline_parallel_size == 1:
             defaults.update(_DSPARK_SINGLE_STAGE_DEFAULTS)
@@ -389,8 +391,18 @@ def prepare_default_fastpaths(model, sidecars=None, tensor_parallel_size=4, pipe
         os.environ["VLLM_HPU_DSV41_V2"] = "1" if _enabled(selected_v2) else "0"
     elif selected_adapter is not None and selected_v2 is None:
         os.environ["VLLM_USE_V2_MODEL_RUNNER"] = "1" if _enabled(selected_adapter) else "0"
-    if (tensor_parallel_size, pipeline_parallel_size) == (4, 1):
-        for key, value in _TP4_FASTPATH_DEFAULTS.items():
+    if tensor_parallel_size in (4, 8) and pipeline_parallel_size == 1:
+        defaults = dict(_TP4_FASTPATH_DEFAULTS)
+        if tensor_parallel_size == 8:
+            # These compound operators have checkpoint-specific I640 geometry.
+            # TP8's I384 uses the general N256 FP8 path with the same rounding.
+            for key in ("EXPERT_W2_THREE_ROUTES", "EXPERT_STREAMED_SAT", "EXPERT_ACTIVE_W2",
+                        "EXPERT_TOKEN_WIDE", "EXPERT_SHARED_SCALE"):
+                full_key = "VLLM_HPU_DSV41_" + key
+                if _enabled(os.environ.get(full_key, "0")):
+                    raise ValueError(f"{full_key} requires an independently qualified TP8 operator")
+                defaults[full_key] = "0"
+        for key, value in defaults.items():
             os.environ.setdefault(key, value)
     else:
         for key, value in _C1_FASTPATH_DEFAULTS.items():
@@ -646,7 +658,8 @@ def load_native_operators(required=()):
 
     optional = []
     if envs.VLLM_HPU_DSV41_MHC_RRMS_POST:
-        optional.append("custom_deepseek_v41_mhc_rrms_post_gaudi2")
+        # RRMS post is registered by the manifest-checked base extension.
+        required = (*required, "custom_deepseek_v41_mhc_rrms_post_gaudi2")
     if envs.VLLM_HPU_DSV41_DSPARK_ROUTER_BATCHED_F32:
         optional.append("custom_deepseek_v41_router_batched_f32_gaudi2")
     if envs.VLLM_HPU_DSV41_DSPARK_VOCAB_SOFTMAX:
@@ -860,7 +873,7 @@ def main():
     parser.add_argument("--max-num-seqs", type=int, default=32)
     parser.add_argument("--max-num-batched-tokens", type=int, default=settings.get("max_num_batched_tokens", 8192))
     parser.add_argument("--block-size", type=int, default=128)
-    parser.add_argument("--tensor-parallel-size", type=int, choices=(2, 4), default=4)
+    parser.add_argument("--tensor-parallel-size", type=int, choices=(2, 4, 8), default=4)
     parser.add_argument("--pipeline-parallel-size", type=int, choices=(1, 2), default=1)
     parser.add_argument(
         "--engram-residency",

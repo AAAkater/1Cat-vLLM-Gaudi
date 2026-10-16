@@ -25,7 +25,7 @@ habana::OutputMetaDataVector metadata(const at::Stack& stack, bool scale_only, b
     const auto tokens = x.size(0);
     const auto w = stack.at(1).toTensor(), s = stack.at(2).toTensor();
     const auto width = scale_only ? x.size(1) : w.size(0);
-    TORCH_CHECK(width == 8192 || width == 16384, "Q projection requires TP2/TP4 width");
+    TORCH_CHECK(width == 4096 || width == 8192 || width == 16384, "Q projection requires TP2/TP4/TP8 width");
     if (scale_only) {
         TORCH_CHECK(x.scalar_type() == (bf16_product ? at::kBFloat16 : at::kFloat) && x.size(1) == width &&
                     w.scalar_type() == at::kFloat && w.sizes() == at::IntArrayRef({1, width}) &&

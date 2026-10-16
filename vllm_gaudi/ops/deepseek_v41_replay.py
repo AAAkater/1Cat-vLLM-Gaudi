@@ -27,6 +27,8 @@ def stage_collectives(tp_rank, native, tp_size=2, *, native_fp32_gather=False, o
     from vllm.distributed import tensor_model_parallel_all_gather, tensor_model_parallel_all_reduce
     from vllm_gaudi import envs
 
+    if tp_size not in (2, 4, 8) or not 0 <= tp_rank < tp_size:
+        raise ValueError("Native stage requires a valid TP2, TP4 or TP8 rank")
     maximum = 64 * 5120 if envs.VLLM_HPU_DSV41_BATCH_DECODE else 32768
     fused_peer_sum = envs.VLLM_HPU_DSV41_ORDERED_PEER_SUM if ordered_peer_sum is None else ordered_peer_sum
 

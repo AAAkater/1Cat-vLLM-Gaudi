@@ -166,7 +166,7 @@ class PagedCSA2SharedState(nn.Module):
         if not 1 <= prefill_tokens <= MAX_PREFILL_TOKENS:
             raise ValueError("Paged prefill capacity must be between 1 and 16384")
         self.prefill_tokens = prefill_tokens
-        self.rotary_on_host = tensor_parallel_size == 4
+        self.rotary_on_host = tensor_parallel_size in (4, 8)
         self.length, self.layer_start, self.layer_stop = max_length, layer_start, layer_stop
         self.runtime_indexer = gaudi_envs.VLLM_HPU_DSV41_RUNTIME_INDEXER
         if self.runtime_indexer and not hasattr(torch.ops.custom_op, "custom_deepseek_v41_index_scores_gaudi2"):
@@ -221,7 +221,7 @@ class PagedCSA2SharedState(nn.Module):
         for source in config["index_source_layer_ids"]:
             if layer_start <= source < layer_stop:
                 selection = nn.Module()
-                if shared_selection is None or tensor_parallel_size != 4:
+                if shared_selection is None or tensor_parallel_size not in (4, 8):
                     shared_selection = torch.full((self.prefill_tokens, 512), -1, dtype=torch.int32, device=device)
                 # Each owner publishes before its contiguous consumer layers.
                 # The next owner replaces these ephemeral IDs only after those
@@ -432,11 +432,11 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
             from vllm_gaudi.ops.deepseek_v41_dspark_peer_operands import make_peer_operands
 
             self.scheduled_peer_operands = make_peer_operands(get_tp_group().rank_in_group, tensor_parallel_size)
-        self.shared_decode_metadata = tensor_parallel_size == 4
-        self.paged_mla_direct = tensor_parallel_size == 4 and hasattr(
+        self.shared_decode_metadata = tensor_parallel_size in (4, 8)
+        self.paged_mla_direct = tensor_parallel_size in (4, 8) and hasattr(
             torch.ops.custom_op, "custom_deepseek_v41_paged_mla_direct_mme_gaudi2"
         )
-        self.paged_mla_logical = tensor_parallel_size == 4 and hasattr(
+        self.paged_mla_logical = tensor_parallel_size in (4, 8) and hasattr(
             torch.ops.custom_op, "custom_deepseek_v41_logical_mla_gaudi2"
         )
         self.logical_mla_vector = True
@@ -504,7 +504,7 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
             for name in ("custom_deepseek_v41_main_batch_publish_mla_gaudi2",
                          "custom_deepseek_v41_main_batch_reuse_mla_gaudi2")
         )
-        self.shared_main_mla = tensor_parallel_size == 4 and all(
+        self.shared_main_mla = tensor_parallel_size in (4, 8) and all(
             hasattr(torch.ops.custom_op, name)
             for name in ("custom_deepseek_v41_main_publish_mla_gaudi2", "custom_deepseek_v41_main_reuse_mla_gaudi2")
         )
@@ -521,7 +521,7 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
         self.register_buffer("_index_score_full_weight", None, False)
         self.tp4_packed_index_queries = False
         self.register_buffer("_index_gain_weight", None, False)
-        for shard in range(4):
+        for shard in range(tensor_parallel_size):
             self.register_buffer(f"_tp4_index_query_shard_{shard}", None, False)
             self.register_buffer(f"_tp4_index_score_shard_{shard}", None, False)
         self.search_length = 512
@@ -701,7 +701,7 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
 
     def prepare_tp4_index_query_weights(self):
         """Keep small immutable query shards local across normal TP4 decode."""
-        if self.tensor_parallel_size == 4 and self.owns_index:
+        if self.tensor_parallel_size in (4, 8) and self.owns_index:
             from vllm_gaudi.ops.deepseek_v41_tp4_selection import prepare_local_index_queries
 
             prepare_local_index_queries(self, release_local=True)
@@ -864,8 +864,8 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
                 value.contiguous(), weight.weight.contiguous(), positions.to(torch.int32).contiguous(),
                 self._rotary_native_table(), hasattr(weight, "scale")).reshape(-1, self.heads, 512)
         if not decode and gaudi_envs.VLLM_HPU_DSV41_PREFILL_Q_PROJECTION and 6 < value.shape[0] <= 16384:
-            if not getattr(weight, "dense_fp8", False) or self.heads not in (16, 32):
-                raise ValueError("Prefill Q projection requires prepared FP8 weights and 16/32 local heads")
+            if not getattr(weight, "dense_fp8", False) or self.heads not in (8, 16, 32):
+                raise ValueError("Prefill Q projection requires prepared FP8 weights and 8/16/32 local heads")
             with prefill_event_span("attention_query_quantization", self.layer, value.shape[0]):
                 value = quantize_activation(value) if hasattr(weight, "scale") else value
             with prefill_event_span("attention_query_projection_rope", self.layer, value.shape[0]):
@@ -1225,7 +1225,7 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
         )
 
     def _scores(self, positions, logical_rows, q, weights):
-        if self.tensor_parallel_size == 4 and q.shape[0] <= NATIVE_WORK_TOKENS:
+        if self.tensor_parallel_size in (4, 8) and q.shape[0] <= NATIVE_WORK_TOKENS:
             from vllm_gaudi.ops.deepseek_v41_decode_index import native_index_tile, supports_native_index_tile
 
             if supports_native_index_tile(q, logical_rows):
@@ -2775,6 +2775,7 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
                         capacity=self.length // self.ratio,
                         reindex=self.layer > self.candidate_source,
                         publish_candidates=self.layer == self.candidate_source,
+                        local_heads=self.index_heads,
                     )
                 if updated is not None:
                     blocks = updated

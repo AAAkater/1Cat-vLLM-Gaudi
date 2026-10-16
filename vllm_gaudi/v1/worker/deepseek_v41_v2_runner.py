@@ -264,7 +264,7 @@ class V41V2ModelRunner(V41ModelRunner):
         if not (envs.VLLM_HPU_DSV41_V2_SEGMENTED_PREFIX and self.pp.group.is_first_rank
                 and self._continuation_authorized(record, scheduled)):
             return False
-        if getattr(self.model, "tensor_parallel_size", 2) == 4:
+        if getattr(self.model, "tensor_parallel_size", 2) in (4, 8):
             cached = scheduled.scheduled_cached_reqs
             if record.request_id not in cached.req_ids or record.request_id in cached.resumed_req_ids:
                 return False
@@ -320,7 +320,7 @@ class V41V2ModelRunner(V41ModelRunner):
         if (
             record is not None
             and getattr(self, "trace_enabled", False)
-            and getattr(self.model, "tensor_parallel_size", 2) == 4
+            and getattr(self.model, "tensor_parallel_size", 2) in (4, 8)
         ):
             with scope(f"v41::worker_commit::PP0::decode::P{record.start}::C1::emit1"):
                 return self._consume_completion_impl(scheduled)
@@ -356,7 +356,7 @@ class V41V2ModelRunner(V41ModelRunner):
             if self._prefix_started is None:
                 if record.device_position is not None:
                     position = record.device_position
-                elif getattr(self.model, "tensor_parallel_size", 2) == 4:
+                elif getattr(self.model, "tensor_parallel_size", 2) in (4, 8):
                     # A changing view offset would create a new compiled
                     # input contract every token. The fixed destination is
                     # ordered after its previous consumer by the device copy.
@@ -433,7 +433,7 @@ class V41V2ModelRunner(V41ModelRunner):
     @trace_phase
     def sample_tokens(self, grammar_output=None):
         if (
-            getattr(self.model, "tensor_parallel_size", 2) == 4
+            getattr(self.model, "tensor_parallel_size", 2) in (4, 8)
             and self.pending == "batch_ready"
             and isinstance(self.batch_result, V41AsyncOutput)
         ):
@@ -507,7 +507,7 @@ class V41V2ModelRunner(V41ModelRunner):
         tp_size = getattr(self.model, "tensor_parallel_size", 2)
         if tp_size == 2:
             self.pp.group.broadcast(token, src=1)
-        elif tp_size != 4 or not (self.pp.group.is_first_rank and self.pp.group.is_last_rank):
+        elif tp_size not in (4, 8) or not (self.pp.group.is_first_rank and self.pp.group.is_last_rank):
             raise RuntimeError("TP4 device continuation requires a single pipeline stage")
         payload = getattr(self, "_device_sampling_payload", None)
         frame = None
@@ -538,7 +538,7 @@ class V41V2ModelRunner(V41ModelRunner):
             frame = self._sampling_frames.preserve(payload, inputs.history_views[-1])
             payload, token = frame[:5], frame[3]
         source = payload[0] if payload is not None else token
-        if tp_size == 4:
+        if tp_size in (4, 8):
             # load_model already verified the native ABI and retained this
             # producer. Resolving again would hash runtime libraries and scan
             # /proc/self/maps on every token, serializing the serving loop.

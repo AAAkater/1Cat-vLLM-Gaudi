@@ -165,7 +165,7 @@ class PreparedGroupPlan : public std::enable_shared_from_this<PreparedGroupPlan>
     TORCH_CHECK(!sealed && !nodes.empty(), "Prepared plans require unsealed nodes");
     const bool has_exchange = std::any_of(nodes.begin(), nodes.end(),
                                         [](const PreparedNode& node) { return node.exchange; });
-    const bool tp4 = has_exchange && backend->getSize() == 4;
+    const bool tp4 = has_exchange && (backend->getSize() == 4 || backend->getSize() == 8);
     world_size = backend->getSize();
     reject_output_alias = tp4;
     TORCH_CHECK(!has_exchange || tp4 || tp2ExchangeEnabled(), "Exchange plans require a supported communicator");
@@ -186,7 +186,7 @@ class PreparedGroupPlan : public std::enable_shared_from_this<PreparedGroupPlan>
       if (node.exchange) {
         TORCH_CHECK(!tp4 || (node.peer_only && (node.reduction_only != node.all_gather)),
                     "Prepared TP4 requires stock AllReduce or AllGather nodes");
-        TORCH_CHECK(!node.all_gather || tp4, "Prepared AllGather requires four ranks");
+        TORCH_CHECK(!node.all_gather || tp4, "Prepared AllGather requires four or eight ranks");
         node.stock_collective_stream = tp4;
         const auto partial = slots.at(node.inputs[0]).toTensor();
         if (node.peer_only) {
@@ -198,7 +198,7 @@ class PreparedGroupPlan : public std::enable_shared_from_this<PreparedGroupPlan>
           const int64_t v41Maximum = batchFlag && std::strcmp(batchFlag, "1") == 0 ? 64 * 5120 : 32768;
           const bool v41Shape = v41 && !node.reduction_only && hidden >= 128 &&
                                 hidden <= v41Maximum && hidden % 128 == 0;
-          TORCH_CHECK(tp4 ? (hidden > 0 && hidden <= v41Maximum && (node.all_gather || hidden % 4 == 0)) :
+          TORCH_CHECK(tp4 ? (hidden > 0 && hidden <= v41Maximum && (node.all_gather || hidden % world_size == 0)) :
                       (hidden == 4096 || (!node.reduction_only && hidden == 5120) || v41Shape),
                       "Unsupported prepared TP2 hidden width");
           TORCH_CHECK(partial.sizes() == at::IntArrayRef({1, hidden}) &&

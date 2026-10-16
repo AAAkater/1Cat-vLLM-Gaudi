@@ -145,6 +145,12 @@ class RuntimeApis {
     });
   }
 
+  void requireTp8() {
+    requireTp4();
+    const auto version = resolve<uint32_t (*)()>("hcclTp8NativeGraphVersion");
+    TORCH_CHECK(version() == 1, "Unsupported TP8 native collective ABI");
+  }
+
   void requirePlanV2() {
     requirePlan();
     std::call_once(plan_v2_once_, [this]() {
@@ -501,14 +507,17 @@ class NativeDecodeGraph : public std::enable_shared_from_this<NativeDecodeGraph>
                std::vector<torch::jit::Stack> inputs) {
     RuntimeApis::get().require();
     TORCH_CHECK(!plans.empty(), "Native capture requires compiled groups");
-    tp4_ = plans.front()->world_size == 4;
+    const auto world_size = plans.front()->world_size;
+    TORCH_CHECK(world_size == 2 || world_size == 4 || world_size == 8, "Unsupported native TP size");
+    tp4_ = world_size == 4 || world_size == 8;
     has_reduction_phases_ = false;
     for (const auto& plan : plans)
       for (const auto& node : plan->nodes) has_reduction_phases_ |= node.reduction_only;
     for (const auto& plan : plans)
-      TORCH_CHECK((plan->world_size == 4) == tp4_, "Native groups use different communicator sizes");
+      TORCH_CHECK(plan->world_size == world_size, "Native groups use different communicator sizes");
     if (tp4_) {
-      RuntimeApis::get().requireTp4();
+      if (world_size == 8) RuntimeApis::get().requireTp8();
+      else RuntimeApis::get().requireTp4();
       TORCH_CHECK(!external_prefix_, "TP4 native input must belong to the complete command graph");
     }
     if (mhcOverlapEnabled()) {

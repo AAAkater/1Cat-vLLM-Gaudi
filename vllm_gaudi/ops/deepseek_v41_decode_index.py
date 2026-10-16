@@ -13,7 +13,7 @@ def supports_query_row_reduction(local_heads):
     Older libraries accept only a shared row vector. Keep their maintained
     tensor implementation until the matching native library is installed.
     """
-    if local_heads not in (8, 16):
+    if local_heads not in (4, 8, 16):
         return False
     try:
         operation = torch.ops.custom_op.custom_deepseek_v41_prefill_index_reduce_gaudi2

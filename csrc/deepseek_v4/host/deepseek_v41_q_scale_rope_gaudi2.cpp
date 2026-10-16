@@ -18,7 +18,7 @@ tpc_lib_api::GlueCodeReturn DeepseekV41QScaleRopeGaudi2::GetGcDefinitions(
     const auto& y = p->outputTensors[0].geometry;
     if (y.dataType != DATA_BF16) return GLUE_INCOMPATIBLE_DATA_TYPE;
     const auto rows = y.maxSizes[1];
-    if (y.dims != 2 || (y.maxSizes[0] != 8192 && y.maxSizes[0] != 16384) || rows < 1 || rows > 64)
+    if (y.dims != 2 || (y.maxSizes[0] != 4096 && y.maxSizes[0] != 8192 && y.maxSizes[0] != 16384) || rows < 1 || rows > 64)
         return GLUE_INCOMPATIBLE_OUTPUT_SIZE;
     for (int i = 0; i < 5; ++i) {
         const auto& x = p->inputTensors[i].geometry;

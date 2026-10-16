@@ -46,7 +46,7 @@ template<bool Reuse, bool Projection = false, bool DecodedSWA = false> habana::O
         const int64_t groups = q.size(1) / 8;
         const auto wa = s.at(base).toTensor(), sa = s.at(base+1).toTensor();
         const auto phase = s.at(base+2).toTensor(), wb = s.at(base+3).toTensor(), sb = s.at(base+4).toTensor();
-        TORCH_CHECK((groups == 2 || groups == 4) && q.size(1) == groups * 8 &&
+        TORCH_CHECK((groups == 1 || groups == 2 || groups == 4) && q.size(1) == groups * 8 &&
             wa.scalar_type() == at::ScalarType::Float8_e4m3fn && wa.sizes() == at::IntArrayRef({groups,4096,1024}) &&
             sa.scalar_type() == at::kFloat && sa.sizes() == at::IntArrayRef({groups,1,1024}) &&
             phase.scalar_type() == at::kFloat && phase.dim() == 2 && phase.size(1) == 64 && phase.size(0) > 0 &&

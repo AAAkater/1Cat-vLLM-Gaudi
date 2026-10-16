@@ -23,8 +23,8 @@ FINGERPRINT = canonical_hash(QUANTIZATION)
 
 
 def quantization_for_tp(tp_size):
-    if tp_size not in (2, 4):
-        raise ValueError("wo_a preparation requires TP2 or TP4")
+    if tp_size not in (2, 4, 8):
+        raise ValueError("wo_a preparation requires TP2, TP4 or TP8")
     return {**QUANTIZATION, "layout": f"G{8 // tp_size}-K4096-N1024"}
 
 

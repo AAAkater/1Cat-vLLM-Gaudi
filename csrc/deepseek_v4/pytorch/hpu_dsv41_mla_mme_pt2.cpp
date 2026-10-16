@@ -44,7 +44,7 @@ habana::OutputMetaDataVector mla_woa_meta(const at::Stack& s) {
     const auto q = s.at(0).toTensor(), w = s.at(12).toTensor();
     const auto channel_scale = s.at(13).toTensor();
     const auto positions = s.at(14).toTensor(), phase = s.at(15).toTensor();
-    TORCH_CHECK(q.size(0) == 1 && (q.size(1) == 16 || q.size(1) == 32),
+    TORCH_CHECK(q.size(0) == 1 && (q.size(1) == 8 || q.size(1) == 16 || q.size(1) == 32),
                 "Fused MLA/wo_a is currently the C1 production contract");
     TORCH_CHECK(w.scalar_type() == at::ScalarType::Float8_e4m3fn &&
                 w.sizes() == at::IntArrayRef({q.size(1) / 8,4096,1024}) &&

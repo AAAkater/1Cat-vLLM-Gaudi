@@ -20,7 +20,7 @@ habana::OutputMetaDataVector metadata(const at::Stack& s) {
     const auto q = s[0].toTensor(), w = s[1].toTensor(), packed = s[2].toTensor();
     const auto pages = s[3].toTensor(), positions = s[4].toTensor(), rows = s[5].toTensor();
     const auto ratio = s[6].toInt();
-    TORCH_CHECK(s[7].toInt() == 8 || s[7].toInt() == 16, "Index requires TP2/TP4 head groups");
+    TORCH_CHECK(s[7].toInt() == 4 || s[7].toInt() == 8 || s[7].toInt() == 16, "Index requires TP2/TP4 head groups");
     TORCH_CHECK(q.dim() == 3 && q.scalar_type() == at::kBFloat16 &&
                 q.size(0) >= 1 && q.size(0) <= 16384 && q.size(1) == 32 && q.size(2) == 128 &&
                 w.scalar_type() == at::kBFloat16 && w.sizes() == at::IntArrayRef({q.size(0), 32}) &&

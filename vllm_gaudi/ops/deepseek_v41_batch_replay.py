@@ -1,13 +1,24 @@
 # SPDX-License-Identifier: Apache-2.0
 """Finite ordinary-request batch graphs, with request-owned state capture."""
-from dataclasses import replace
-
 import torch
 
 from vllm_gaudi.models.deepseek_v41_batch_program import CompiledBatchStage
 from vllm_gaudi.ops.deepseek_v41_replay import _Metadata
 from vllm_gaudi.ops.deepseek_v41_reindex_compact import bounded_reindex_bucket
-from vllm_gaudi.ops.tp2_model_adapter import DEEPSEEK_V41_PP0_INPUT, DEEPSEEK_V41_PP1
+from vllm_gaudi.ops.tp2_model_adapter import DecoderTopology
+
+
+def batch_stage_topology(program):
+    """Describe the owned layer groups, including a complete TP4/PP1 stage."""
+    layers = len(program.layers)
+    if layers == 0 or layers % 4:
+        raise ValueError("Native V4.1 request batches require complete four-layer groups")
+    engram_collectives = sum(layer.layer in (1, 14) for layer in program.layers)
+    index_collectives = sum(2 for layer in program.layers if layer.attention.owns_index)
+    return DecoderTopology(
+        f"deepseek_v41_pp{program.pp_rank}_request_batch", (4,) * (layers // 4), 2, False,
+        engram_collectives + int(program.pp_rank == 0) + index_collectives,
+    )
 
 
 class BatchSnapshot:
@@ -55,11 +66,7 @@ class BatchStageVariant(torch.nn.Module):
         self.bucket = positions.numel()
         if self.bucket not in (1, 2, 4, 8, 16, 32, 64):
             raise ValueError("Unsupported native request bucket")
-        base = DEEPSEEK_V41_PP0_INPUT if program.pp_rank == 0 else DEEPSEEK_V41_PP1
-        self.adapter = replace(base,
-                               name=f"deepseek_v41_pp{program.pp_rank}_request_batch",
-                               extra_collectives=base.extra_collectives +
-                               sum(2 for layer in program.layers if layer.attention.owns_index))
+        self.adapter = batch_stage_topology(program)
         self.compiled = CompiledBatchStage(program, text_input=program.pp_rank == 0)
         self.fixed = tuple(value.clone() for value in (hidden, pre, positions, ids))
         self.attention_inputs = tuple(value.clone() for value in (*engram, slots, pages))

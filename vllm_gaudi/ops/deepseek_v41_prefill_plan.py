@@ -108,11 +108,11 @@ def _runtime():
     # Compute-only plans do not execute TP2 exchange. Keep serving bound to
     # its actual TP group while the existing stage owns standard HCCL calls.
     world = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 0
-    if world in (1, 4):
+    if world in (1, 4, 8):
         from vllm.distributed import get_tp_group
 
         group = torch.distributed.distributed_c10d._get_default_group() if world == 1 else get_tp_group().device_group
-        if world == 4 and torch.distributed.get_world_size(group) != 4:
+        if world in (4, 8) and torch.distributed.get_world_size(group) != world:
             bridge, backend, _ = _resolve_runtime()
             return bridge, backend
         path = Path(os.environ["VLLM_HPU_TP2_FUSED_AR_NORM_BRIDGE"])

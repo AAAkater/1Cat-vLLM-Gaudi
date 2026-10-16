@@ -14,13 +14,16 @@ def _bf16_boundary(value):
         1, -1)).reshape(value.shape)
 
 
-def reindex_mme_scores(query, weights, cache, pages, positions, candidates, ratio, tile=2048, *, tiled_keys=False):
+def reindex_mme_scores(query, weights, cache, pages, positions, candidates, ratio, tile=2048, *,
+                       tiled_keys=False, local_heads=16):
     if tile not in (512, 1024, 2048) or ratio not in (1, 2):
         raise ValueError("Unsupported reindex tile or compression ratio")
     if query.ndim != 3 or query.shape[1:] != (32, 128):
         raise ValueError("Reindex queries must have shape [requests,32,128]")
     if candidates.shape != (query.shape[0], 2048):
         raise ValueError("Reindex candidate pool must contain 2048 blocks per request")
+    if local_heads not in (4, 8, 16):
+        raise ValueError("Reindex MME requires TP2/TP4/TP8 head groups")
     visible = ((positions + 1) // ratio).unsqueeze(-1)
     offsets = torch.arange(8, dtype=torch.int32, device=query.device)
     outputs = []
@@ -38,8 +41,10 @@ def reindex_mme_scores(query, weights, cache, pages, positions, candidates, rati
     return torch.cat(outputs, -1)
 
 
-def reindex_mme_select(query, weights, cache, pages, positions, candidates, *, ratio, tile=2048, tiled_keys=False):
-    scores = reindex_mme_scores(query, weights, cache, pages, positions, candidates, ratio, tile, tiled_keys=tiled_keys)
+def reindex_mme_select(query, weights, cache, pages, positions, candidates, *, ratio, tile=2048, tiled_keys=False,
+                       local_heads=16):
+    scores = reindex_mme_scores(query, weights, cache, pages, positions, candidates, ratio, tile,
+                               tiled_keys=tiled_keys, local_heads=local_heads)
     ops = torch.ops.custom_op
     stats = ops.custom_deepseek_v41_index_threshold_gaudi2(scores, positions, ratio, 1, 0)
     selected = ops.custom_deepseek_v41_index_emit_gaudi2(scores, positions, candidates, stats, ratio, 1, 0)

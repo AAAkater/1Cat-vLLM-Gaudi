@@ -158,19 +158,22 @@ def eligible_collectives(gm):
                 source = node.args[0]
                 if set(source.users) != {node} or not _fresh_recipe_output(gm, source):
                     return ()
-            elif node.args[1] != 4:
+            elif node.args[1] not in (4, 8):
                 return ()
     # A replay boundary includes the compiled consumer of the last collective.
     return tuple(nodes) if last_compute is not None else ()
 
 
-def _lower_collectives(gm, nodes):
+def _lower_collectives(gm, nodes, tp_size=4):
     gather = _collectives()[2]
     for node in nodes:
         value = node.args[0].meta["val"]
         shape = tuple(node.meta["val"].shape)
         target = (torch.ops.vllm_gaudi.tp4_allgather_plain.default if node.target == gather
                   else torch.ops.vllm_gaudi.tp4_allreduce_plain.default)
+        if tp_size == 8:
+            target = (torch.ops.vllm_gaudi.tp8_allgather_plain.default if node.target == gather
+                      else torch.ops.vllm_gaudi.tp8_allreduce_plain.default)
         with gm.graph.inserting_before(node):
             flat = gm.graph.call_function(torch.ops.aten.view.default, (node.args[0], [1, value.numel()]))
             flat.meta = dict(node.args[0].meta, val=value.reshape(1, -1))
@@ -283,16 +286,21 @@ def prepare_native_group(gm, owner):
     if not nodes:
         return False
     from vllm_gaudi.ops.deepseek_v41_completion import resolve_device_runtime
-    bridge, backend = resolve_device_runtime(4)
+    from vllm.distributed import get_tp_group
+    tp_size = get_tp_group().world_size
+    if tp_size not in (4, 8):
+        return False
+    bridge, backend = resolve_device_runtime(tp_size)
     if getattr(bridge, "tp4_prepared_group_version", 0) != 1:
         return False
-    if not bridge.native_tp4_decode_graph_available():
+    capability = getattr(bridge, f"native_tp{tp_size}_decode_graph_available", lambda: False)
+    if not capability():
         raise RuntimeError("Installed TP4 group adapter lacks its pinned native runtime")
     # Resolve the actual process group before replacing any operation.
     from torch.distributed.distributed_c10d import _resolve_process_group
     for node in nodes:
         group = _resolve_process_group(node.args[-1])
-        if group.size() != 4 or group._get_backend(torch.device("hpu")) is not backend:
+        if group.size() != tp_size or group._get_backend(torch.device("hpu")) is not backend:
             raise RuntimeError("Compiled collective belongs to a different TP4 communicator")
     from vllm_gaudi.distributed.tp2_fused_ar_norm import initialize_tp4_allreduce_runtime
     from torch._subclasses.fake_tensor import unset_fake_temporarily
@@ -300,7 +308,7 @@ def prepare_native_group(gm, owner):
         initialize_tp4_allreduce_runtime()
     original = torch.fx.GraphModule(gm, copy.deepcopy(gm.graph))
     lowered = eligible_collectives(original)
-    _lower_collectives(original, lowered)
+    _lower_collectives(original, lowered, tp_size)
     if not prepared._eligible(original, tp4=True):
         raise RuntimeError("Eligible TP4 graph lost its prepared replay contract")
     name = "_tp4_native_group"

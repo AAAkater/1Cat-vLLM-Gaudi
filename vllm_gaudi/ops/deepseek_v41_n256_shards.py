@@ -12,7 +12,7 @@ from vllm_gaudi.ops.deepseek_v41_weights import canonical_hash, file_hash, read_
 
 def runtime_layout(shard, *, compact_scales=None):
     if compact_scales is None:
-        compact_scales = shard.manifest.get("tensor_parallel_size", 2) == 4
+        compact_scales = shard.manifest.get("tensor_parallel_size", 2) in (4, 8)
     return (COMPACT_LAYOUT, COMPACT_FINGERPRINT) if compact_scales else (LAYOUT, FINGERPRINT)
 
 

@@ -1,0 +1,88 @@
+diff --git a/hcl/src/collective_interface/collectives/all_reduce.cpp b/hcl/src/collective_interface/collectives/all_reduce.cpp
+--- a/hcl/src/collective_interface/collectives/all_reduce.cpp
++++ b/hcl/src/collective_interface/collectives/all_reduce.cpp
+@@ -179,8 +179,9 @@
+                                                       HclCollectiveParams& params, int phase)
+ {
+     const auto& comm = params.m_dynamicComm;
+-    if (comm.getCommSize() != 4 || comm.getScaleupGroupSize() != 4 || phase < 0 || phase > 2 ||
+-        params.m_count == 0 || (phase != 2 && params.m_count % 4 != 0)) return nullptr;
++    const auto ranks = comm.getCommSize();
++    if ((ranks != 4 && ranks != 8) || comm.getScaleupGroupSize() != ranks || phase < 0 || phase > 2 ||
++        params.m_count == 0 || (phase != 2 && params.m_count % ranks != 0)) return nullptr;
+     params.m_directScaleupNicTransfer = false;
+     params.m_directScaleupNicReduction = false;
+     params.m_currentOp = phase == 0 ? eHCLReduceScatter : eHCLAllGather;
+@@ -189,7 +190,7 @@
+     auto graph = std::make_unique<HcclGraph>(engine, &params);
+     if (phase == 0)
+     {
+-        const uint64_t perRank = params.m_count / 4;
++        const uint64_t perRank = params.m_count / ranks;
+         const uint64_t offset = comm.getRankInScaleupGroup() * perRank * dataTypeSizeInBytes(params.m_dataType);
+         graph->createPrim<HcclPrimReduceScatter>(ReduceScatterPrimArgs {
+             {params.m_sendBufferAddr, params.m_recvBufferAddr + offset, {}, params.m_count}, false});
+@@ -198,7 +199,7 @@
+     {
+         graph->startStrongOrder = phase == 1;
+         graph->createPrim<HcclPrimAllGather>(params.m_sendBufferAddr, params.m_recvBufferAddr,
+-                                            phase == 1 ? params.m_count / 4 : params.m_count);
++                                            phase == 1 ? params.m_count / ranks : params.m_count);
+     }
+     graph->instantiate();
+     return graph;
+diff --git a/hcl/src/hccl/hccl.cpp b/hcl/src/hccl/hccl.cpp
+--- a/hcl/src/hccl/hccl.cpp
++++ b/hcl/src/hccl/hccl.cpp
+@@ -1511,6 +1511,7 @@
+ 
+ // Capability is an artifact property, not a serving optimization switch.
+ extern "C" uint32_t HCCL_API_CALL hcclTp4NativeGraphVersion() { return 1; }
++extern "C" uint32_t HCCL_API_CALL hcclTp8NativeGraphVersion() { return 1; }
+ 
+ extern "C" hcclResult_t HCCL_API_CALL hcclTp4NativeGraphCreate(
+     const void* sendbuff, void* recvbuff, size_t count, hcclDataType_t datatype,
+@@ -1523,12 +1524,13 @@
+                                ? size_t(64) * 5120 : size_t(32768);
+     if (!graphHandle || !sendbuff || !recvbuff || !streamHandle || datatype != hcclBfloat16 ||
+         reduceOp != hcclSum || count == 0 || count > maxCount || phase < 0 || phase > 2 ||
+-        (phase != 2 && count % 4 != 0) || (phase == 1 ? sendbuff != recvbuff : sendbuff == recvbuff))
++        (phase == 1 ? sendbuff != recvbuff : sendbuff == recvbuff))
+         return hcclInvalidArgument;
+     *graphHandle = nullptr;
+     auto* communicator = hccl_ctx.communicator(comm);
+-    if (!communicator || !communicator->getDynamicComm() || communicator->getCommSize() != 4 ||
+-        communicator->getDynamicComm()->getScaleupGroupSize() != 4) return hcclInvalidArgument;
++    if (!communicator || !communicator->getDynamicComm() || (communicator->getCommSize() != 4 && communicator->getCommSize() != 8) ||
++        communicator->getDynamicComm()->getScaleupGroupSize() != communicator->getCommSize() ||
++        (phase != 2 && count % communicator->getCommSize() != 0)) return hcclInvalidArgument;
+     try
+     {
+         const uint32_t streamId = hccl_device().nativeStreamId(streamHandle);
+diff --git a/hcl/src/platform/gaudi2/context_manager.cpp b/hcl/src/platform/gaudi2/context_manager.cpp
+--- a/hcl/src/platform/gaudi2/context_manager.cpp
++++ b/hcl/src/platform/gaudi2/context_manager.cpp
+@@ -632,7 +632,7 @@
+         // AllReduce AllGather phase sends its rank-owned receive slice.
+         // Native replay bypasses the host cache: every TP4 template must
+         // restore its own relative-rank descriptor along with its stride.
+-        if (m_device.getComm(comm).getCommSize() == 4)
++        if (m_device.getComm(comm).getCommSize() == 4 || m_device.getComm(comm).getCommSize() == 8)
+         {
+             dwordsForUpdate.DW_REMOTE_RANK = true;
+         }
+diff --git a/hcl/src/platform/gen2_arch_common/hcl_collective_routines.cpp b/hcl/src/platform/gen2_arch_common/hcl_collective_routines.cpp
+--- a/hcl/src/platform/gen2_arch_common/hcl_collective_routines.cpp
++++ b/hcl/src/platform/gen2_arch_common/hcl_collective_routines.cpp
+@@ -130,9 +130,9 @@
+     hcl::NativeHclReplayState* states, hcl::syncInfo* completions)
+ {
+     const unsigned ranks = dynamicComm.getScaleupGroupSize();
+-    VERIFY(!m_nullSubmit && (ranks == 2 || ranks == 4), "Invalid native scale-up batch runtime");
++    VERIFY(!m_nullSubmit && (ranks == 2 || ranks == 4 || ranks == 8), "Invalid native scale-up batch runtime");
+     for (const auto* capture : captures)
+-        VERIFY(ranks == 4 ? capture->tp4Phase >= 0 && capture->tp4Phase <= 2 : capture->tp4Phase == -1,
++        VERIFY(ranks > 2 ? capture->tp4Phase >= 0 && capture->tp4Phase <= 2 : capture->tp4Phase == -1,
+                "Native phase contract does not match communicator size");
+     // Match ordinary collective accounting: one receive WQE from every
+     // remote scale-up rank, on the actual RS or AG queue of this phase.

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Freeze N256 weights/scales for TP4 x PP1 or legacy TP2 x PP2."""
+"""Freeze N256 weights/scales for TP8/TP4 x PP1 or legacy TP2 x PP2."""
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -82,10 +82,10 @@ def main():
         parser.error("--workers must be between 1 and 4")
     source_manifest = json.loads((args.prepared / "manifest.json").read_text())
     tp_size, pp_size = source_manifest["tensor_parallel_size"], source_manifest["pipeline_parallel_size"]
-    if (tp_size, pp_size) not in ((4, 1), (2, 2)):
-        parser.error("N256 preparation requires TP4 x PP1 or TP2 x PP2")
+    if (tp_size, pp_size) not in ((8, 1), (4, 1), (2, 2)):
+        parser.error("N256 preparation requires TP8/TP4 x PP1 or TP2 x PP2")
     shards = [PreparedV41Shard(args.prepared, pp, tp) for pp in range(pp_size) for tp in range(tp_size)]
-    compact_scales = tp_size == 4 and not args.legacy_scales
+    compact_scales = tp_size in (4, 8) and not args.legacy_scales
     layout, fingerprint = runtime_layout(shards[0], compact_scales=compact_scales)
     required = sum(
         math.prod(spec["shape"]) * 2
@@ -114,7 +114,7 @@ def main():
             manifest["rank_files"][rank] = record
             publish_json(args.output / "progress.json", manifest)
     manifest["prepared_at"] = datetime.now(timezone.utc).isoformat()
-    # The loader accepts only this final publication after all four files are
+    # The loader accepts only this final publication after all rank files are
     # complete, reversible and hashed. Partial builds are never served.
     publish_json(args.output / "manifest.json", manifest)
 

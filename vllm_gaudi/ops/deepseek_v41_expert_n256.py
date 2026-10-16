@@ -2,7 +2,7 @@
 """Reversible N256 weight layout with bounded, load-time FP8 exponent preparation.
 
 Q16 stores four adjacent N codes at the same K. Legacy scale groups retain
-original E8M0 bytes and FP8 offsets. The compact TP4 layout retains original
+original E8M0 bytes and FP8 offsets. The compact TP4/TP8 layout retains original
 bytes plus one channel-exponent row, reconstructing the same offsets on chip.
 Both formats retain the original BF16 prefill scales exactly.
 """
@@ -167,7 +167,7 @@ def load_projection(shard, prefix, device):
     source_q = shard.catalog[prefix + "_q16"]
     source_s = shard.catalog[prefix + "_s16"]
     experts, blocks, stream = source_q.shape
-    compact_scales = getattr(shard, "manifest", {}).get("tensor_parallel_size") == 4
+    compact_scales = getattr(shard, "manifest", {}).get("tensor_parallel_size") in (4, 8)
     if blocks % 2:
         raise ValueError("Prepared shard cannot be represented by the N256 expert layout")
     q = torch.empty((experts, blocks // 2, stream * 2), dtype=torch.int16, device=device)

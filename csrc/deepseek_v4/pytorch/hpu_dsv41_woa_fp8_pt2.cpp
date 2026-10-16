@@ -21,7 +21,7 @@ habana::OutputMetaDataVector meta(const at::Stack& stack, bool quant) {
     const auto x = stack.at(0).toTensor();
     const auto groups = x.size(1);
     TORCH_CHECK(x.scalar_type() == at::kBFloat16 && x.dim() == 3 && x.size(0) >= 1 && x.size(0) <= 16384 &&
-                (x.size(1) == 2 || x.size(1) == 4) && x.size(2) == 4096, "wo_a requires BF16 [T,G2|4,4096]");
+                (x.size(1) == 1 || x.size(1) == 2 || x.size(1) == 4) && x.size(2) == 4096, "wo_a requires BF16 [T,G1|2|4,4096]");
     for (const auto& item : stack) {
         const auto t = item.toTensor();
         TORCH_CHECK(t.is_contiguous() && !t.requires_grad() && t.device() == x.device(),
@@ -39,7 +39,7 @@ habana::OutputMetaDataVector rope_meta(const at::Stack& stack) {
     const auto groups = x.size(1) / 8;
     const auto positions = stack.at(3).toTensor(), phase = stack.at(4).toTensor();
     TORCH_CHECK(x.scalar_type() == at::kBFloat16 && x.dim() == 3 && x.size(0) >= 1 && x.size(0) <= 16384 &&
-                (x.size(1) == 16 || x.size(1) == 32) && x.size(2) == 512, "rope wo_a requires BF16 [T,H16|32,512]");
+                (x.size(1) == 8 || x.size(1) == 16 || x.size(1) == 32) && x.size(2) == 512, "rope wo_a requires BF16 [T,H8|16|32,512]");
     TORCH_CHECK(w.scalar_type() == at::ScalarType::Float8_e4m3fn && w.sizes() == at::IntArrayRef({groups,4096,1024}) &&
                 scale.scalar_type() == at::kFloat && scale.sizes() == at::IntArrayRef({groups,1,1024}),
                 "rope wo_a requires prepared Gaudi2 FP8 weights and channel scales");
@@ -58,7 +58,7 @@ habana::OutputMetaDataVector rope_quant_meta(const at::Stack& stack) {
     const auto groups = x.size(1) / 8;
     const auto phase = stack.at(2).toTensor();
     TORCH_CHECK(x.scalar_type() == at::kBFloat16 && x.dim() == 3 && x.size(0) >= 1 && x.size(0) <= 16384 &&
-                (x.size(1) == 16 || x.size(1) == 32) && x.size(2) == 512, "rope wo_a quant requires BF16 [T,H16|32,512]");
+                (x.size(1) == 8 || x.size(1) == 16 || x.size(1) == 32) && x.size(2) == 512, "rope wo_a quant requires BF16 [T,H8|16|32,512]");
     TORCH_CHECK(positions.scalar_type() == at::kInt && positions.dim() == 1 && positions.size(0) == x.size(0) &&
                 phase.scalar_type() == at::kFloat && phase.dim() == 2 && phase.size(1) == 64,
                 "rope wo_a quant requires I32 [T] positions and F32 [L,64] phase");

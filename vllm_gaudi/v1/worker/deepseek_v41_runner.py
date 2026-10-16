@@ -1126,7 +1126,7 @@ class V41ModelRunner:
                 prefill_tokens=self.prefill_capacity,
             )
         self.model = get_model(vllm_config=self.vllm_config)
-        if getattr(self.model, "tensor_parallel_size", 2) == 4 and not self.use_dspark:
+        if getattr(self.model, "tensor_parallel_size", 2) in (4, 8) and not self.use_dspark:
             from vllm_gaudi.ops.deepseek_v41_completion import prepare_decode_control
 
             self.tp4_control_inputs, self.tp4_token_readback = prepare_decode_control(
@@ -1252,7 +1252,7 @@ class V41ModelRunner:
         elif self.pp.group.is_last_rank:
             sampler = self.model.program.sample_greedy_token if self.v2_completion else self.model.program.sample_greedy
             sampler_backend = "hpu_backend"
-            if getattr(self.model, "tensor_parallel_size", 2) == 4:
+            if getattr(self.model, "tensor_parallel_size", 2) in (4, 8):
                 from vllm_gaudi.compilation.deepseek_v41_tp4 import make_backend
 
                 sampler_backend = make_backend()
@@ -1720,7 +1720,7 @@ class V41ModelRunner:
                 else None
             )
             geometry_key = (id(program), getattr(program, "generation", None), search, decode_bound)
-            reuse_geometry = graph_c1 and getattr(program, "tensor_parallel_size", 2) == 4
+            reuse_geometry = graph_c1 and getattr(program, "tensor_parallel_size", 2) in (4, 8)
             if not reuse_geometry or geometry_key != getattr(self, "_decode_geometry_key", None):
                 program.search_length = search
                 program.decode_token_bound = decode_bound
@@ -1804,7 +1804,7 @@ class V41ModelRunner:
                 # next fixed input; no external position-copy recipe is needed.
                 pass
             elif self.position_bank is not None and graph_c1:
-                if getattr(self.model, "tensor_parallel_size", 2) == 4:
+                if getattr(self.model, "tensor_parallel_size", 2) in (4, 8):
                     if not self.model.decode_prefix_pending:
                         self.position_bank.copy_into(positions, start)
                 else:
@@ -1817,7 +1817,7 @@ class V41ModelRunner:
         # as decode; the legacy prompt/DSpark path keeps its bounded capture.
         use_replay = (
             getattr(self.model, "native", False)
-            or (self.v2_completion and getattr(self.model, "tensor_parallel_size", 2) == 4)
+            or (self.v2_completion and getattr(self.model, "tensor_parallel_size", 2) in (4, 8))
         ) and (
             (decode and 1 <= count <= (6 if self.use_dspark else 1))
             or (c1_replay and (self.request_slots_enabled or start + count <= 1024))
@@ -2308,7 +2308,7 @@ class V41ModelRunner:
             if not decode:
                 from vllm_gaudi.ops.deepseek_v41_decoder_halo import decoder_halo_mode
 
-                tp4_halo = getattr(program, "tensor_parallel_size", 2) == 4
+                tp4_halo = getattr(program, "tensor_parallel_size", 2) in (4, 8)
                 halo_block = self.prefill_capacity if tp4_halo else PREFILL_BLOCK_TOKENS
                 halo_mode = decoder_halo_mode(
                     start + offset,
@@ -2972,7 +2972,7 @@ class V41ModelRunner:
             "__v41_warmup__",
             [1 + index for index in range(tokens)],
             start_position,
-            decode=(native or getattr(self.model, "tensor_parallel_size", 2) == 4) and (self.use_dspark or tokens == 1),
+            decode=(native or getattr(self.model, "tensor_parallel_size", 2) in (4, 8)) and (self.use_dspark or tokens == 1),
             reset=True,
         )
         from vllm_gaudi.ops.tp2_prepared_plan import prepared_group_stats

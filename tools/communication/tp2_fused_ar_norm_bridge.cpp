@@ -56,6 +56,7 @@ namespace {
 
 constexpr char kAddGuid[] = "add_fwd_bf16";
 constexpr char kRmsNormGuid[] = "rms_norm_ex_fwd_bf16";
+constexpr int64_t kTp4PeerMaxElements = 387840;
 std::atomic<uint64_t> g_collective_launch_count{0};
 std::atomic<uint64_t> g_collective_allocate_count{0};
 std::atomic<uint64_t> g_collective_allocate_dry_count{0};
@@ -772,13 +773,13 @@ at::Tensor tp2ExchangePeer(c10d::ProcessGroupEagerHCCL *backend,
   TORCH_CHECK(tp4 || tp2ExchangeEnabled(),
               "TP2 peer exchange requires the tp2-exchange algorithm");
   if (tp4) {
-    TORCH_CHECK((reduction_only != all_gather) && !immediate && backend->getSize() == 4,
-                "TP4 requires queued stock AllReduce or AllGather on a four-rank communicator");
+    TORCH_CHECK((reduction_only != all_gather) && !immediate && (backend->getSize() == 4 || backend->getSize() == 8),
+                "TP4 requires queued stock AllReduce or AllGather on a four- or eight-rank communicator");
     TORCH_CHECK(GET_ENV_FLAG_NEW(PT_HPU_LAZY_MODE) == 0 &&
                     GET_ENV_FLAG_NEW(PT_HPU_EAGER_PIPELINE_ENABLE) &&
                     GET_ENV_FLAG_NEW(PT_HPU_EAGER_COLLECTIVE_PIPELINE_ENABLE),
                 "TP4 reduction requires the eager compute and collective pipelines");
-    TORCH_CHECK(partial.device().type() == at::kHPU && partial.numel() <= 32768 &&
+    TORCH_CHECK(partial.device().type() == at::kHPU && partial.numel() <= kTp4PeerMaxElements &&
                     partial.storage().data_ptr().get() != peer.storage().data_ptr().get(),
                 "TP4 reduction requires bounded activations with distinct storage");
   }
@@ -1156,7 +1157,7 @@ struct DeviceEngramRecipe {
     // Table geometry is static data. Address-space translation belongs to
     // the launch descriptor; making the graph tensor H2D triggers the 1.24
     // mount/shape pipeline, which is unrelated to this mapped read.
-    const bool static_table = local_heads == 6;
+    const bool static_table = local_heads == 3 || local_heads == 6;
     const auto table_type = static_table ? DATA_TENSOR : HOST_TO_DEVICE_TENSOR;
     void* compile_data = static_table ? nullptr : compile_byte.data();
     const uint64_t compile_bytes = static_table ? 0 : compile_byte.size();
@@ -1246,11 +1247,13 @@ class DeviceEngramProducer
                        bool shared_checkpoint, uint64_t local_heads = kDeviceEngramHeads, uint64_t tokens = 1)
       : token_map_(std::move(token_map)), parameters_(std::move(parameters)), local_heads_(local_heads), tokens_(tokens) {
     TORCH_CHECK(tokens_ >= 1 && tokens_ <= 6, "Device Engram requires C1-C6");
-    TORCH_CHECK(local_heads_ == 6 || local_heads_ == 12,
-                "Device Engram requires 6 or 12 local heads");
+    TORCH_CHECK(local_heads_ == 3 || local_heads_ == 6 || local_heads_ == 12,
+                "Device Engram requires 3, 6 or 12 local heads");
     auto *group = dynamic_cast<c10d::ProcessGroupEagerHCCL *>(backend.get());
     TORCH_CHECK(group != nullptr,
                 "Device Engram requires ProcessGroupEagerHCCL");
+    TORCH_CHECK(group->getSize() * local_heads_ == 24,
+                "Device Engram local heads must match the tensor communicator");
     communicator_ = group->lowLatencyCommunicator();
     TORCH_CHECK(communicator_ != nullptr,
                 "Device Engram requires an initialized HCCL communicator");
@@ -1676,12 +1679,14 @@ TORCH_LIBRARY_IMPL(hccl, Meta, library) {
 namespace py = pybind11;
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
+  module.attr("tp4_peer_max_elements") = kTp4PeerMaxElements;
   module.attr("tp4_index_gather_pair_version") = 1;
   module.def("tp4_index_gather_pair", &dsv41_index_pair::enqueue);
   module.def("tp4_index_gather_pair_launches", []() {
     return dsv41_index_pair::launches.load(std::memory_order_relaxed);
   });
   module.attr("tp4_prepared_group_version") = 1;
+  module.attr("tp8_prepared_group_version") = 1;
   module.attr("prepared_control_input_version") = 1;
   module.attr("prepared_position_bank_version") = 3;
   py::class_<dsv41_control::PreparedInputs, std::shared_ptr<dsv41_control::PreparedInputs>>(
@@ -1697,6 +1702,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
   module.def("native_tp4_decode_graph_available", []() {
     try {
       tp2_native::RuntimeApis::get().requireTp4();
+      tp2_native::RuntimeApis::get().requirePlanV2();
+      return true;
+    } catch (...) { return false; }
+  });
+  module.def("native_tp8_decode_graph_available", []() {
+    try {
+      tp2_native::RuntimeApis::get().requireTp8();
       tp2_native::RuntimeApis::get().requirePlanV2();
       return true;
     } catch (...) { return false; }

@@ -63,8 +63,8 @@ habana::OutputMetaDataVector projection_meta(const at::Stack& s) {
     const auto woa = s.at(8).toTensor(), woa_scale = s.at(9).toTensor();
     const auto positions = s.at(10).toTensor(), phase = s.at(11).toTensor();
     const auto wob = s.at(12).toTensor(), wob_scale = s.at(13).toTensor();
-    TORCH_CHECK(q.size(0) == 1 && (q.size(1) == 16 || q.size(1) == 32),
-                "Paged MLA projection requires the C1 TP4/TP2 head geometry");
+    TORCH_CHECK(q.size(0) == 1 && (q.size(1) == 8 || q.size(1) == 16 || q.size(1) == 32),
+                "Paged MLA projection requires the C1 TP8/TP4/TP2 head geometry");
     TORCH_CHECK(woa.scalar_type() == at::ScalarType::Float8_e4m3fn &&
                 woa.sizes() == at::IntArrayRef({q.size(1) / 8, 4096, 1024}) &&
                 woa_scale.scalar_type() == at::kFloat &&

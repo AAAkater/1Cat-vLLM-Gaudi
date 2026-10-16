@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Prepare immutable TP4/PP1 (or legacy TP2/PP2) files, with Engram in its source mmap."""
+"""Prepare immutable TP8/PP1, TP4/PP1 (or legacy TP2/PP2) files, with Engram in its source mmap."""
 
 import argparse
 from datetime import datetime, timezone
@@ -35,7 +35,7 @@ def main():
         help="Prepare verified backbone files while Engram downloads; publish only after all hashes pass")
     parser.add_argument("--tensor-parallel-size",
                         type=int,
-                        choices=(2, 4),
+                        choices=(2, 4, 8),
                         default=4,
                         help="Tensor parallel degree for prepared rank files (default: 4)")
     parser.add_argument("--pipeline-parallel-size",

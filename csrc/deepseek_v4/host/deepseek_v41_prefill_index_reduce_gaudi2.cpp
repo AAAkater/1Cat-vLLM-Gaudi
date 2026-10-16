@@ -11,7 +11,7 @@ tpc_lib_api::GlueCodeReturn DeepseekV41PrefillIndexReduceGaudi2::GetGcDefinition
         return GLUE_FAILED;
     const auto* parameters = static_cast<const int*>(p->nodeParams.nodeParams);
     const int ratio = parameters[0], local_heads = parameters[1];
-    if (local_heads != 8 && local_heads != 16) return GLUE_INCOMPATIBLE_INPUT_SIZE;
+    if (local_heads != 4 && local_heads != 8 && local_heads != 16) return GLUE_INCOMPATIBLE_INPUT_SIZE;
     if (ratio != 1 && ratio != 2) return GLUE_INCOMPATIBLE_INPUT_SIZE;
     if (p->inputTensorNr != 4) return GLUE_INCOMPATIBLE_INPUT_COUNT;
     if (p->outputTensorNr != 1) return GLUE_INCOMPATIBLE_OUTPUT_COUNT;

@@ -30,7 +30,7 @@ tpc_lib_api::GlueCodeReturn DeepseekV41WoaGaudi2::GetGcDefinitions(
     const auto& a = p->inputTensors[0].geometry;
     const auto& b = p->outputTensors[0].geometry;
     const auto groups = quant_ ? b.maxSizes[2] : a.maxSizes[2];
-    if (groups != 2 && groups != 4) return GLUE_INCOMPATIBLE_INPUT_SIZE;
+    if (groups != 1 && groups != 2 && groups != 4) return GLUE_INCOMPATIBLE_INPUT_SIZE;
     const auto tokens = product_ ? 1 : (quant_ ? a.maxSizes[2] : a.maxSizes[1]);
     if (tokens < 1 || tokens > 16384 || a.dims != (product_ ? 2u : 3u) || b.dims != 3)
         return GLUE_INCOMPATIBLE_INPUT_SIZE;

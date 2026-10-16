@@ -286,7 +286,7 @@ class PreparedMoE(nn.Module):
         self.normal_scales, self.reduce = normal_scales, reduce
         self.register_buffer("lookup", lookup, False)
         n256_fp8 = (topk == 6 and gaudi_envs.VLLM_HPU_DSV41_EXPERT_N256_FP8)
-        if tensor_parallel_size == 4 and not n256_fp8 and not draft:
+        if tensor_parallel_size in (4, 8) and not n256_fp8 and not draft:
             raise ValueError("TP4 requires the optimized N256 FP8 MoE; generic MoE is not a serving fallback")
         # MTP keeps its checkpoint top-3/128-expert router. The common flag
         # selects this kernel only for the target's top-6/384-expert contract.
@@ -318,9 +318,9 @@ class PreparedMoE(nn.Module):
         self.register_buffer("fp8_w2_scale", None, False)
         self.n256 = topk == 6 and (gaudi_envs.VLLM_HPU_DSV41_EXPERT_N256 or gaudi_envs.VLLM_HPU_DSV41_EXPERT_N256_FP8)
         self.n256_fp8 = self.n256 and gaudi_envs.VLLM_HPU_DSV41_EXPERT_N256_FP8
-        if tensor_parallel_size == 4 and not self.n256_fp8 and not draft:
+        if tensor_parallel_size in (4, 8) and not self.n256_fp8 and not draft:
             raise ValueError("TP4 requires the optimized N256 FP8 MoE; generic MoE is not a serving fallback")
-        if tensor_parallel_size == 4 and gaudi_envs.VLLM_HPU_DSV41_PREFILL_MXFP4:
+        if tensor_parallel_size in (4, 8) and gaudi_envs.VLLM_HPU_DSV41_PREFILL_MXFP4:
             raise ValueError("TP4 prefill requires the V4.1 clipped, FP32-routed prepared MoE path")
         self.prefill_mxfp4 = self.n256 and gaudi_envs.VLLM_HPU_DSV41_PREFILL_MXFP4
         self.prefill_grouped = self.n256 and gaudi_envs.VLLM_HPU_DSV41_PREFILL_GROUPED
@@ -442,7 +442,8 @@ class PreparedMoE(nn.Module):
     def refresh_sat_eligibility(self):
         self.c6_token_wide_load16 = False
         self.c6_token_wide_sat = (
-            self.n256_fused
+            self.tensor_parallel_size != 8
+            and self.n256_fused
             and getattr(self.weights.experts.w13_q16, "dsv41_sat_eligible", False)
             and getattr(self.weights.experts.w2_q16, "dsv41_sat_eligible", False)
             and hasattr(torch.ops.custom_op, "custom_deepseek_v41_expert_n256_moe_token_wide_sat_fp8_gaudi2")
@@ -1452,7 +1453,7 @@ class PreparedDecoderLayer(nn.Module):
         # replicated Q/KV inputs on layers without a full hidden-state consumer.
         self.sequence_qkv_input = tensor_parallel_size == 4
         self.mhc_post_collapse = (
-            tensor_parallel_size == 4 or gaudi_envs.VLLM_HPU_DSV41_PEER_POST_COLLAPSE
+            tensor_parallel_size in (4, 8) or gaudi_envs.VLLM_HPU_DSV41_PEER_POST_COLLAPSE
         ) and hasattr(
             torch.ops.custom_op, "custom_deepseek_v41_mhc_post_collapse_gaudi2"
         )
@@ -1639,7 +1640,7 @@ class PreparedDecoderLayer(nn.Module):
         # The fused update depends on the four mHC streams, not TP heads.
         # TP4 needs it even before the other prefill regions are enabled:
         # the eager broadcast otherwise materializes [T,4,4,5120] FP32.
-        fused_post = prefill or (self.moe.tensor_parallel_size == 4 and residual.shape[0] > 6)
+        fused_post = prefill or (self.moe.tensor_parallel_size in (4, 8) and residual.shape[0] > 6)
         post_update = _prefill_hc_post if fused_post else hc_post
         if prefill_sequence:
             if not prefill or self.moe.tensor_parallel_size != 4 or residual.shape[0] * 4 != positions.numel():
@@ -2532,7 +2533,7 @@ class PreparedStage(nn.Module):
 
             runtime_shard = getattr(self.shard, "_n256_runtime_shard", None)
             compact_expert_scales = (
-                runtime_shard.layout == COMPACT_LAYOUT if runtime_shard is not None else self.tensor_parallel_size == 4
+                runtime_shard.layout == COMPACT_LAYOUT if runtime_shard is not None else self.tensor_parallel_size in (4, 8)
             )
             enabled_layers = set(self.expert_n256_config["routed_experts"])
             for layer in self.layers:
@@ -2739,7 +2740,7 @@ class PreparedStage(nn.Module):
             residual, pre_mix = residual.take()
         retire = (
             torch.hpu.Event()
-            if getattr(self, "tensor_parallel_size", 2) == 4
+            if getattr(self, "tensor_parallel_size", 2) in (4, 8)
             and residual.device.type == "hpu"
             and residual.shape[0] > 8192
             else None
@@ -2791,7 +2792,7 @@ class PreparedStage(nn.Module):
         are compacted after its last consumer, before the suffix Reindex layers.
         The scheduler selects this only for the qualified text-prompt geometry.
         """
-        tp4 = getattr(self, "tensor_parallel_size", 2) == 4
+        tp4 = getattr(self, "tensor_parallel_size", 2) in (4, 8)
         supported = (tp4 and self.pp_rank == 0 and self.start in (0, 20)) or (
             not tp4 and self.pp_rank == 1 and self.start == 20
         )
@@ -2903,7 +2904,7 @@ class PreparedStage(nn.Module):
         normal prefill ordering and does not turn the request into C1/C6.
         """
         if isinstance(residual, PrefillInput):
-            if self.tensor_parallel_size != 4 or not (
+            if self.tensor_parallel_size not in (4, 8) or not (
                 gaudi_envs.VLLM_HPU_DSV41_PREFILL_GROUPED or gaudi_envs.VLLM_HPU_DSV41_PREFILL_MXFP4
             ):
                 raise RuntimeError("Owned prefill requires the full-chunk TP4 expert path")
@@ -2920,7 +2921,7 @@ class PreparedStage(nn.Module):
         tokens = residual.shape[0]
         if (
             gaudi_envs.VLLM_HPU_DSV41_PREFILL_DECODER_HALO
-            and (self.pp_rank == 1 or getattr(self, "tensor_parallel_size", 2) == 4)
+            and (self.pp_rank == 1 or getattr(self, "tensor_parallel_size", 2) in (4, 8))
             and tokens > 6
             and self.prefill_halo_mode != "full"
         ):
@@ -3090,7 +3091,7 @@ class PreparedLayerGroup(nn.Module):
         super().__init__()
         self.fp8_decode = fp8_decode
         self.decode = decode
-        self.preserve_layer_rounding = getattr(stage, "tensor_parallel_size", 2) == 4
+        self.preserve_layer_rounding = getattr(stage, "tensor_parallel_size", 2) in (4, 8)
         self.pp_wire_input = pp_wire_input and start == 0
         self.text_input = fused_text_io and stage.pp_rank == 0 and start == 0
         is_last_stage = getattr(stage, "is_last_stage", stage.pp_rank == 1)
@@ -3314,7 +3315,7 @@ class CompiledStage:
         if replay_tail and getattr(stage, "device_input_feedback", False) and not native_input:
             raise ValueError("Input feedback requires private roots owned by the native input variant")
         backend = "hpu_backend"
-        if not native and getattr(stage, "tensor_parallel_size", 2) == 4:
+        if not native and getattr(stage, "tensor_parallel_size", 2) in (4, 8):
             from vllm_gaudi.compilation.deepseek_v41_tp4 import make_backend
 
             backend = make_backend(native_group_owner=stage if prepared_tp4 and native_tp4 else None)
@@ -3359,14 +3360,14 @@ class CompiledStage:
                 pp_wire_input=pp_wire_input,
                 fused_text_io=fused_text_io,
                 fp8_decode=getattr(stage, "fp8_decode", False),
-                decode=native or getattr(stage, "tensor_parallel_size", 2) == 4,
+                decode=native or getattr(stage, "tensor_parallel_size", 2) in (4, 8),
                 replay_tail=replay_tail,
             )
             for start in range(0, len(stage.layers), group_size)
         )
         if native_input:
             self.groups[0].native_input = PreparedInput(stage.weights.embed, stage.tp_rank, stage.reduce)
-        tp4_owner = stage if not native and prepared_tp4 and getattr(stage, "tensor_parallel_size", 2) == 4 else None
+        tp4_owner = stage if not native and prepared_tp4 and getattr(stage, "tensor_parallel_size", 2) in (4, 8) else None
         compile_options = {"native": native, "backend": backend}
         if tp4_owner is not None:
             compile_options["tp4_owner"] = tp4_owner
@@ -3393,7 +3394,7 @@ class CompiledStage:
                 (index for index, group in enumerate(self.groups) if any(layer.layer == 14 for layer in group.layers)),
                 0,
             )
-            if getattr(stage, "tensor_parallel_size", 2) == 4
+            if getattr(stage, "tensor_parallel_size", 2) in (4, 8)
             else 0
         )
         self.prefix_generation = None
@@ -3522,7 +3523,7 @@ class CompiledStage:
             and input_ids.dtype == torch.int32
             and len(engram) == 2
             and engram[0].dtype == torch.bfloat16
-            and getattr(self.owner, "tensor_parallel_size", 2) == 4
+            and getattr(self.owner, "tensor_parallel_size", 2) in (4, 8)
         ):
             self.prefix_generation = self._prefix_key(self.owner.search_length)
         return hidden, pre_mix, aux

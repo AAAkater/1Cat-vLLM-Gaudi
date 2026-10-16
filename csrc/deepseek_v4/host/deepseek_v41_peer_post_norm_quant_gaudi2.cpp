@@ -17,7 +17,7 @@ tpc_lib_api::GlueCodeReturn DeepseekV41PeerPostNormQuantGaudi2::GetGcDefinitions
     const auto& post=in->inputTensors[2].geometry;const auto& comb=in->inputTensors[3].geometry;
     const auto& pre=in->inputTensors[4].geometry;const auto& w=in->inputTensors[5].geometry;
     if(v.dims!=3 || v.maxSizes[0]!=5120 || v.maxSizes[1]!=tokens ||
-       (v.maxSizes[2]!=1 && v.maxSizes[2]!=2 && v.maxSizes[2]!=4) ||
+       (v.maxSizes[2]!=1 && v.maxSizes[2]!=2 && v.maxSizes[2]!=4 && v.maxSizes[2]!=8) ||
        r.dims!=3 || r.maxSizes[0]!=5120 || r.maxSizes[1]!=4 || (tokens<1 || tokens>6) ||
        post.dims!=2 || post.maxSizes[0]!=4 || post.maxSizes[1]!=tokens ||
        pre.dims!=2 || pre.maxSizes[0]!=4 || pre.maxSizes[1]!=tokens ||

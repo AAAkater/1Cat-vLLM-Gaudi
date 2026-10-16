@@ -39,9 +39,10 @@ class NativeTp2GraphProbe : public std::enable_shared_from_this<NativeTp2GraphPr
     TORCH_CHECK(weight_.numel() == 5120 && weight_.scalar_type() == at::kBFloat16 &&
                     weight_.is_contiguous() && weight_.device() == input_.device(),
                 "Native TP2 graph probe weight mismatch");
-    tp4_ = group->getSize() == 4;
-    TORCH_CHECK(tp4_ || group->getSize() == 2, "Native graph probe requires two or four ranks");
-    if (tp4_) RuntimeApis::get().requireTp4();
+    tp4_ = group->getSize() == 4 || group->getSize() == 8;
+    TORCH_CHECK(tp4_ || group->getSize() == 2, "Native graph probe requires two, four or eight ranks");
+    if (group->getSize() == 8) RuntimeApis::get().requireTp8();
+    else if (tp4_) RuntimeApis::get().requireTp4();
     else TORCH_CHECK(tp2ExchangeEnabled(), "Native TP2 graph probe requires the dedicated TP2 exchange algorithm");
 
     communicator_ = group->lowLatencyCommunicator();

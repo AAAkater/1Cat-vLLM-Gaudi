@@ -16,7 +16,7 @@ tpc_lib_api::GlueCodeReturn DeepseekV41WoaScaleDenseQuantGaudi2::GetGcDefinition
     const auto& q = in->outputTensors[0].geometry;
     const auto& qs = in->outputTensors[1].geometry;
     const auto groups = p.maxSizes[2];
-    if (p.dims != 3 || p.maxSizes[0] != 1024 || p.maxSizes[1] != 1 || (groups != 2 && groups != 4) ||
+    if (p.dims != 3 || p.maxSizes[0] != 1024 || p.maxSizes[1] != 1 || (groups != 1 && groups != 2 && groups != 4) ||
         w.dims != 3 || w.maxSizes[0] != 1024 || w.maxSizes[1] != 1 || w.maxSizes[2] != groups ||
         s.dims != 3 || s.maxSizes[0] != 1 || s.maxSizes[1] != 1 || s.maxSizes[2] != groups)
         return GLUE_INCOMPATIBLE_INPUT_SIZE;

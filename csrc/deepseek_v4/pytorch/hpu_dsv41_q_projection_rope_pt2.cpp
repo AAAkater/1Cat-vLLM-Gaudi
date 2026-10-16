@@ -39,7 +39,7 @@ habana::OutputMetaDataVector meta(const at::Stack& stack, bool epilogue) {
     }
     const auto w = stack.at(1).toTensor(), s = stack.at(2).toTensor();
     const auto width = epilogue ? (x.dim() == 2 ? x.size(1) : 0) : (w.dim() == 2 ? w.size(0) : 0);
-    TORCH_CHECK(width == 8192 || width == 16384, "Q projection requires TP2/TP4 width");
+    TORCH_CHECK(width == 4096 || width == 8192 || width == 16384, "Q projection requires TP2/TP4/TP8 width");
     const auto rows = x.dim() == 2 ? x.size(0) : 0;
     TORCH_CHECK(rows >= 1 && rows <= 64, "Q projection requires 1..64 request rows");
     if (epilogue) {
@@ -65,7 +65,7 @@ habana::OutputMetaDataVector norm_meta(const at::Stack& stack) {
     const auto x = stack.at(0).toTensor(), norm = stack.at(1).toTensor();
     const auto w = stack.at(2).toTensor(), s = stack.at(3).toTensor();
     const auto width = w.size(0);
-    TORCH_CHECK(width == 8192 || width == 16384, "Q projection requires TP2/TP4 width");
+    TORCH_CHECK(width == 4096 || width == 8192 || width == 16384, "Q projection requires TP2/TP4/TP8 width");
     const auto pos = stack.at(4).toTensor(), table = stack.at(5).toTensor();
     const auto epsilon = stack.at(6).toDouble();
     const auto rows = x.dim() == 2 ? x.size(0) : 0;
@@ -94,12 +94,12 @@ habana::OutputMetaDataVector bf16_meta(const at::Stack& stack) {
     const auto x=stack.at(0).toTensor(),w=stack.at(1).toTensor();
     const auto p=stack.at(2).toTensor(),phase=stack.at(3).toTensor();
     TORCH_CHECK(x.dim()==2 && x.size(0)>=1 && x.size(0)<=64 && x.size(1)==1280 &&
-                w.dim()==2 && (w.size(0)==8192 || w.size(0)==16384) && w.size(1)==1280 &&
+                w.dim()==2 && (w.size(0)==4096 || w.size(0)==8192 || w.size(0)==16384) && w.size(1)==1280 &&
                 x.scalar_type()==at::kBFloat16 && w.scalar_type()==at::kBFloat16 &&
                 p.scalar_type()==at::kInt && p.sizes()==at::IntArrayRef({x.size(0)}) &&
                 phase.scalar_type()==at::kFloat && phase.dim()==2 && phase.size(1)==64 &&
                 phase.size(0)>0 && phase.size(0)<=1048576,
-                "BF16 Q projection requires actual TP2/TP4 weights, I32 positions and F32 RoPE table");
+                "BF16 Q projection requires actual TP2/TP4/TP8 weights, I32 positions and F32 RoPE table");
     for(int i=0;i<4;++i) {
         const auto t=stack.at(i).toTensor();
         TORCH_CHECK(t.is_contiguous() && !t.requires_grad() && t.device()==x.device());

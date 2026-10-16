@@ -68,8 +68,8 @@ def device_engram_parameters(layout, layer, tp_rank, pad_id, tensor_parallel_siz
         result.extend((_signed_i32_bits(bits), _signed_i32_bits(bits >> 32)))
     first, last = shard["head_start"], shard["head_stop"]
     primes = [int(value) for value in layout.primes[layer_index, first:last]]
-    if len(primes) not in (6, 12):
-        raise ValueError("Device Engram supports TP2/TP4 head shards")
+    if len(primes) not in (3, 6, 12):
+        raise ValueError("Device Engram supports TP2/TP4/TP8 head shards")
     # Keep the existing TPC parameter offsets. The index space runs only the
     # actual local heads; padding has no table accesses or arithmetic work.
     padding = 12 - len(primes)
@@ -393,8 +393,8 @@ class EngramHost:
         self.directory, self.tp_rank = Path(directory), tp_rank
         manifest = json.loads((self.directory / "manifest.json").read_text())
         self.tensor_parallel_size = manifest.get("tensor_parallel_size", 2)
-        self.prefill_hash_local = self.tensor_parallel_size == 4
-        if self.tensor_parallel_size not in (2, 4):
+        self.prefill_hash_local = self.tensor_parallel_size in (4, 8)
+        if self.tensor_parallel_size not in (2, 4, 8):
             raise RuntimeError("Prepared Engram manifest has an unsupported tensor parallel size")
         if not 0 <= tp_rank < self.tensor_parallel_size:
             raise ValueError("Invalid Engram TP rank for the prepared manifest")
@@ -501,10 +501,10 @@ class EngramHost:
                 [self.tables[layer] for layer in layers],
                 targets,
             )
-        if device_c1_enabled and self.tensor_parallel_size in (2, 4):
+        if device_c1_enabled and self.tensor_parallel_size in (2, 4, 8):
             self._initialize_device_c1(host, device)
         elif gaudi_envs.VLLM_HPU_DSV41_V2_DEVICE_ENGRAM:
-            raise RuntimeError("Device Engram requires a TP2 or TP4 head shard")
+            raise RuntimeError("Device Engram requires a TP2, TP4 or TP8 head shard")
         self.batches = None
         if envs.VLLM_HPU_DSV41_BATCHED_INPUT_STAGING and max_tokens == 6:
             if not envs.VLLM_HPU_DSV41_FUSED_STAGE_IO:
@@ -546,7 +546,7 @@ class EngramHost:
 
         self.device_reference = (
             torch.compile(stage_device_engram_rows, backend=make_backend(), fullgraph=True, dynamic=False)
-            if self.tensor_parallel_size == 4
+            if self.tensor_parallel_size in (4, 8)
             else stage_device_engram_rows
         )
         self.prefix_late_placeholder = self.c1_packets[0].buffers[1]
@@ -563,7 +563,7 @@ class EngramHost:
         if shared and getattr(bridge, "device_engram_shared_mapping_version", 0) != 1:
             raise RuntimeError("The TP2 bridge cannot share the resident Engram backing")
         mapping_options = {"shared_checkpoint": True} if shared else {}
-        if self.tensor_parallel_size == 4:
+        if self.tensor_parallel_size in (4, 8):
             if getattr(bridge, "device_engram_tp4_version", 0) != 3:
                 raise RuntimeError(
                     "Rebuild the device Engram producer with the TP4 static-table and mapped-launch contract"
@@ -742,7 +742,7 @@ class EngramHost:
         head_range = None
         if count == 16384 and getattr(self, "prefill_hash_local", False):
             bounds = {(item["head_start"], item["head_stop"]) for item in self.shards.values()}
-            if self.tensor_parallel_size != 4 or len(bounds) != 1:
+            if self.tensor_parallel_size not in (4, 8) or len(bounds) != 1:
                 raise RuntimeError("Local prompt hashing requires matching TP4 head ownership")
             head_range = bounds.pop()
         batch = self.history.prepare(request_id, token_ids, image_mask, head_range=head_range)
@@ -910,7 +910,7 @@ class EngramHost:
         ):
             raise RuntimeError("Stale or already bound deferred Engram preparation")
         if (
-            self.tensor_parallel_size != 4
+            self.tensor_parallel_size not in (4, 8)
             or ticket.packet
             or ticket.batch.hash_ids.shape[0] != 16384
             or getattr(self, "batches", None) is not None
