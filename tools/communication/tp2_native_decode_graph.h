@@ -245,6 +245,11 @@ inline bool mhcOverlapEnabled() {
   return value && (std::strcmp(value, "1") == 0 || strcasecmp(value, "true") == 0);
 }
 
+inline bool diagnosticLoggingEnabled() {
+  const char* value = std::getenv("VLLM_LOGGING_LEVEL");
+  return value && strcasecmp(value, "DEBUG") == 0;
+}
+
 inline bool segmentedPrefixEnabled() {
   const char* value = std::getenv("VLLM_HPU_DSV41_V2_SEGMENTED_PREFIX");
   return value && (std::strcmp(value, "1") == 0 || strcasecmp(value, "true") == 0);
@@ -1080,8 +1085,10 @@ class NativeDecodeGraph : public std::enable_shared_from_this<NativeDecodeGraph>
         std::vector<NativeBufferRange> late;
         for (const auto& input : late_inputs_) late.push_back(tensorRange(input));
         input_prefix_ = prepareNativeInputPrefix(bindings, late, prepared_dependencies_);
-        std::fprintf(stderr, "NATIVE_INPUT_PREFIX_VERIFIED computes=%u collectives=%zu late_inputs=%zu\n",
-                     input_prefix_.computes, input_prefix_.collectives, late.size());
+        if (diagnosticLoggingEnabled()) {
+          std::fprintf(stderr, "NATIVE_INPUT_PREFIX_VERIFIED computes=%u collectives=%zu late_inputs=%zu\n",
+                       input_prefix_.computes, input_prefix_.collectives, late.size());
+        }
       }
       TORCH_CHECK(prepared_dependencies_.size() == topology.consumers.size(),
                   "Explicit TP dependency coverage differs");
@@ -1092,9 +1099,11 @@ class NativeDecodeGraph : public std::enable_shared_from_this<NativeDecodeGraph>
         prepared_producers_.push_back(dep.producer);
         prepared_consumers_.push_back(dep.consumer);
         overlapped += dep.producer != UINT32_MAX && dep.consumer > dep.producer + 1;
-        std::fprintf(stderr, "NATIVE_TP_DEPENDENCY i=%zu producer=%u consumer=%u last_consumer=%u bytes=%llu\n",
-                     index, dep.producer, dep.consumer, dep.lastConsumer,
-                     static_cast<unsigned long long>(dep.input.bytes));
+        if (diagnosticLoggingEnabled()) {
+          std::fprintf(stderr, "NATIVE_TP_DEPENDENCY i=%zu producer=%u consumer=%u last_consumer=%u bytes=%llu\n",
+                       index, dep.producer, dep.consumer, dep.lastConsumer,
+                       static_cast<unsigned long long>(dep.input.bytes));
+        }
       }
       TORCH_CHECK(overlapped > 0 || !require_independent_overlap_,
                   "V4.1 overlap graph has no independent compute between TP producer and consumer");

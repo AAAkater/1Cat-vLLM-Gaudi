@@ -378,7 +378,7 @@ def make_backend(*, static_int32=False, static_factories=False, static_clamps=Fa
                 torch.ops.vllm_gaudi.tp_peer_allgather_scheduled.default,
             ), mark_tensor_ready=mark_tensor_ready)
             ctx.graph_module._dsv41_mhc_producer_merges = merged
-            logger().info("V4.1 independent mHC branches joined to payload producers: %s", merged)
+            logger().debug("V4.1 independent mHC branches joined to payload producers: %s", merged)
         from vllm_gaudi import envs
 
         tile_partitions = 0
@@ -386,7 +386,7 @@ def make_backend(*, static_int32=False, static_factories=False, static_clamps=Fa
             from vllm_gaudi.compilation.deepseek_v41_reindex import split_reindex_tiles
 
             tile_partitions = split_reindex_tiles(ctx.graph_module)
-        logger().info(
+        logger().debug(
             "V4.1 TP/mHC partition transform examined %d modules, split %d",
             sum(node.op == "call_module" for node in ctx.graph_module.graph.nodes),
             len(audit),
@@ -396,9 +396,9 @@ def make_backend(*, static_int32=False, static_factories=False, static_clamps=Fa
             # canonicalized views and rejects their saved storage offsets.
             # New calls/getitems inherit the exact child-output contract above.
             passes.pass_add_fused_op_metadata(ctx)
-            logger().info("V4.1 TP/mHC independent partitions: %s", audit)
+            logger().debug("V4.1 TP/mHC independent partitions: %s", audit)
             if tile_partitions:
-                logger().info("V4.1 isolated optional Reindex tile recipes: %d", tile_partitions)
+                logger().debug("V4.1 isolated optional Reindex tile recipes: %d", tile_partitions)
         return bool(audit or tile_partitions or memory_resets)
 
     def backend(graph, inputs, **kwargs):
