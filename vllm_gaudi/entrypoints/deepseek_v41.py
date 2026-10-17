@@ -851,6 +851,19 @@ def prepare_environment(model=None, sidecars=None, tensor_parallel_size=4, pipel
         os.environ.setdefault(key, value)
 
 
+def resident_device_engram_layers(gaudi_envs):
+    """Share every table registered by the selected device input producers."""
+    closed_loop = gaudi_envs.VLLM_HPU_DSV41_V2_DEVICE_ENGRAM and gaudi_envs.VLLM_HPU_DSV41_DEVICE_CLOSED_LOOP
+    device_rounds = (gaudi_envs.VLLM_HPU_DSV41_DSPARK and gaudi_envs.VLLM_HPU_DSV41_DEVICE_VERIFY
+                     and gaudi_envs.VLLM_HPU_DSV41_DEVICE_ROUNDS)
+    # DeviceEngramRounds registers both tables, in addition to the ordinary
+    # layer-1 producer. Each registration must reuse the resident memfd;
+    # registering a private checkpoint mapping copies its complete range.
+    if closed_loop or device_rounds:
+        return (1, 14)
+    return (1, ) if gaudi_envs.VLLM_HPU_DSV41_V2_DEVICE_ENGRAM else ()
+
+
 def main():
     bootstrap = argparse.ArgumentParser(add_help=False)
     bootstrap.add_argument("--settings", type=Path)
@@ -1058,7 +1071,7 @@ def main():
                 EngramDeviceGate, EngramResidency, EngramStartup, table_regions,
             )
 
-            device_layers = (1, ) if gaudi_envs.VLLM_HPU_DSV41_V2_DEVICE_ENGRAM else ()
+            device_layers = resident_device_engram_layers(gaudi_envs)
             tables = EngramResidency(table_regions(args.model),
                                      args.engram_host_budget_gib * 1024**3,
                                      device_layers=device_layers)

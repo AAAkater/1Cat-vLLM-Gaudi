@@ -311,6 +311,32 @@ def prefill_search_warmups(maximum, capacity, *, reuse_index_keys=True):
                 yield start, count
 
 
+
+def scalar_prefill_search_warmups(maximum, *, reuse_index_keys=True):
+    """Cover C1 prompt tails whose transaction search differs from decode.
+
+    A scalar tail keeps its enclosing prefill transaction's search geometry.
+    In particular, shared-key prefill can use a 16K search while ordinary
+    decode uses 32K. Include every visible-prefix variant of these searches;
+    callers can subtract the native decode geometries already qualified.
+    """
+    from vllm_gaudi.ops.deepseek_v41_config import decode_source_window_quantum
+
+    lower = 0
+    while lower < maximum:
+        search = prefill_search_length(lower, 1, maximum, reuse_index_keys=reuse_index_keys)
+        if search <= 32768:
+            quantum = decode_source_window_quantum(search)
+            # Align to the visible-prefix boundaries, not to the first token
+            # of a search bucket. This also covers a partial final window.
+            positions = dict.fromkeys(max(lower, start) for start in range(0, search, quantum))
+        else:
+            # StageReplay keys include visible_prefix only through 32K.
+            positions = (lower,)
+        for start in positions:
+            yield start, search
+        lower = search
+
 def _exchange_payload_views(exchange_wire, capacity, hidden_slots=4, hidden_width=5120):
     """Return views for one native-BF16 stage-boundary payload.
 
@@ -2952,7 +2978,7 @@ class V41ModelRunner:
         return value if self.pp.group.is_last_rank else None
 
     @torch.inference_mode()
-    def _dummy_run(self, tokens, *, native=False, start_position=0):
+    def _dummy_run(self, tokens, *, native=False, start_position=0, search_length=None):
         logger.info(
             "V4.1 PP%d C%d warmup target start (native=%s, preceding steps=%d)",
             self.model.pp_rank,
@@ -2974,6 +3000,7 @@ class V41ModelRunner:
             start_position,
             decode=(native or getattr(self.model, "tensor_parallel_size", 2) in (4, 8)) and (self.use_dspark or tokens == 1),
             reset=True,
+            **({"search_length": search_length} if search_length is not None else {}),
         )
         from vllm_gaudi.ops.tp2_prepared_plan import prepared_group_stats
 
@@ -3208,6 +3235,29 @@ class V41ModelRunner:
                     self._dummy_run(count, native=self.model.native, start_position=start_position)
                 if self.model.native:
                     self.model.program.replay_owner.require_ready(count, search=search)
+            if count == 1 and runtime and self.model.native and not self.use_dspark:
+                def qualification_position_key(start, search):
+                    # Preserve every original boundary probe even when the
+                    # opt-in C1 bound shares one wider captured graph. This
+                    # key schedules qualification positions, not replay. The
+                    # actual _forward bound and require_ready use the same
+                    # runtime-indexer geometry as public requests.
+                    return (search, decode_source_prefix_bound(
+                        start + 1, search, self.model.tensor_parallel_size, runtime_indexer=False)
+                            if search <= 32768 else None)
+
+                qualified = {qualification_position_key(start, search) for start, search in geometries}
+                for start_position, search in scalar_prefill_search_warmups(
+                        self.model.program.length, reuse_index_keys=envs.VLLM_HPU_DSV41_PREFILL_REINDEX_REUSE):
+                    key = qualification_position_key(start_position, search)
+                    if key in qualified:
+                        continue
+                    logger.info("V4.1 PP%d warming scalar-prefill C1 search=%d visible_prefix=%s at position %d",
+                                self.model.pp_rank, search, key[1], start_position)
+                    for _ in range(4):
+                        self._dummy_run(1, native=True, start_position=start_position, search_length=search)
+                    self.model.program.replay_owner.require_ready(1, search=search)
+                    qualified.add(key)
             self.graphed_buckets.add(count)
         if (
             not self.use_dspark

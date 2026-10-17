@@ -188,7 +188,7 @@ def test_tp_only_stage_inherits_c1_except_pipeline_transport(monkeypatch, tmp_pa
 def test_rejects_unsupported_topology_before_changing_environment(monkeypatch, tmp_path, tp, pp):
     _clear_profile(monkeypatch)
     before = dict(os.environ)
-    with pytest.raises(ValueError, match="TP4 x PP1"):
+    with pytest.raises(ValueError, match=r"TP4/TP8 x PP1"):
         prepare_default_fastpaths(tmp_path, tensor_parallel_size=tp, pipeline_parallel_size=pp)
     assert dict(os.environ) == before
 

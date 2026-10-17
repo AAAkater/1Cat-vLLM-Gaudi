@@ -14,6 +14,27 @@ def _bf16_boundary(value):
         1, -1)).reshape(value.shape)
 
 
+def _ordered_reindex_scores(dots, weights, positions, rows, ratio, local_heads):
+    """Retain TP shard rounding with the existing per-query reducer ABI.
+
+    TP2 keeps its qualified two-by-sixteen reducer. TP4 requires four groups
+    of eight heads. Its maintained per-query row-plane ABI accepts at most
+    six requests, so four-row slices also cover B8 and larger batch buckets.
+    Every slice retains its own positions and logical rows.
+    """
+    if local_heads not in (4, 8, 16):
+        raise ValueError("Reindex MME requires TP2/TP4/TP8 head groups")
+    if local_heads == 16:
+        return torch.ops.custom_op.custom_deepseek_v41_index_reduce_gaudi2(dots.contiguous(), weights)
+    reduced = []
+    for first in range(0, dots.shape[0], 4):
+        stop = min(first + 4, dots.shape[0])
+        reduced.append(torch.ops.custom_op.custom_deepseek_v41_prefill_index_reduce_gaudi2(
+            dots[first:stop].contiguous(), weights[first:stop].contiguous(),
+            positions[first:stop].contiguous(), rows[first:stop].contiguous(), ratio, local_heads))
+    return torch.cat(reduced, 0) if len(reduced) > 1 else reduced[0]
+
+
 def reindex_mme_scores(query, weights, cache, pages, positions, candidates, ratio, tile=2048, *,
                        tiled_keys=False, local_heads=16):
     if tile not in (512, 1024, 2048) or ratio not in (1, 2):
@@ -36,7 +57,7 @@ def reindex_mme_scores(query, weights, cache, pages, positions, candidates, rati
                   if tiled_keys else torch.ops.custom_op.custom_deepseek_v41_index_keys_gaudi2)
         keys = gather(cache, pages, rows, ratio)
         dots = _bf16_boundary(torch.bmm(query, keys.transpose(1, 2)))
-        scores = torch.ops.custom_op.custom_deepseek_v41_index_reduce_gaudi2(dots.contiguous(), weights)
+        scores = _ordered_reindex_scores(dots, weights, positions, rows, ratio, local_heads)
         outputs.append(scores.masked_fill(~valid, -torch.inf))
     return torch.cat(outputs, -1)
 

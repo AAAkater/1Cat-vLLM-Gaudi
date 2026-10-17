@@ -26,7 +26,7 @@ from vllm_gaudi.ops.deepseek_v41_math import (
     unpack_swa,
 )
 from vllm_gaudi.ops.deepseek_v41_shard_loader import PreparedV41Shard
-from vllm_gaudi.ops.deepseek_v41_shared_experts import shared_expert_moe
+from vllm_gaudi.ops.deepseek_v41_shared_experts import bf16_boundary, shared_expert_moe
 from vllm_gaudi.ops.deepseek_v41_weights import canonical_hash
 from vllm_gaudi.ops.deepseek_v41_trace import prefill_scope
 from vllm_gaudi.ops.deepseek_v41_native_trace import prefill_span
@@ -651,8 +651,7 @@ class PreparedMoE(nn.Module):
             if 2 <= value.shape[0] <= 6:
                 # Match the one-row BF16 projection boundary when Synapse
                 # combines the multi-row GEMM and its FP32 SiLU consumer.
-                projected = torch.ops.custom_op.custom_deepseek_v41_bf16_identity_gaudi2(
-                    projected.reshape(1, -1)).reshape(projected.shape)
+                projected = bf16_boundary(projected)
             projected = projected.float()
             gate, up = projected.chunk(2, dim=-1)
             gate = gate.clamp(max=10.0)
@@ -662,8 +661,7 @@ class PreparedMoE(nn.Module):
             up = linear(value, shared.w3).float().clamp(-10.0, 10.0)
         middle = (F.silu(gate) * up).to(value.dtype)
         if self.shared_gate_up and 2 <= value.shape[0] <= 6:
-            middle = torch.ops.custom_op.custom_deepseek_v41_bf16_identity_gaudi2(
-                middle.reshape(1, -1)).reshape(middle.shape)
+            middle = bf16_boundary(middle)
         return linear(middle, shared.w2)
 
     def _can_use_indexed(self, value, ids, routing):
@@ -791,7 +789,8 @@ class PreparedMoE(nn.Module):
             channel2 = experts.w2_fp8_channel
             if not isinstance(channel13, torch.Tensor) or not isinstance(channel2, torch.Tensor):
                 raise TypeError("N256 FP8 channel scales were not loaded as tensors")
-            if self.tensor_parallel_size == 4 and use_fused and tile_prequant is None:
+            if (self.tensor_parallel_size == 4 and use_fused and tile_prequant is None
+                    and tile_value.shape[0] <= 6):
                 from vllm_gaudi.ops.deepseek_v41_expert_n256 import run_fused_decode
 
                 return run_fused_decode(

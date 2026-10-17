@@ -141,6 +141,9 @@ class EngramLayerInputs:
     def __len__(self):
         return len(self.ticket.buffers)
 
+    def __iter__(self):
+        return (self[index] for index in range(len(self)))
+
     def __getitem__(self, index):
         host, ticket = self.host, self.ticket
         if host.pending is not ticket or ticket.generation != host.generation:

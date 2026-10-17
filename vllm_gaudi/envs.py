@@ -533,6 +533,19 @@ def _optional_bool_env(name: str) -> Optional[bool]:
     raise ValueError(f"{name} must be one of 0, 1, false or true, got {value!r}.")
 
 
+def _dsv41_full_mme_prefix_tokens() -> int:
+    """Bounded Full MME prefix extent.
+
+    This TP8 adaptation branch keeps only the qualified 4096-token
+    extent; the 64K candidate is intentionally not enabled here.
+    """
+    name = "VLLM_HPU_DSV41_BATCH_FULL_INDEX_MME_PREFIX_TOKENS"
+    value = os.environ.get(name, "4096")
+    if value != "4096":
+        raise ValueError(f"{name} only supports 4096 on this branch; 64K is not enabled, got {value!r}")
+    return 4096
+
+
 # The begin-* and end* here are used by the documentation generator
 # to extract the used env vars.
 
@@ -1417,6 +1430,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: os.environ.get("VLLM_HPU_DSV41_BATCH_PACKED_MLA_VECTOR", "0") == "1",
     "VLLM_HPU_DSV41_BATCH_FULL_INDEX_MME":
     lambda: os.environ.get("VLLM_HPU_DSV41_BATCH_FULL_INDEX_MME", "0") == "1",
+    "VLLM_HPU_DSV41_BATCH_FULL_INDEX_MME_PREFIX_TOKENS":
+    lambda: _dsv41_full_mme_prefix_tokens(),
     "VLLM_HPU_DSV41_REINDEX_BOUNDED_PLAN":
     lambda: os.environ.get("VLLM_HPU_DSV41_REINDEX_BOUNDED_PLAN", "0") == "1",
 

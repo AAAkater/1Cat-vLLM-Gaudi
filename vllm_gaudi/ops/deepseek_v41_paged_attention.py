@@ -541,6 +541,8 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
         )
         self.batch_reindex_mme = gaudi_envs.VLLM_HPU_DSV41_BATCH_REINDEX_MME
         self.batch_full_index_mme = gaudi_envs.VLLM_HPU_DSV41_BATCH_FULL_INDEX_MME
+        # Fix the recipe extent at construction; never select it from device positions.
+        self.batch_full_index_mme_prefix_tokens = gaudi_envs.VLLM_HPU_DSV41_BATCH_FULL_INDEX_MME_PREFIX_TOKENS
         self.batch_packed_mla = gaudi_envs.VLLM_HPU_DSV41_BATCH_PACKED_MLA
         self.batch_packed_mla_sram = gaudi_envs.VLLM_HPU_DSV41_BATCH_PACKED_MLA_SRAM
         self.batch_packed_mla_vector = gaudi_envs.VLLM_HPU_DSV41_BATCH_PACKED_MLA_VECTOR
@@ -576,6 +578,8 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
         ):
             raise RuntimeError("Batch compressor fusion requires the request-slot native pair kernel")
         self.bounded_reindex = gaudi_envs.VLLM_HPU_DSV41_REINDEX_BOUNDED_PLAN
+        if self.bounded_reindex and tensor_parallel_size in (4, 8):
+            raise ValueError("TP4 Reindex MME excludes the TP2-only bounded native plan")
         if self.bounded_reindex and (
             not self.batch_reindex_mme
             or not gaudi_envs.VLLM_HPU_DSV41_TP_MHC_OVERLAP
@@ -601,6 +605,8 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
         self.decode_batched_selection = False
         from vllm_gaudi.ops.deepseek_v41_decode_index import supports_query_row_reduction
         self.c6_index_reduce = supports_query_row_reduction(self.index_heads)
+        if self.batch_reindex_mme and tensor_parallel_size in (4, 8) and not self.c6_index_reduce:
+            raise RuntimeError("TP4 Reindex MME requires the native per-query TP4 head reducer")
         # Independent query rows share a score producer while retaining the
         # same per-tile TopK and merge order. The ABI/mirror gate is below.
         self.c6_index_wide_scores = True
@@ -2735,6 +2741,8 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
                         publish_candidates=self.layer == self.candidate_source,
                         key_ready=index_done,
                         tiled_keys=self.batch_index_tiled_keys and q.shape[0] in (8, 32),
+                        local_heads=self.index_heads,
+                        prefix_tokens=self.batch_full_index_mme_prefix_tokens,
                     )
                 elif self.batch_reindex_mme and q.shape[0] > 1 and self.layer > self.candidate_source:
                     from vllm_gaudi.ops.deepseek_v41_reindex_mme import (
@@ -2752,6 +2760,8 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
                         else reindex_mme_select
                     )
                     options = {"tiled_keys": self.batch_index_tiled_keys and q.shape[0] in (8, 32)}
+                    if select is reindex_mme_select:
+                        options["local_heads"] = self.index_heads
                     selected = select(
                         q.contiguous(),
                         weights.contiguous(),

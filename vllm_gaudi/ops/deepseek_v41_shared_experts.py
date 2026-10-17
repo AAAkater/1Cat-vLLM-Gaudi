@@ -10,6 +10,17 @@ import torch
 import torch.nn.functional as F
 
 
+def bf16_boundary(value):
+    """Materialize the native BF16 boundary, including a partial final vector."""
+    flat = value.reshape(1, -1)
+    count = flat.shape[1]
+    padding = (-count) % 128
+    if padding:
+        flat = F.pad(flat, (0, padding))
+    result = torch.ops.custom_op.custom_deepseek_v41_bf16_identity_gaudi2(flat)
+    return result[:, :count].reshape_as(value)
+
+
 def expert_owners(ids):
     tokens, experts = ids.shape
     flat = ids.reshape(-1)
