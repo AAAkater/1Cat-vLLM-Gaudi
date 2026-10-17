@@ -28,7 +28,7 @@ class NativeDraftProtocol(torch.nn.Module):
     def __init__(self, draft, *, generation, sampled=False, repair_frame=None, full=False, full_main=False,
                  known_stochastic=False, input_publication=None, state_publication=None):
         super().__init__()
-        if draft.tensor_parallel_size not in (2, 4) or len(draft.layers) != 3:
+        if draft.tensor_parallel_size not in (2, 4, 8) or len(draft.layers) != 3:
             raise ValueError("Native speculative control requires the sampling TP group and three MTP layers")
         self.draft = draft
         self.generation = generation

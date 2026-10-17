@@ -216,16 +216,22 @@ def test_sampled_prefix_rejects_uncertified_target_before_context_commit():
                 assert not result[4].item()
 
 
-def test_sharded_rejection_matches_global_control_with_zero_mass_shards():
-    p = torch.tensor([[.1, .2, .3, .4, 0., 0., 0., 0.]] * 5 +
-                     [[0., 0., 0., 0., .1, .2, .3, .4]], dtype=torch.float64)
-    q = torch.tensor([[.4, .3, .2, .1, 0., 0., 0., 0.]] * 5, dtype=torch.float64)
+@pytest.mark.parametrize("tp_size", (4, 8))
+def test_sharded_rejection_matches_global_control_with_zero_mass_shards(tp_size):
+    local_vocab = 2
+    first = torch.arange(1, tp_size // 2 + 1, dtype=torch.float64)
+    first /= first.sum()
+    p = torch.zeros(6, tp_size * local_vocab, dtype=torch.float64)
+    p[:5, :tp_size // 2] = first
+    p[5, tp_size // 2:tp_size] = first
+    q = torch.zeros(5, tp_size * local_vocab, dtype=torch.float64)
+    q[:, :tp_size // 2] = first.flip(0)
     proposed = torch.tensor([0, 1, 2, 3, 0])
     for draws in (torch.zeros(5), torch.ones(5) * .9, torch.tensor([0., 0., .99, 0., 0.])):
         for correction in (.13, .77):
             expected = sample_speculative_prefix(p, q, proposed, draws, torch.tensor(correction))
-            barrier = threading.Barrier(4)
-            buffers = [None] * 4
+            barrier = threading.Barrier(tp_size)
+            buffers = [None] * tp_size
 
             def rank_case(rank, draws=draws, correction=correction, barrier=barrier, buffers=buffers):
                 def gather(value, dim):
@@ -236,11 +242,12 @@ def test_sharded_rejection_matches_global_control_with_zero_mass_shards():
                     return result
 
                 return sample_speculative_prefix_sharded(
-                    p[:, rank * 2:(rank + 1) * 2], q[:, rank * 2:(rank + 1) * 2], proposed, draws,
-                    torch.tensor(correction), rank, 4, gather)
+                    p[:, rank * local_vocab:(rank + 1) * local_vocab],
+                    q[:, rank * local_vocab:(rank + 1) * local_vocab], proposed, draws,
+                    torch.tensor(correction), rank, tp_size, gather)
 
-            with ThreadPoolExecutor(max_workers=4) as pool:
-                results = list(pool.map(rank_case, range(4)))
+            with ThreadPoolExecutor(max_workers=tp_size) as pool:
+                results = list(pool.map(rank_case, range(tp_size)))
             for result in results:
                 for actual, reference in zip(result, expected, strict=True):
                     assert torch.equal(actual, reference)

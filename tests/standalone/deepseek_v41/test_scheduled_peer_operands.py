@@ -15,7 +15,8 @@ module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
 
 
-@pytest.mark.parametrize('tp_rank,tp_size,rows', ((0, 2, 2), (1, 2, 6), (0, 4, 6), (3, 4, 2)))
+@pytest.mark.parametrize('tp_rank,tp_size,rows',
+                         ((0, 2, 2), (1, 2, 6), (0, 4, 6), (3, 4, 2), (0, 8, 6), (7, 8, 2)))
 def test_rank_order_and_scheduled_dependency(monkeypatch, tp_rank, tp_size, rows):
     value = torch.full((rows, 5120), float(tp_rank), dtype=torch.bfloat16)
     ready = (torch.tensor(7), torch.tensor(8))
@@ -42,3 +43,19 @@ def test_rank_order_and_scheduled_dependency(monkeypatch, tp_rank, tp_size, rows
 def test_large_operand_is_rejected_before_transport():
     with pytest.raises(ValueError, match='small BF16'):
         module.make_peer_operands(0, 4)(torch.empty(7, 5120, dtype=torch.bfloat16))
+
+
+def test_tp8_unscheduled_rank_order_uses_allgather(monkeypatch):
+    value = torch.full((3, 128), 5., dtype=torch.bfloat16)
+    calls = []
+
+    def gather(flat, size):
+        calls.append((flat.shape, size))
+        assert size == 8
+        return torch.cat([torch.full_like(flat, float(rank)) for rank in range(size)])
+
+    monkeypatch.setattr(torch.ops, 'vllm_gaudi', SimpleNamespace(tp_peer_allgather=gather))
+    result = module.make_peer_operands(5, 8)(value)
+    assert result.shape == (8, 3, 128)
+    assert all(torch.equal(result[rank], torch.full_like(value, float(rank))) for rank in range(8))
+    assert calls == [(torch.Size([1, 384]), 8)]

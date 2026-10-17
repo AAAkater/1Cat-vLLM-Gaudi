@@ -268,7 +268,25 @@ def test_c1_defaults_preserve_scheduler_prefill_tile_and_halo(monkeypatch, tmp_p
     assert max(prefill_compute_buckets(capacity)) == 8192
 
 
-@pytest.mark.parametrize("tp,pp", ((2, 2), (4, 1)))
+def test_tp8_ordinary_profile_is_not_dspark(monkeypatch, tmp_path):
+    _clear_profile(monkeypatch)
+    for sidecar in ("wo_a_fp8", "attention_dense_fp8", "engram_fp8"):
+        (tmp_path / "sidecars" / sidecar).mkdir(parents=True)
+
+    prepare_default_fastpaths(tmp_path, tensor_parallel_size=8, pipeline_parallel_size=1)
+
+    assert os.environ["VLLM_HPU_DSV41_DSPARK"] == "0"
+    assert os.environ["VLLM_USE_V2_MODEL_RUNNER"] == "1"
+    assert os.environ["VLLM_HPU_DSV41_NATIVE_INPUT_GRAPH"] == "1"
+    assert os.environ["VLLM_HPU_DSV41_EXPERT_N256_FP8"] == "1"
+    assert all(
+        os.environ["VLLM_HPU_DSV41_" + key] == "0"
+        for key in ("EXPERT_W2_THREE_ROUTES", "EXPERT_STREAMED_SAT", "EXPERT_ACTIVE_W2",
+                    "EXPERT_TOKEN_WIDE", "EXPERT_SHARED_SCALE")
+    )
+
+
+@pytest.mark.parametrize("tp,pp", ((2, 2), (4, 1), (8, 1)))
 def test_explicit_dspark_keeps_shared_speculative_profile(monkeypatch, tmp_path, tp, pp):
     _clear_profile(monkeypatch)
     monkeypatch.setenv("VLLM_HPU_DSV41_DSPARK", "1")
@@ -292,9 +310,15 @@ def test_explicit_dspark_keeps_shared_speculative_profile(monkeypatch, tmp_path,
             or os.environ["VLLM_HPU_DSV41_FUSED_STAGE_IO"] == "1")
     if pp == 1:
         assert all(os.environ[key] == "0" for key in _PIPELINE_ONLY_FASTPATHS)
+    if tp == 8:
+        assert all(
+            os.environ["VLLM_HPU_DSV41_" + key] == "0"
+            for key in ("EXPERT_W2_THREE_ROUTES", "EXPERT_STREAMED_SAT", "EXPERT_ACTIVE_W2",
+                        "EXPERT_TOKEN_WIDE", "EXPERT_SHARED_SCALE")
+        )
 
 
-@pytest.mark.parametrize("tp,pp", ((2, 2), (4, 1)))
+@pytest.mark.parametrize("tp,pp", ((2, 2), (4, 1), (8, 1)))
 def test_dspark_explicit_precision_uses_common_sidecar_discovery(monkeypatch, tmp_path, tp, pp):
     _clear_profile(monkeypatch)
     monkeypatch.setenv("VLLM_HPU_DSV41_DSPARK", "1")

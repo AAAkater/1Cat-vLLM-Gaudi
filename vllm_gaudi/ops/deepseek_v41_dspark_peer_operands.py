@@ -11,7 +11,7 @@ def make_peer_operands(tp_rank, tp_size):
     consumer performs the rank-ordered sum at its BF16 boundary; communication
     and C1 default dispatch remain owned by the maintained native operators.
     """
-    if tp_size not in (2, 4) or not 0 <= tp_rank < tp_size:
+    if tp_size not in (2, 4, 8) or not 0 <= tp_rank < tp_size:
         raise ValueError("Scheduled peer operands require a supported TP group")
 
     def operands(value, ready_outputs=()):

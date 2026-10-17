@@ -29,7 +29,7 @@ class Draft(torch.nn.Module):
         return record, wire, target, confidence
 
 
-@pytest.mark.parametrize("tp", (2, 4))
+@pytest.mark.parametrize("tp", (2, 4, 8))
 @torch.inference_mode()
 def test_hot_inputs_and_generation_use_one_plan_without_rebinding_weights(monkeypatch, tp):
     captures, plans, compilations, context = [], {}, [], {}
@@ -93,8 +93,9 @@ def test_hot_inputs_and_generation_use_one_plan_without_rebinding_weights(monkey
         owner(hidden, proposed, control, auxiliary, positions)
 
 
-def test_c6_plan_rejects_a_different_protocol_before_capture():
-    owner = replay.NativeDraftProtocol(Draft(4), generation=1)
+@pytest.mark.parametrize("tp", (4, 8))
+def test_c6_plan_rejects_a_different_protocol_before_capture(tp):
+    owner = replay.NativeDraftProtocol(Draft(tp), generation=1)
     with pytest.raises(ValueError, match="C6 hidden"):
         owner(torch.zeros(2, 8), torch.zeros(5), torch.zeros(7), torch.zeros(6, 8), torch.zeros(6))
 

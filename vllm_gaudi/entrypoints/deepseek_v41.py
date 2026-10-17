@@ -370,20 +370,25 @@ _DSPARK_SINGLE_STAGE_DEFAULTS = {
 
 
 def prepare_default_fastpaths(model, sidecars=None, tensor_parallel_size=4, pipeline_parallel_size=1):
-    """Select prepared execution defaults for the requested four-card topology."""
+    """Select prepared execution defaults for the requested V4.1 topology."""
     if (tensor_parallel_size, pipeline_parallel_size) not in ((2, 2), (4, 1), (8, 1)):
         raise ValueError("The prepared V4.1 path supports TP4/TP8 x PP1 or legacy TP2 x PP2")
     if not _enabled(os.environ.get("VLLM_HPU_DSV41_DEFAULT_FASTPATHS", "1")):
         return
     os.environ.setdefault("VLLM_HPU_DSV41_DSPARK", "0")
     if _enabled(os.environ["VLLM_HPU_DSV41_DSPARK"]):
-        if tensor_parallel_size == 8:
-            raise ValueError("TP8 currently requires ordinary decoding; speculative operators need separate qualification")
         defaults = dict(_DSPARK_FASTPATH_DEFAULTS)
         if pipeline_parallel_size == 1:
             defaults.update(_DSPARK_SINGLE_STAGE_DEFAULTS)
         for key, value in defaults.items():
             os.environ.setdefault(key, value)
+        if tensor_parallel_size == 8:
+            # These compound operators have checkpoint-specific I640 geometry.
+            # TP8 uses the general N256 FP8 path instead.
+            for key in ("VLLM_HPU_DSV41_EXPERT_W2_THREE_ROUTES", "VLLM_HPU_DSV41_EXPERT_STREAMED_SAT",
+                        "VLLM_HPU_DSV41_EXPERT_ACTIVE_W2", "VLLM_HPU_DSV41_EXPERT_TOKEN_WIDE",
+                        "VLLM_HPU_DSV41_EXPERT_SHARED_SCALE"):
+                os.environ[key] = "0"
         if pipeline_parallel_size == 1:
             for key in _PIPELINE_ONLY_FASTPATHS:
                 os.environ[key] = "0"
@@ -1021,6 +1026,8 @@ def main():
         extra += ["--served-model-name", "DeepSeek-V4.1-Flash"]
     from vllm_gaudi import envs as gaudi_envs
 
+    # DSpark is selected by the source-level environment switch and injected
+    # here. Launchers must not pass --speculative-config themselves.
     speculative = (["--speculative-config", '{"method":"dspark","num_speculative_tokens":5}']
                    if gaudi_envs.VLLM_HPU_DSV41_DSPARK else [])
     scheduling = "--async-scheduling" if gaudi_envs.VLLM_HPU_DSV41_V2 else "--no-async-scheduling"
