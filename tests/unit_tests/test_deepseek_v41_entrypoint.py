@@ -3,6 +3,7 @@ import os
 import json
 from pathlib import Path
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -10,6 +11,7 @@ from vllm_gaudi.entrypoints.deepseek_v41 import (
     _C1_FASTPATH_DEFAULTS,
     _DSPARK_FASTPATH_DEFAULTS,
     _DSPARK_SINGLE_STAGE_DEFAULTS,
+    _DSPARK_TP8_DEFAULTS,
     _NUMERIC_FASTPATH_DEFAULTS,
     _PREFILL_MOE_DEFAULTS,
     _PIPELINE_ONLY_FASTPATHS,
@@ -21,6 +23,7 @@ from vllm_gaudi.entrypoints.deepseek_v41 import (
 _PROFILE_KEYS = set().union(
     _DSPARK_FASTPATH_DEFAULTS,
     _DSPARK_SINGLE_STAGE_DEFAULTS,
+    _DSPARK_TP8_DEFAULTS,
     _PIPELINE_ONLY_FASTPATHS,
     _TP4_FASTPATH_DEFAULTS,
     _SINGLE_STAGE_NATIVE_DEFAULTS,
@@ -279,11 +282,75 @@ def test_tp8_ordinary_profile_is_not_dspark(monkeypatch, tmp_path):
     assert os.environ["VLLM_USE_V2_MODEL_RUNNER"] == "1"
     assert os.environ["VLLM_HPU_DSV41_NATIVE_INPUT_GRAPH"] == "1"
     assert os.environ["VLLM_HPU_DSV41_EXPERT_N256_FP8"] == "1"
+    assert not any(key in os.environ for key in _DSPARK_TP8_DEFAULTS)
     assert all(
         os.environ["VLLM_HPU_DSV41_" + key] == "0"
         for key in ("EXPERT_W2_THREE_ROUTES", "EXPERT_STREAMED_SAT", "EXPERT_ACTIVE_W2",
                     "EXPERT_TOKEN_WIDE", "EXPERT_SHARED_SCALE")
     )
+
+
+def test_tp8_dspark_profile_closes_stage1_incompatible_defaults(monkeypatch, tmp_path):
+    _clear_profile(monkeypatch)
+    monkeypatch.setenv("VLLM_HPU_DSV41_DSPARK", "1")
+    for sidecar in ("wo_a_fp8", "attention_dense_fp8", "engram_fp8"):
+        (tmp_path / "sidecars" / sidecar).mkdir(parents=True)
+
+    prepare_default_fastpaths(tmp_path, tensor_parallel_size=8, pipeline_parallel_size=1)
+
+    assert all(os.environ[key] == "0" for key in _DSPARK_TP8_DEFAULTS)
+
+
+@pytest.mark.parametrize(("tp", "pp"), ((2, 2), (4, 1)))
+def test_tp8_dspark_overlay_does_not_change_tp2_tp4_defaults(monkeypatch, tmp_path, tp, pp):
+    _clear_profile(monkeypatch)
+    monkeypatch.setenv("VLLM_HPU_DSV41_DSPARK", "1")
+    for sidecar in ("wo_a_fp8", "attention_dense_fp8", "engram_fp8"):
+        (tmp_path / "sidecars" / sidecar).mkdir(parents=True)
+
+    prepare_default_fastpaths(tmp_path, tensor_parallel_size=tp, pipeline_parallel_size=pp)
+
+    tp4_only = {
+        "VLLM_HPU_DSV41_DSPARK_W13_K_PIPELINE",
+        "VLLM_HPU_DSV41_DSPARK_SHARED_FP8",
+        "VLLM_HPU_DSV41_DSPARK_LAYER_MAIN_SPLIT",
+    }
+    expected_enabled = tp4_only if tp == 4 else set()
+    assert {key for key in _DSPARK_TP8_DEFAULTS if key in tp4_only and os.environ.get(key) == "1"} == expected_enabled
+
+
+@pytest.mark.parametrize("name", tuple(_DSPARK_TP8_DEFAULTS))
+def test_tp8_dspark_config_rejects_explicit_tp4_only_switch(monkeypatch, name):
+    from vllm_gaudi.ops.deepseek_v41_config import configure
+
+    _clear_profile(monkeypatch)
+    monkeypatch.setenv("VLLM_HPU_DSV41_PREPARED_SHARDS", "1")
+    monkeypatch.setenv("VLLM_HPU_DSV41_DSPARK", "1")
+    monkeypatch.setenv(name, "1")
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(hf_config=SimpleNamespace(model_type="deepseek_v41")),
+        parallel_config=SimpleNamespace(tensor_parallel_size=8, pipeline_parallel_size=1, data_parallel_size=1),
+        scheduler_config=SimpleNamespace(max_num_seqs=1),
+    )
+
+    with pytest.raises(ValueError, match=name):
+        configure(config)
+
+
+def test_tp8_dspark_config_requires_single_request_stage1(monkeypatch):
+    from vllm_gaudi.ops.deepseek_v41_config import configure
+
+    _clear_profile(monkeypatch)
+    monkeypatch.setenv("VLLM_HPU_DSV41_PREPARED_SHARDS", "1")
+    monkeypatch.setenv("VLLM_HPU_DSV41_DSPARK", "1")
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(hf_config=SimpleNamespace(model_type="deepseek_v41")),
+        parallel_config=SimpleNamespace(tensor_parallel_size=8, pipeline_parallel_size=1, data_parallel_size=1),
+        scheduler_config=SimpleNamespace(max_num_seqs=2),
+    )
+
+    with pytest.raises(ValueError, match=r"Stage 1 requires max_num_seqs=1"):
+        configure(config)
 
 
 @pytest.mark.parametrize("tp,pp", ((2, 2), (4, 1), (8, 1)))

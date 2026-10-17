@@ -111,11 +111,31 @@ def validate_sampling(params, *, dspark=None):
             "are not supported")
 
 
+def validate_dspark_tp8_profile(config):
+    """Reject Stage-1 TP8 DSpark switches and unsupported concurrency."""
+    if not envs.VLLM_HPU_DSV41_DSPARK:
+        return
+    parallel = config.parallel_config
+    if (parallel.tensor_parallel_size, parallel.pipeline_parallel_size) != (8, 1):
+        return
+    from vllm_gaudi.entrypoints.deepseek_v41 import _DSPARK_TP8_DEFAULTS
+
+    max_num_seqs = config.scheduler_config.max_num_seqs
+    if max_num_seqs != 1:
+        raise ValueError(f"TP8 x PP1 DSpark Stage 1 requires max_num_seqs=1 (got {max_num_seqs})")
+    enabled = [name for name in _DSPARK_TP8_DEFAULTS if getattr(envs, name)]
+    if enabled:
+        raise ValueError(
+            "TP8 x PP1 DSpark Stage 1 does not support the enabled profile switches; "
+            f"set these variables to 0: {', '.join(enabled)}")
+
+
 def configure(config):
     if not is_v41(config):
         return
     if not envs.VLLM_HPU_DSV41_PREPARED_SHARDS:
         raise ValueError("V4.1 on HPU requires VLLM_HPU_DSV41_PREPARED_SHARDS=1")
+    validate_dspark_tp8_profile(config)
     from vllm_gaudi.entrypoints.deepseek_v41 import prepare_native_libraries
 
     prepare_native_libraries()

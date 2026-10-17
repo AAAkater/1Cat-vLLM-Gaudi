@@ -369,6 +369,33 @@ _DSPARK_SINGLE_STAGE_DEFAULTS = {
 }
 
 
+# Stage-1 TP8 DSpark uses the general N256 path. These TP4 single-stage
+# operators rely on TP4 geometry/SAT assumptions and must not be inherited.
+# Optional unique-expert, device-round, and full-HCCL add-ons are disabled
+# until their TP8 artifacts and runtime gates are qualified independently.
+_DSPARK_TP8_DEFAULTS = {
+    "VLLM_HPU_DSV41_DSPARK_W13_K_PIPELINE": "0",
+    "VLLM_HPU_DSV41_DSPARK_W2_K_PIPELINE": "0",
+    "VLLM_HPU_DSV41_DSPARK_SPLIT_SCALE_PLANES": "0",
+    "VLLM_HPU_DSV41_DSPARK_SHARED_FP8": "0",
+    "VLLM_HPU_DSV41_DSPARK_LAYER_MAIN_SPLIT": "0",
+    "VLLM_HPU_DSV41_DSPARK_MHC_OVERLAP": "0",
+    "VLLM_HPU_DSV41_DEVICE_ROUNDS": "0",
+    "VLLM_HPU_DSV41_DSPARK_BATCH_ENGRAM": "0",
+    "VLLM_HPU_DSV41_DSPARK_VOCAB_SOFTMAX": "0",
+    "VLLM_HPU_DSV41_DSPARK_W2_REDUCE_N256": "0",
+    "VLLM_HPU_DSV41_DSPARK_DRAFT_VOCAB_CDF": "0",
+    "VLLM_HPU_DSV41_DSPARK_FUSED_BOUNDED_NUCLEUS": "0",
+    "VLLM_HPU_DSV41_DSPARK_JOURNAL_COPY": "0",
+    "VLLM_HPU_DSV41_DSPARK_LANE_CANDIDATES": "0",
+    "VLLM_HPU_DSV41_DSPARK_NATIVE_FULL_REPAIR": "0",
+    "VLLM_HPU_DSV41_DSPARK_NORM_ROUNDTRIP": "0",
+    "VLLM_HPU_DSV41_DSPARK_SCALE_CACHE": "0",
+    "VLLM_HPU_DSV41_DSPARK_FULL_HCCL_MAIN": "0",
+    "VLLM_HPU_DSV41_DSPARK_LARGE_HCCL": "0",
+}
+
+
 def prepare_default_fastpaths(model, sidecars=None, tensor_parallel_size=4, pipeline_parallel_size=1):
     """Select prepared execution defaults for the requested V4.1 topology."""
     if (tensor_parallel_size, pipeline_parallel_size) not in ((2, 2), (4, 1), (8, 1)):
@@ -380,6 +407,8 @@ def prepare_default_fastpaths(model, sidecars=None, tensor_parallel_size=4, pipe
         defaults = dict(_DSPARK_FASTPATH_DEFAULTS)
         if pipeline_parallel_size == 1:
             defaults.update(_DSPARK_SINGLE_STAGE_DEFAULTS)
+        if tensor_parallel_size == 8:
+            defaults.update(_DSPARK_TP8_DEFAULTS)
         for key, value in defaults.items():
             os.environ.setdefault(key, value)
         if tensor_parallel_size == 8:
