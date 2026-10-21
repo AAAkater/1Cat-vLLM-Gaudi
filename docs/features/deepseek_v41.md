@@ -553,3 +553,10 @@ passed natural-EOS checks and a fixed semantic cohort separately; stochastic
 sampling is not yet qualified against the greedy latency target.
 Requests with unsupported penalties,
 logprobs or constrained sampling fail explicitly.
+
+## TP8 development handoff
+
+See the [TP8 source and hardware-server handoff](../dev_guide/deepseek_v41_tp8_handoff.md)
+for pinned dependencies, CPU-only concurrency preparation, deployment gates and
+remaining batch execution work. TP8 DSpark still requires one active request;
+the metadata prototype does not enable batched serving.
