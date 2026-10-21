@@ -26,12 +26,18 @@ masking and sink-concatenation pass.
 
 ## Preparation
 
-Start from a validated V4.1 engine and its matching native replay runtime.
-The complete serving engine source delta is pinned in
-`tools/communication/patches/dsv41-serving-engine.json`. Apply it to the pinned
-clean vLLM checkout with `tools/prepare_deepseek_v41_engine.py` before building
-the engine. Preserve the actual engine source and runtime binary fingerprints
-with the prepared manifest. See the
+Start from the applied-engine branch `feat/dsv41-serving-engine` on the
+[AAAkater/vllm fork](https://github.com/AAAkater/vllm). Its pinned commit
+`64e9c1cb9b045b53b4feb174389c1f288e375e38` is based on
+`e47aa780bccf59f59dfa2cbb18e17a10b4fe69ba` and reuses the existing 18-file
+patched tree exactly. Clone and verification instructions are maintained in the
+[TP8 source and hardware-server handoff](../dev_guide/deepseek_v41_tp8_handoff.md#source-pins).
+Do not run `tools/prepare_deepseek_v41_engine.py` or reapply an engine patch.
+The old engine patch remains for historical audit and legacy workflows; the
+JSON may still be used for existing source-integrity checks, not for fetching
+or applying the engine sources. This branch has not
+been hardware-validated as a deployment. Preserve the actual engine source and
+runtime binary fingerprints with the prepared manifest. See the
 [engineering guide](../1cat_gaudi_guide.md#deepseek-v41) for prerequisites,
 profile recording, and explicit device selection. The original Hugging Face checkpoint is the recovery source;
 the four prepared files are immutable derived artifacts.
@@ -115,8 +121,9 @@ dense device cache. The C1 FP8 sidecars below have their own storage contract.
 
 Ordinary paged serving can opt into prefix caching with
 `--enable-prefix-caching`, or `"enable_prefix_caching": true` in the installation
-settings. Explicit CLI flags take precedence. The matching pinned engine delta
-is required; workers reject an older engine before loading model state.
+settings. Explicit CLI flags take precedence. The applied-engine branch pinned
+in the handoff is required; workers reject an older engine before loading model
+state.
 Prompt usage exposes `prompt_tokens_details.cached_tokens` when enabled.
 
 A hit requires retained compressed KV pages and a checkpoint of SWA,
@@ -336,11 +343,12 @@ and direct token IDs. The engine uses its normal async scheduler and output
 thread. On PP0, layer-1 Engram preparation continues from the sampled device
 token while host C1 prepares only the later layer-14 input.
 
-The incremental hook is provided in
-`tools/communication/patches/dsv41-v2-platform.patch`. Apply it to the existing
-prepared V4.1 engine, not a stock checkout; the adjacent JSON manifest records
-the pinned revision and required parent file hashes. Other platforms still
-require Triton, and all remaining V2 feature checks stay enabled.
+The required non-Triton V2 platform capability hook is already present in the
+applied-engine branch pinned in the handoff. Do not apply
+`tools/communication/patches/dsv41-v2-platform.patch` or its adjacent JSON
+manifest on top of that branch; those files remain only for historical audit
+and compatibility with older workflows. Other platforms still require Triton,
+and all remaining V2 feature checks stay enabled.
 
 Only ordinary C1 decode is supported. DSpark, inline completion and resumed
 generated-prefix replay are rejected. Ordinary sampling supports temperature,
@@ -473,18 +481,15 @@ Build the matching native kernel extension, host gather, peer bridge and pinned
 Bridge/Synapse/HCL runtime using the maintained build tools. The concat-axis
 cache-key patch or its fingerprinted adapter is required; do not globally disable
 shape-agnostic compilation. Every native source in the build manifest must match
-this plugin revision. Apply the complete serving engine delta first:
-
-```bash
-python tools/prepare_deepseek_v41_engine.py ENGINE_CHECKOUT --check
-python tools/prepare_deepseek_v41_engine.py ENGINE_CHECKOUT
-```
+this plugin revision. Verify that `ENGINE_CHECKOUT` is the clean applied-engine
+branch pinned in the handoff, and do not apply another engine patch.
 
 Materialize the deployment using the matching Python environment. The runtime
 profile identifies SDK options and installed artifacts, rather than a list of
-performance opt-ins. The installer verifies the engine delta, native source and
-input library fingerprints, copies Python dependencies, engine and all plugin
-packages, removes editable import hooks, and relocates library/ABI paths.
+performance opt-ins. The installer verifies the maintained 18-file engine
+candidate hashes, native source and input library fingerprints, copies Python
+dependencies, engine and all plugin packages, removes editable import hooks, and
+relocates library/ABI paths.
 Model checkpoints and the installed system Gaudi driver/SDK remain prerequisites.
 
 ```bash

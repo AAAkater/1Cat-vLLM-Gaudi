@@ -14,6 +14,7 @@ Use the checked-out branch's full SHA when recording the deployment.
 | Repository in the AAAkater forks | Ref | Required source pin |
 | --- | --- | --- |
 | `1Cat-vLLM-Gaudi` | `feat/tp8-unified-runtime-build` | Record the full HEAD containing this handoff |
+| [`vllm`](https://github.com/AAAkater/vllm) | `feat/dsv41-serving-engine` | `64e9c1cb9b045b53b4feb174389c1f288e375e38` (base `e47aa780bccf59f59dfa2cbb18e17a10b4fe69ba`) |
 | `HCL` | `feat/tp8-native-hcl` | `af8e5be897b13fb4dc9a3caac0daf98b81cea376` |
 | `Intel_Gaudi3_Software` | `feat/native-runtime-source` | `e64079d1c05be2edb969f9781c9a519b773f47d3` |
 | `gaudi-pytorch-bridge` | `import/tp8-patches` | `d92427b592b97fa9322556fca54cfb58fefb5130` |
@@ -22,14 +23,28 @@ The Bridge patch branch has been published to the user's fork. Fetch that ref
 and verify its SHA; the ordinary `v1.24.2` checkout is **not** the patched
 Bridge. Publishing does not rewrite the existing patch authors or commit IDs.
 
-The serving engine must start at
-`e47aa780bccf59f59dfa2cbb18e17a10b4fe69ba` and receive the source delta pinned by
-[dsv41-serving-engine.json](../../tools/communication/patches/dsv41-serving-engine.json).
-Use [prepare_deepseek_v41_engine.py](../../tools/prepare_deepseek_v41_engine.py)
-to check/apply it to a separate clean checkout before installation.
-The locally inspected upstream revision
-`fa75d3456d60a5ffe923818c4b495295675b38e1` is only a reference; do not install it
-in place of the pinned engine or apply the delta to an arbitrary latest tree.
+The serving engine is the already-patched
+[AAAkater/vllm](https://github.com/AAAkater/vllm) branch
+`feat/dsv41-serving-engine`. Its published commit reuses the existing 18-file
+patched source tree exactly; it was not regenerated from a patch. It is based on
+`e47aa780bccf59f59dfa2cbb18e17a10b4fe69ba`, not the development checkout's local
+HEAD `fa75d3456d60a5ffe923818c4b495295675b38e1`, and has not been
+hardware-validated as a deployment. Use a new checkout:
+
+```bash
+NEWDIR=../vllm-dsv41
+git clone --branch feat/dsv41-serving-engine \
+  https://github.com/AAAkater/vllm.git "$NEWDIR"
+test "$(git -C "$NEWDIR" rev-parse HEAD)" = \
+  64e9c1cb9b045b53b4feb174389c1f288e375e38
+test -z "$(git -C "$NEWDIR" status --porcelain)"
+```
+
+Do not run `tools/prepare_deepseek_v41_engine.py` and do not reapply an engine
+patch. The old `dsv41-serving-engine.patch` and `.json` files in this repository
+remain for historical audit, legacy workflows and existing source-integrity
+checks. They are not the source download or patch-application step for this
+branch; the optional installer may still read the JSON to verify source hashes.
 
 ## What is implemented
 
@@ -85,8 +100,9 @@ rather than this repository can also cause `ModuleNotFoundError`.
 2. Check all source pins above. Build patched HCL, then patched Synapse, then
    patched Bridge against the matching SDK/Torch environment. Retain private
    library outputs; never overwrite the shared system SDK as a shortcut.
-3. Apply the pinned engine delta to its clean base, then install the engine
-   and plugin in that same environment without an uncontrolled dependency upgrade.
+3. Clone and verify the applied-engine branch as described above, then install
+   the engine and plugin in that same environment without an uncontrolled
+   dependency upgrade.
 4. Use the existing unified runtime builder described in
    [DeepSeek V4.1 preparation](../features/deepseek_v41.md#unified-v41-runtime-build).
    It produces native kernels/host gather and the communication extension in

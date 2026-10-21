@@ -43,7 +43,7 @@ python -m pip install 'packaging>=24.2' 'setuptools>=77.0.3,<85.0.0' \
 
 ### 插件与引擎配对
 
-`vllm_gaudi` 是硬件插件，`vllm` 引擎需要单独安装。V4 使用下一节的固定引擎补丁链；V4.1 需要独立的配套引擎；Qwen / 通用 HPU 应选择已验证支持目标模型的引擎版本。
+`vllm_gaudi` 是硬件插件，`vllm` 引擎需要单独安装。V4 使用下一节的固定引擎补丁链；V4.1 使用 [AAAkater/vllm](https://github.com/AAAkater/vllm) 的 `feat/dsv41-serving-engine` 已应用补丁分支，而不是官方仓库 checkout 后从 1Cat 取 patch。该分支尚未进行硬件验证；Qwen / 通用 HPU 应选择已验证支持目标模型的引擎版本。
 
 通用插件安装方式参考[上游安装文档](https://docs.vllm.ai/projects/gaudi/en/latest/getting_started/installation.html)。上游的 last-good-commit 属于其验证组合，不应自动视为本分支每条实验路线的模型验证结果。
 
@@ -104,13 +104,24 @@ python -m vllm_gaudi.entrypoints.deepseek_v4 \
 
 ### 准备条件
 
-这是一条 **Gaudi2、TP2×PP2、单请求、512-token 总上下文、贪心**的专用实验路线。当前仓库有模型集成、权重准备和 runtime 补丁；V4.1 的可安装引擎锁定包尚未完整归档。因此本节从已验证的配套引擎环境开始，不能把某个上游 PR 的最新 head 当成经过验证的安装版本。
+这是一条 **Gaudi2、TP2×PP2、单请求、512-token 总上下文、贪心**的专用实验路线。当前引擎部署入口是用户 fork 中已应用 18 文件补丁的 `feat/dsv41-serving-engine` 分支；它基于 `e47aa780bccf59f59dfa2cbb18e17a10b4fe69ba`，不是本机开发 checkout 的最新 head，也尚未经过 Gaudi2 硬件部署验证。首次使用新目录：
+
+```bash
+ENGINE_CHECKOUT=../vllm-dsv41-new
+git clone --branch feat/dsv41-serving-engine \
+  https://github.com/AAAkater/vllm.git "$ENGINE_CHECKOUT"
+test "$(git -C "$ENGINE_CHECKOUT" rev-parse HEAD)" = \
+  64e9c1cb9b045b53b4feb174389c1f288e375e38
+test -z "$(git -C "$ENGINE_CHECKOUT" status --porcelain)"
+```
+
+不要运行 `tools/prepare_deepseek_v41_engine.py`，也不要重复 `git apply`。旧引擎 patch 保留用于历史审计/兼容旧流程，JSON 仍可供已有安装器做源码指纹检查；它们不再是引擎下载或补丁应用步骤。
 
 需要成套保留：
 
 | 制品 | 对应要求 |
 |---|---|
-| V4.1 引擎 | 真实 commit、实际补丁和安装路径；包含模型所需的 `vllm.models.deepseek_v4_1` 等接口 |
+| V4.1 引擎 | `feat/dsv41-serving-engine` 完整 commit `64e9c1cb9b045b53b4feb174389c1f288e375e38`；包含模型所需的 `vllm.models.deepseek_v4_1` 等接口 |
 | 插件 | 固定 commit 与对应原生扩展 |
 | Native replay runtime | Bridge、Synapse、HCL 源码与补丁指纹、构建产物 |
 | TP2 扩展 | 对应 runtime 的扩展及 `.abi.json` |
@@ -120,7 +131,7 @@ python -m vllm_gaudi.entrypoints.deepseek_v4 \
 
 Native runtime 的源码仓库与 base commit 已列于[manifest](../tools/communication/patches/native-runtime/manifest.json)，补丁与构建顺序见[runtime 文档](../tools/communication/patches/native-runtime/README.md)。该 Synapse 路线使用旧公开源码及兼容补丁；ABI 匹配不等于与已安装 SDK 的编译器和数值完全等价。
 
-`audit_deepseek_v41_upstream.py` 收集上游 PR 的状态与 diff 证据，**不安装引擎，也不生成已验证的引擎兼容锁**。设备运行工具会另行归档实际 `engine_commit` 与 `engine.patch`，这些记录才对应真实运行环境。
+`audit_deepseek_v41_upstream.py` 收集上游 PR 的状态与 diff 证据，**不安装引擎，也不生成已验证的引擎兼容锁**。部署记录应归档实际 `engine_commit=64e9c1cb9b045b53b4feb174389c1f288e375e38`；旧流程的 `engine.patch` 记录只用于历史审计，不应用于已应用分支。
 
 ### 审计与权重准备
 
