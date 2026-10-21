@@ -41,12 +41,60 @@ the four prepared files are immutable derived artifacts.
 .venv/bin/python tools/sync_deepseek_v41_checkpoint.py MODEL_DIR --evidence CHECKPOINT_AUDIT
 .venv/bin/python tools/prepare_deepseek_v41_shards.py MODEL_DIR PREPARED_DIR \
   --checkpoint-audit CHECKPOINT_AUDIT/complete.json --upstream-lock UPSTREAM_LOCK
-.venv/bin/python tools/build_deepseek_v41.py --build-root BUILD_DIR
 ```
 
-Build the native TP2 bridge using `tools/communication/build_tp2_fused_ar_norm_bridge.py`
-and the exact Bridge, Synapse and HCL source/build paths for the replay runtime.
-Its ABI manifest remains mandatory. See the native replay build documentation.
+For the native runtime, use the unified entry point in the next section as
+the recommended build path. The underlying
+`tools/build_deepseek_v41.py` and
+`tools/communication/build_tp2_fused_ar_norm_bridge.py` scripts remain
+available for advanced or local compatibility builds, but they are not
+additional preparation steps and do not need to be run separately when using
+the unified command. The native replay ABI manifest remains mandatory.
+
+### Unified V4.1 runtime build
+
+Use `tools/build_deepseek_v41_runtime.py` when the native kernels, host gather
+extension and Bridge extension should be produced from one invocation. The
+orchestrator runs the existing native builder first and the existing Bridge
+builder second; both are always invoked and reuse is delegated to their
+incremental build caches. It overrides `GAUDI_PYTORCH_BRIDGE_ROOT` and
+`GAUDI_PYTORCH_BRIDGE_BUILD_ROOT` with the explicit Bridge source and CMake
+build directories for both child builds, and sets `MAX_JOBS` from `--jobs`.
+This prevents a stale Bridge tree selected by the caller's environment from
+being used for the native operators.
+
+```bash
+.venv/bin/python tools/build_deepseek_v41_runtime.py \
+  --bridge-source BRIDGE_SOURCE \
+  --bridge-cmake-build-directory BRIDGE_CMAKE_BUILD \
+  --synapse-library PATH/TO/libSynapse.so \
+  --hcl-library PATH/TO/libhcl.so \
+  --build-root build/deepseek_v41_runtime \
+  --output-dir build/deepseek_v41_runtime/output \
+  --jobs 8
+```
+
+`--backend-library` and `--native-hccl-library` are optional overrides. If they
+are omitted, the Bridge builder keeps its existing discovery logic. The Bridge
+extension is compiled in `--bridge-build-directory` (default
+`BUILD_ROOT/bridge`), then its binary and ABI manifest are safely copied into
+the unified output directory. The publisher accepts only a unique root-level
+`tp2_fused_ar_norm_bridge*.so` file with the matching
+`.with_suffix(".abi.json")` sidecar and a valid `binary_sha256`; nested historical
+builds are ignored. The staging directory may equal `--output-dir`, but only
+one valid extension/ABI pair is permitted.
+
+The products remain separate: the native kernels and host extensions keep
+their own `.so` files plus `deepseek_v4_build.json` / `deepseek_v41_build.json`,
+while the Bridge keeps its own `.so` and ABI manifest. The aggregate
+`deepseek_v41_runtime_build.json` records their relative paths, SHA256 digests,
+source commit when available, build arguments and commands. No runtime profile
+JSON is generated or required, and the orchestration does not execute a model
+or require an HPU device.
+
+This unified build path has not been executed on this machine; it still
+requires a compatible Gaudi build environment and exact Bridge, Synapse and
+HCL inputs.
 
 Preparation creates `pp0-tp0.safetensors`, `pp0-tp1.safetensors`,
 `pp1-tp0.safetensors`, `pp1-tp1.safetensors`, the topology/quantization manifest,
