@@ -42,11 +42,20 @@ void main(tensor kv_history,
     const int token=0;
     const int logical = s_i32_ld_g(gen_addr((int5){0, 0, 0, 0, 0}, position));
 #endif
+#if defined(DSV41_COMPRESSOR_SEQUENCE_MASKED) && DSV41_COMPRESSOR_SEQUENCE_MASKED
+    const bool token_valid = logical >= 0;
+#endif
     const int ring = logical & 7;
     const bool current_is_first = (logical & 1) == 0;
     const int other = current_is_first ? ((ring + 1) & 7) : ((ring - 1) & 7);
 
     for (int block = begin[0]; block < end[0]; ++block) {
+#if defined(DSV41_COMPRESSOR_SEQUENCE_MASKED) && DSV41_COMPRESSOR_SEQUENCE_MASKED
+        if (!token_valid) {
+            v_bf16_st_tnsr((int5){block * 128, token, 0, 0, 0}, latent, (bfloat128)0);
+            continue;
+        }
+#endif
         float128 result;
         #pragma unroll (2)
         for (int lane_half = 0; lane_half < 2; ++lane_half) {
@@ -60,8 +69,14 @@ void main(tensor kv_history,
             // The qualified C<=6 transaction writes all rows before mixing.
             // Forward a present partner directly; only boundary partners read
             // old ring state. No cross-TPC store/load dependency or barrier.
-            const int partner=logical+(current_is_first?1:-1)-base;
-            const bool present=partner>=0 && partner<rows;
+            const int partner_position=logical+(current_is_first?1:-1);
+            const int partner=partner_position-base;
+            bool present=partner>=0 && partner<rows;
+#if defined(DSV41_COMPRESSOR_SEQUENCE_MASKED) && DSV41_COMPRESSOR_SEQUENCE_MASKED
+            // A physical row inside the fixed bucket is a current partner only
+            // when its position names the actual adjacent token, never padding.
+            present=present && s_i32_ld_g(gen_addr((int5){partner}, position))==partner_position;
+#endif
             const int5 partner_at={feature,partner,0,0,0};
             const float64 other_value=present?v_f32_ld_tnsr_b(partner_at,kv):v_f32_ld_tnsr_b(other_at,kv_history);
             const float64 other_score=present?v_f32_ld_tnsr_b(partner_at,score):v_f32_ld_tnsr_b(other_at,score_history);

@@ -78,6 +78,41 @@ class RequestSlots:
         with self.lock:
             self._check(slot)
 
+    def validate_batch_identities(self, slots, generations, active) -> bool:
+        """Return whether every active lane still names its current owner.
+
+        This is the host-side validator consumed by fixed batch rings.  A lane
+        is live only when both its physical slot and generation match the
+        current request owner.  Inactive lanes use ``(-1, 0)`` and do not name
+        an owner.
+        """
+        try:
+            slots = tuple(slots)
+            generations = tuple(generations)
+            active = tuple(active)
+        except TypeError:
+            return False
+        if not (len(slots) == len(generations) == len(active)):
+            return False
+        if any(type(value) is not int for value in (*slots, *generations)):
+            return False
+        if any(type(value) is not bool for value in active):
+            return False
+
+        with self.lock:
+            live = {(slot.index, slot.generation) for slot in self.owners.values()}
+        identities = set()
+        for slot, generation, enabled in zip(slots, generations, active, strict=True):
+            if not enabled:
+                if slot != -1 or generation != 0:
+                    return False
+                continue
+            identity = (slot, generation)
+            if identity in identities or identity not in live:
+                return False
+            identities.add(identity)
+        return True
+
 
 @dataclass(frozen=True)
 class QuerySpan:

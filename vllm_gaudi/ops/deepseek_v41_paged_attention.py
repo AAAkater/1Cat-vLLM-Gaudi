@@ -869,7 +869,9 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
             return torch.ops.custom_op.custom_deepseek_v41_q_bf16_projection_rope_gaudi2(
                 value.contiguous(), weight.weight.contiguous(), positions.to(torch.int32).contiguous(),
                 self._rotary_native_table(), hasattr(weight, "scale")).reshape(-1, self.heads, 512)
-        if not decode and gaudi_envs.VLLM_HPU_DSV41_PREFILL_Q_PROJECTION and 6 < value.shape[0] <= 16384:
+        if (not decode and gaudi_envs.VLLM_HPU_DSV41_PREFILL_Q_PROJECTION
+                and 6 < value.shape[0] <= 16384
+                and (not request_batch or getattr(weight, "dense_fp8", False))):
             if not getattr(weight, "dense_fp8", False) or self.heads not in (8, 16, 32):
                 raise ValueError("Prefill Q projection requires prepared FP8 weights and 8/16/32 local heads")
             with prefill_event_span("attention_query_quantization", self.layer, value.shape[0]):
@@ -2682,6 +2684,90 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
         index_done = write_state_rows(self.cache.index, pack_fp4(index, 32), rows)
         return main_done, index_done
 
+    def _compress_batch_target(self, value, positions, slots, pages, row_valid, request_lengths, request_slots):
+        """Compress fixed ``[N,6]`` C1/C6 spans with lane-local ordering.
+
+        The masked sequence op consumes exactly six physical rows per request
+        and treats ``position=-1`` as no-write.  Projections run once over all
+        ``6*N`` rows; only the stateful compressor call is lane-local.  This
+        signature is independent of the logical valid count, so C1/C6 and
+        partial activity do not create separate target graphs.
+        """
+        from vllm_gaudi.ops.deepseek_v41_batch_attention import batch_physical_rows, write_state_rows
+
+        request_slots = tuple(int(slot) for slot in request_slots)
+        capacity = len(request_slots)
+        rows = 6 * capacity
+        if tuple(request_lengths) != (6, ) * capacity:
+            raise ValueError("target compressor graph is fixed at six physical rows per lane")
+        if (capacity < 1 or len(set(request_slots)) != capacity
+                or any(slot < 0 or slot >= capacity for slot in request_slots)):
+            raise ValueError("target compressor slots must be fixed distinct lane owners")
+        if (value.shape[0] != rows or positions.shape != (rows, ) or slots.shape != (rows, )
+                or row_valid.shape != (rows, ) or pages.shape[0] != rows):
+            raise ValueError("target compressor inputs must match the fixed 6*N capacity")
+        state, compressor = self.batch_state, self.weights.compressor
+        active = row_valid.bool() & (slots >= 0)
+        safe_positions = positions.clamp_min(0)
+        if self.ratio == 2:
+            kv, score = self._project_compressor_input(value)
+            from vllm_gaudi.ops.deepseek_v41_batch_target import (
+                compressor_sequence_slot_native_mix,
+                compressor_sequence_slot_publish_read,
+                compressor_sequence_slot_torch_mix,
+                select_compressor_norm_by_request_length,
+            )
+
+            native_norms, compiled_norms = [], []
+            for request_index, slot in enumerate(request_slots):
+                start = request_index * 6
+                history, score_history = compressor_sequence_slot_publish_read(
+                    state.kv_history,
+                    state.score_history,
+                    slot,
+                    kv[start:start + 6],
+                    score[start:start + 6],
+                    positions[start:start + 6],
+                )
+                native_norms.append(rms_norm(
+                    compressor_sequence_slot_native_mix(
+                        history,
+                        score_history,
+                        kv[start:start + 6],
+                        score[start:start + 6],
+                        positions[start:start + 6],
+                    ),
+                    compressor.norm.weight,
+                    self.eps,
+                ))
+                compiled_norms.append(rms_norm(
+                    compressor_sequence_slot_torch_mix(
+                        history,
+                        score_history,
+                        positions[start:start + 6],
+                    ),
+                    compressor.norm.weight,
+                    self.eps,
+                ))
+            # Choose only after both BF16 norms exist. Selecting the mixed
+            # FP32 latent earlier can introduce or eliminate the old compiled
+            # C2-C6 FP32 -> BF16 -> FP32 roundtrip.
+            latent = select_compressor_norm_by_request_length(
+                torch.cat(native_norms, 0), torch.cat(compiled_norms, 0), active)
+            first = safe_positions - safe_positions.remainder(2)
+        else:
+            first = safe_positions
+            latent = rms_norm(self.linear(value, compressor.wkv), compressor.norm.weight, self.eps)
+        indexer = self.weights.indexer
+        index = rms_norm(self.linear(latent, indexer.wk), indexer.k_norm.weight, self.eps)
+        index, latent = self._rope(index, first, request_batch=True), self._rope(latent, first, request_batch=True)
+        visible = active & ((safe_positions + 1).remainder(self.ratio) == 0)
+        physical = batch_physical_rows((safe_positions // self.ratio).reshape(-1, 1), pages, self.ratio).flatten()
+        rows = torch.where(visible, physical, -1).int()
+        main_done = write_state_rows(self.cache.main, pack_fp4(latent, 16), rows)
+        index_done = write_state_rows(self.cache.index, pack_fp4(index, 32), rows)
+        return main_done, index_done
+
     def forward_batch(
         self, value, positions, slots, pages, selected, candidates, main_done, index_done, ready_outputs=()
     ):
@@ -2823,6 +2909,165 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
         )
         result = self._finish_output(output, safe_positions, ready_outputs, request_batch=True)
         result = torch.where(active[:, None], result, 0)
+        return result, selected, blocks, main_done, index_done
+
+    def forward_batch_target(
+        self,
+        value,
+        positions,
+        slots,
+        pages,
+        selected,
+        candidates,
+        main_done,
+        index_done,
+        *,
+        row_valid,
+        request_lengths,
+        request_slots,
+        ready_outputs=(),
+    ):
+        """Packed C1/C6 target attention with per-lane state and page ownership."""
+        from vllm_gaudi.ops.deepseek_v41_batch_attention import (
+            batch_packed_mla,
+            read_state_rows,
+            write_state_rows,
+        )
+        from vllm_gaudi.ops.deepseek_v41_indexer import runtime_index_select
+
+        request_slots = tuple(int(slot) for slot in request_slots)
+        capacity = len(request_slots)
+        rows = 6 * capacity
+        if tuple(request_lengths) != (6, ) * capacity:
+            raise ValueError("target attention graph is fixed at six physical rows per lane")
+        if (capacity < 1 or len(set(request_slots)) != capacity
+                or any(slot < 0 or slot >= capacity for slot in request_slots)):
+            raise ValueError("target request slot ownership must be distinct host-static lane slots")
+        if (value.shape[0] != rows or positions.shape != (rows, ) or slots.shape != (rows, )
+                or row_valid.shape != (rows, ) or selected.shape != (rows, 512)
+                or candidates.shape != (rows, 2048) or main_done.shape != (rows, )
+                or index_done.shape != (rows, ) or pages.shape[0] != rows):
+            raise ValueError("target attention inputs must match the fixed 6*N capacity")
+        safe_positions = positions.clamp_min(0)
+        active = row_valid.to(torch.bool) & (slots >= 0)
+        query_input, kv_input = self._project_qkv_input(value)
+        norm = torch.ops.custom_op.custom_deepseek_v41_attention_norm_bf16_gaudi2 if self.fused_norm else rms_norm
+        needs_index_query = self.ratio and self.owns_index
+        if (
+            self.batch_c1_numerics
+            and self.fused_norm
+            and self.q_scale_rope
+            and self.native_rope
+            and getattr(self.weights.wq_b, "dense_fp8", False)
+            and not needs_index_query
+        ):
+            qr = None
+            query = self.project_query_input(query_input, safe_positions)
+        else:
+            qr = norm(query_input.contiguous(), self.weights.q_norm.weight, self.eps)
+            query = self.project_query(qr, safe_positions, request_batch=True)
+        kv = self._rope(
+            norm(kv_input.contiguous(), self.weights.kv_norm.weight, self.eps),
+            safe_positions,
+            request_batch=True,
+        )
+        rows = torch.where(active, slots * SWA_ROWS + safe_positions.remainder(SWA_ROWS), -1).int()
+        swa_done = write_state_rows(self.batch_state.swa, pack_swa(kv), rows)
+        blocks = candidates
+        if self.ratio:
+            if self.owns_kv:
+                main_done, index_done = self._compress_batch_target(
+                    value, positions, slots, pages, active, request_lengths, request_slots
+                )
+            if self.owns_index:
+                q, weights = self._prepare_index_queries(value, qr, safe_positions, request_batch=True)
+                q = read_state_rows(
+                    q.reshape(q.shape[0], -1).contiguous(),
+                    torch.arange(q.shape[0], device=q.device, dtype=torch.int32),
+                    index_done.clamp_min(0),
+                ).reshape(q.shape)
+                if self.batch_full_index_mme and q.shape[0] > 1 and self.layer <= self.candidate_source:
+                    from vllm_gaudi.ops.deepseek_v41_full_index_mme import full_index_mme_select
+
+                    selected, updated = full_index_mme_select(
+                        q.contiguous(),
+                        weights.contiguous(),
+                        self.cache.index,
+                        pages,
+                        safe_positions.contiguous(),
+                        candidates,
+                        ratio=self.ratio,
+                        capacity=self.length // self.ratio,
+                        publish_candidates=self.layer == self.candidate_source,
+                        key_ready=index_done,
+                        tiled_keys=self.batch_index_tiled_keys and q.shape[0] in (8, 32),
+                        local_heads=self.index_heads,
+                        prefix_tokens=self.batch_full_index_mme_prefix_tokens,
+                    )
+                elif self.batch_reindex_mme and q.shape[0] > 1 and self.layer > self.candidate_source:
+                    from vllm_gaudi.ops.deepseek_v41_reindex_mme import (
+                        bounded_reindex_mme_select,
+                        reindex_mme_select,
+                    )
+                    from vllm_gaudi.ops.deepseek_v41_reindex_compact import bounded_reindex_bucket
+
+                    select = (bounded_reindex_mme_select
+                              if self.bounded_reindex and bounded_reindex_bucket(q.shape[0]) else reindex_mme_select)
+                    options = {"tiled_keys": self.batch_index_tiled_keys and q.shape[0] in (8, 32)}
+                    if select is reindex_mme_select:
+                        options["local_heads"] = self.index_heads
+                    selected = select(q.contiguous(), weights.contiguous(), self.cache.index, pages,
+                                      safe_positions.contiguous(), candidates, ratio=self.ratio, **options)
+                    updated = None
+                else:
+                    selected, updated = runtime_index_select(
+                        q.contiguous(),
+                        weights.contiguous(),
+                        self.cache.index,
+                        pages,
+                        safe_positions.contiguous(),
+                        candidates,
+                        ratio=self.ratio,
+                        capacity=self.length // self.ratio,
+                        reindex=self.layer > self.candidate_source,
+                        publish_candidates=self.layer == self.candidate_source,
+                        local_heads=self.index_heads,
+                    )
+                if updated is not None:
+                    blocks = updated
+            selected = torch.where(
+                active[:, None] & (selected < ((safe_positions + 1) // self.ratio)[:, None]), selected, -1
+            ).int()
+            blocks = torch.where(active[:, None], blocks, -1).int()
+            main_cache = self.cache.main
+        else:
+            main_cache = self.batch_main_unused
+        packed_gather = (
+            self.batch_packed_mla
+            and bool(self.ratio)
+            and query.shape[0] in (8, 32)
+            and (query.shape[0] == 32 or not self.batch_reindex_group)
+        )
+        output = batch_packed_mla(
+            query.contiguous(),
+            self.batch_state.swa,
+            main_cache,
+            selected,
+            pages,
+            safe_positions,
+            slots,
+            self.weights.attn_sink,
+            self.scale,
+            swa_done,
+            main_done,
+            ratio=self.ratio,
+            window=self.window,
+            fused_gather=packed_gather,
+            sram_gather=packed_gather and self.batch_packed_mla_sram,
+            vector_gather=packed_gather and self.batch_packed_mla_vector,
+        )
+        result = self._finish_output(output, safe_positions, ready_outputs, request_batch=True)
+        result = torch.where(active[:, None], result, torch.zeros_like(result))
         return result, selected, blocks, main_done, index_done
 
     def insert_context(self, value, positions, valid_count=None):

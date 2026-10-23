@@ -9,6 +9,9 @@
 #ifndef DSV41_COMPRESSOR_PAIR_ROWS
 #define DSV41_COMPRESSOR_PAIR_ROWS 1
 #endif
+#ifndef DSV41_COMPRESSOR_PAIR_MIN_ROWS
+#define DSV41_COMPRESSOR_PAIR_MIN_ROWS 1
+#endif
 #ifndef DSV41_COMPRESSOR_PAIR_SCHEMA
 #define DSV41_COMPRESSOR_PAIR_SCHEMA "custom_deepseek_v41_compressor_pair_bf16_gaudi2"
 #define DSV41_COMPRESSOR_PAIR_ORDERED "custom_deepseek_v41_compressor_pair_ordered_bf16_gaudi2"
@@ -33,7 +36,8 @@ void validate(const at::Tensor& kv_history,
                     "V4.1 compressor pair requires contiguous inference FP32 tensors");
     TORCH_CHECK(kv_history.sizes() == at::IntArrayRef({8, 512}) &&
                     score_history.sizes() == at::IntArrayRef({8, 512}) &&
-                    kv.dim() == 2 && kv.size(1) == 512 && kv.size(0) >= 1 &&
+                    kv.dim() == 2 && kv.size(1) == 512 &&
+                    kv.size(0) >= DSV41_COMPRESSOR_PAIR_MIN_ROWS &&
                     kv.size(0) <= DSV41_COMPRESSOR_PAIR_ROWS && score.sizes() == kv.sizes() &&
                     position.scalar_type() == at::kInt &&
                     position.dim() == 1 && position.size(0) == kv.size(0) &&

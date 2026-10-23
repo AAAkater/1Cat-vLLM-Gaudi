@@ -4,6 +4,10 @@
 from vllm_gaudi import envs
 
 
+_DSPARK_BATCH_MIN_CAPACITY = 2
+_DSPARK_BATCH_MAX_CAPACITY = 4
+
+
 def select_native_warmup_geometries(geometries, additional_config):
     """Select deployment context plans without changing compute or decode shapes."""
     requested = additional_config.get("dsv41_native_warmup_searches")
@@ -94,13 +98,16 @@ def validate_v2(config):
     # the segmented device producer.
 
 
-def validate_sampling(params, *, dspark=None):
+def validate_sampling(params, *, dspark=None, batch=False):
     from vllm.exceptions import VLLMValidationError
 
     if params is None:
         raise VLLMValidationError("V4.1 runner requires sampling parameters")
     if dspark is None:
         dspark = envs.VLLM_HPU_DSV41_DSPARK
+    if dspark and batch and params.temperature != 0:
+        raise VLLMValidationError(
+            "V4.1 DSpark B2 is greedy-only for concurrent capacities; temperature must be 0")
     if dspark and params.temperature != 0 and not envs.VLLM_HPU_DSV41_DEVICE_VERIFY:
         raise VLLMValidationError("V4.1 sampled DSpark requires device probability verification")
     if (params.logprobs is not None or params.prompt_logprobs is not None or params.presence_penalty != 0
@@ -111,22 +118,79 @@ def validate_sampling(params, *, dspark=None):
             "are not supported")
 
 
+def validate_dspark_batch_capacity(config):
+    """Return the deployment capacity and reject invalid DSpark values early."""
+    capacity = getattr(getattr(config, "scheduler_config", None), "max_num_seqs", None)
+    if type(capacity) is not int or not 1 <= capacity <= _DSPARK_BATCH_MAX_CAPACITY:
+        raise ValueError("DSpark max_num_seqs must be an integer in 1..4")
+    return capacity
+
+
+def is_dspark_batch_tp8_profile(config):
+    """Return whether a 2..4 greedy TP8 x PP1 batch profile was requested.
+
+    This is a configuration gate, not a hardware-qualification claim. The
+    serial N=1 profiles retain their existing topology-specific behavior.
+    """
+    if not envs.VLLM_HPU_DSV41_DSPARK or not is_v41(config):
+        return False
+    parallel = getattr(config, "parallel_config", None)
+    scheduler = getattr(config, "scheduler_config", None)
+    cache = getattr(config, "cache_config", None)
+    if parallel is None or scheduler is None or cache is None:
+        return False
+    if (parallel.tensor_parallel_size, parallel.pipeline_parallel_size) != (8, 1):
+        return False
+    capacity = getattr(scheduler, "max_num_seqs", None)
+    if type(capacity) is not int or not _DSPARK_BATCH_MIN_CAPACITY <= capacity <= _DSPARK_BATCH_MAX_CAPACITY:
+        return False
+    if not hasattr(scheduler, "async_scheduling") or not hasattr(cache, "enable_prefix_caching"):
+        return False
+    return not scheduler.async_scheduling and not cache.enable_prefix_caching
+
+
+def is_dspark_b2_tp8_profile(config):
+    """Compatibility wrapper for the original exact-capacity B2 profile."""
+    return is_dspark_batch_tp8_profile(config) and config.scheduler_config.max_num_seqs == 2
+
+
 def validate_dspark_tp8_profile(config):
-    """Reject Stage-1 TP8 DSpark switches and unsupported concurrency."""
+    """Validate serial B1 and bounded TP8 x PP1 concurrent DSpark profiles."""
     if not envs.VLLM_HPU_DSV41_DSPARK:
         return
     parallel = config.parallel_config
-    if (parallel.tensor_parallel_size, parallel.pipeline_parallel_size) != (8, 1):
-        return
+    tp8_pp1 = (parallel.tensor_parallel_size, parallel.pipeline_parallel_size) == (8, 1)
     from vllm_gaudi.entrypoints.deepseek_v41 import _DSPARK_TP8_DEFAULTS
 
-    max_num_seqs = config.scheduler_config.max_num_seqs
-    if max_num_seqs != 1:
-        raise ValueError(f"TP8 x PP1 DSpark Stage 1 requires max_num_seqs=1 (got {max_num_seqs})")
+    max_num_seqs = validate_dspark_batch_capacity(config)
+    if max_num_seqs == 1:
+        if not tp8_pp1:
+            return
+    else:
+        # B1 keeps the existing TP2 x PP2 and TP4 x PP1 paths. Capacities 2..4
+        # are deliberately narrower and must not be inferred from max_num_seqs.
+        if not tp8_pp1:
+            raise ValueError("DSpark concurrency requires TP8 x PP1")
+        if not hasattr(config, "cache_config") or not hasattr(config.cache_config, "enable_prefix_caching"):
+            raise ValueError(
+                "TP8 x PP1 DSpark Stage 1 requires max_num_seqs=1 without an explicit prefix-caching setting; "
+                "DSpark concurrency requires that setting")
+        if not hasattr(config.scheduler_config, "async_scheduling"):
+            raise ValueError(
+                "TP8 x PP1 DSpark Stage 1 requires max_num_seqs=1 without an explicit asynchronous-scheduling "
+                "setting; DSpark concurrency requires that setting")
+        if config.cache_config.enable_prefix_caching:
+            raise ValueError("DSpark concurrency requires prefix caching to be disabled")
+        if config.scheduler_config.async_scheduling:
+            raise ValueError("DSpark concurrency requires synchronous scheduling")
+        if not is_dspark_batch_tp8_profile(config):
+            raise ValueError(
+                "DSpark concurrency requires the greedy TP8 x PP1, prefix-off, synchronous-scheduling "
+                f"profile with max_num_seqs in 2..4 (got {max_num_seqs})")
     enabled = [name for name in _DSPARK_TP8_DEFAULTS if getattr(envs, name)]
     if enabled:
         raise ValueError(
-            "TP8 x PP1 DSpark Stage 1 does not support the enabled profile switches; "
+            "TP8 x PP1 DSpark does not support the enabled profile switches; "
             f"set these variables to 0: {', '.join(enabled)}")
 
 

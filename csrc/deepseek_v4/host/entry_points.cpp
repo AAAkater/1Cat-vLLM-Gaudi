@@ -73,6 +73,7 @@ NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVE
 #include "deepseek_v41_csa2_prep_gaudi2.hpp"
 #include "deepseek_v41_compressor_pair_gaudi2.hpp"
 #include "deepseek_v41_compressor_batch_gaudi2.hpp"
+#include "deepseek_v41_compressor_sequence_masked_gaudi2.hpp"
 #include "deepseek_v41_decoded_kv_gaudi2.hpp"
 #include "deepseek_v41_control_gemv_gaudi2.hpp"
 #include "deepseek_v41_control_gemv_rrms_gaudi2.hpp"
@@ -218,6 +219,7 @@ enum KernelIndex {
     GAUDI2_KERNEL_DEEPSEEK_V41_COMPRESSOR_PAIR_BF16,
     GAUDI2_KERNEL_DEEPSEEK_V41_COMPRESSOR_BATCH_BF16,
     GAUDI2_KERNEL_DEEPSEEK_V41_COMPRESSOR_BATCH_GATHER_F32,
+    GAUDI2_KERNEL_DEEPSEEK_V41_COMPRESSOR_SEQUENCE_MASKED_BF16,
     GAUDI2_KERNEL_DEEPSEEK_V41_FP4_CACHE_WRITE_BF16,
     GAUDI2_KERNEL_DEEPSEEK_V41_SWA_PACK_WRITE_BF16,
     GAUDI2_KERNEL_DEEPSEEK_V41_CONTROL_GEMV_F32,
@@ -515,6 +517,8 @@ tpc_lib_api::GlueCodeReturn GetKernelGuids(tpc_lib_api::DeviceId deviceId,
                 DeepseekV41CompressorBatchGaudi2::name);
     std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_COMPRESSOR_BATCH_GATHER_F32].name,
                 DeepseekV41CompressorBatchGaudi2::gatherName);
+    std::strcpy(guids[GAUDI2_KERNEL_DEEPSEEK_V41_COMPRESSOR_SEQUENCE_MASKED_BF16].name,
+                DeepseekV41CompressorSequenceMaskedGaudi2::name);
     DeepseekV41Fp4PackGaudi2 fp4Write(0);
     fp4Write.GetKernelName(guids[GAUDI2_KERNEL_DEEPSEEK_V41_FP4_CACHE_WRITE_BF16].name);
     DeepseekV41SwaPackGaudi2 swaWrite(true);
@@ -1039,6 +1043,10 @@ tpc_lib_api::GlueCodeReturn InstantiateTpcKernel(tpc_lib_api::HabanaKernelParams
     if (std::strcmp(params->guid.name,
                     DeepseekV41CompressorBatchGaudi2::gatherName) == 0)
         return DeepseekV41CompressorBatchGaudi2(true).GetGcDefinitions(
+            params, instance);
+    if (std::strcmp(params->guid.name,
+                    DeepseekV41CompressorSequenceMaskedGaudi2::name) == 0)
+        return DeepseekV41CompressorSequenceMaskedGaudi2().GetGcDefinitions(
             params, instance);
     DeepseekV41Fp4PackGaudi2 fp4Write(0);
     fp4Write.GetKernelName(kernelName);

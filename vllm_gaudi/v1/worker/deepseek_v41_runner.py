@@ -48,6 +48,7 @@ from vllm_gaudi.ops.deepseek_v41_prefill_capacity import (
     prefill_compute_buckets,
     prefill_target_tokens,
 )
+from vllm_gaudi.v1.worker.deepseek_v41_dspark_batch_runner import DSparkBatchRunner, DSparkBatchTrace
 
 logger = init_logger()
 
@@ -1027,10 +1028,17 @@ class V41ModelRunner:
         self.requests, self.encoder_cache = {}, {}
         self.model = self.state = None
         self.request_batches = None
+        self.dspark_batch_runner = None
         self.prefix_checkpoints = None
         self.kv_caches, self.graphed_buckets = [], set()
         self.pending = self.draft_token_ids = None
         self.use_dspark = envs.VLLM_HPU_DSV41_DSPARK
+        if self.use_dspark:
+            from vllm_gaudi.ops.deepseek_v41_config import validate_dspark_batch_capacity
+
+            self.dspark_batch_capacity = validate_dspark_batch_capacity(vllm_config)
+        else:
+            self.dspark_batch_capacity = 0
         self._token_copy = self._next_input = None
         self.tp4_token_readback = None
         self.active_request = None
@@ -1140,7 +1148,40 @@ class V41ModelRunner:
             "image_encodes": 0,
         }
 
+    def _validate_dspark_batch_capacity(self):
+        from vllm_gaudi.ops.deepseek_v41_config import validate_dspark_batch_capacity
+
+        capacity = validate_dspark_batch_capacity(self.vllm_config)
+        configured = getattr(self, "dspark_batch_capacity", None)
+        if configured is not None and configured != capacity:
+            raise RuntimeError(
+                f"DSpark runner capacity {configured} does not match configured max_num_seqs {capacity}")
+        self.dspark_batch_capacity = capacity
+        return capacity
+
+    def _initialize_dspark_batch_runner(self, capacity):
+        target_stage, draft_stage = self.model.initialize_dspark_batch(capacity)
+        state = getattr(self.model, "batch_state", None)
+        slots = getattr(state, "slots", None)
+        if (getattr(state, "capacity", None) != capacity or getattr(slots, "capacity", None) != capacity):
+            raise RuntimeError(
+                "DSpark model initialization did not derive target state and RequestSlots from one capacity")
+        if (getattr(state, "pending", None) is not None or getattr(state, "single_owner", None) is not None
+                or getattr(state, "prefill_owner", None) is not None or bool(getattr(slots, "owners", None))):
+            raise RuntimeError(
+                "DSpark batch runner requires drained B1 close-loop state and idle request bindings")
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        self.dspark_batch_runner = DSparkBatchRunner(
+            target_stage,
+            draft_stage,
+            trace=DSparkBatchTrace(rank=rank, tp_rank=self.model.tp_rank, pp_rank=self.model.pp_rank),
+            slots=slots,
+            batch_capacity=capacity,
+        )
+        self.dspark_batch_capacity = capacity
+
     def load_model(self):
+        dspark_capacity = self._validate_dspark_batch_capacity() if self.use_dspark else 0
         before = torch.hpu.memory_allocated()
         if envs.VLLM_HPU_DSV41_GRAPH_REPLAY:
             from vllm_gaudi.distributed.tp2_fused_ar_norm import initialize_tp2_fused_ar_norm_runtime
@@ -1180,10 +1221,13 @@ class V41ModelRunner:
             from vllm_gaudi.v1.worker.deepseek_v41_batch_runner import BatchExecution
 
             self.request_batches = BatchExecution(self, self.vllm_config.scheduler_config.max_num_seqs)
+        if self.use_dspark:
+            if dspark_capacity > 1:
+                self._initialize_dspark_batch_runner(dspark_capacity)
         if self.vllm_config.cache_config.enable_prefix_caching:
             from vllm_gaudi.v1.worker.deepseek_v41_prefix import PrefixCheckpoints
 
-            if self.request_batches is None:
+            if self.request_batches is None and self.dspark_batch_runner is None:
                 self.model.initialize_request_state(self.vllm_config.scheduler_config.max_num_seqs)
             self.prefix_checkpoints = PrefixCheckpoints(self)
         register_state_spec(self.vllm_config)
@@ -1500,6 +1544,7 @@ class V41ModelRunner:
     @property
     def request_slots_enabled(self):
         return (getattr(self, "request_batches", None) is not None
+                or getattr(self, "dspark_batch_runner", None) is not None
                 or getattr(self, "prefix_checkpoints", None) is not None)
 
     def _bind_request(self, request):
@@ -1511,6 +1556,8 @@ class V41ModelRunner:
                 bank.bind_single(owner, request.num_computed_tokens)
             else:
                 bank.bind_prefill(owner)
+            if self.dspark_batch_runner is not None:
+                self.dspark_batch_runner.bind_single(owner)
             if self.model.engram_host is not None:
                 self.model.engram_host.activate(request.req_id, reset=request.num_computed_tokens == 0)
             if request.num_computed_tokens == request.decode_start and envs.VLLM_HPU_DSV41_STATE_AUDIT_DIR:
@@ -1551,7 +1598,24 @@ class V41ModelRunner:
             self.active_request = request.req_id
             self.audit["requests"] += 1
 
+    def _prepare_dspark_batch_request(self, request):
+        """Prepare packed ownership without selecting a B1 working binding.
+
+        The batch adapter retires any previous B1 working set exactly once at
+        execution. Binding every request here would turn one packed round into
+        N serial handoffs and could publish stale working rows over packed state.
+        """
+        bank = self.model.batch_state
+        owner = bank.acquire(request.req_id)
+        bank.publish_pages(owner, request.block_ids[0], self.state.blocks)
+        if self.model.engram_host is not None:
+            self.model.engram_host.activate(request.req_id, reset=request.num_computed_tokens == 0)
+        self.active_request = request.req_id
+        return owner
+
     def _release_batch_state(self, req_id):
+        if self.dspark_batch_runner is not None:
+            self.dspark_batch_runner.release(req_id)
         self.model.batch_state.release(req_id)
         if isinstance(self.state, PagedStageState):
             self.state.release(req_id)
@@ -1645,11 +1709,10 @@ class V41ModelRunner:
             if self.request_slots_enabled and req_id in cached.resumed_req_ids:
                 request.recompute_until = len(request.tokens)
 
-    @staticmethod
-    def _validate_sampling(params):
-        from vllm_gaudi.ops.deepseek_v41_config import validate_sampling
+    def _validate_sampling(self, params):
+        from vllm_gaudi.ops.deepseek_v41_config import is_dspark_batch_tp8_profile, validate_sampling
 
-        validate_sampling(params)
+        validate_sampling(params, batch=is_dspark_batch_tp8_profile(self.vllm_config))
 
     def _image_embeddings(self, request, start, count, input_ids):
         if not request.mm_features or not self.pp.group.is_first_rank:
@@ -2184,6 +2247,12 @@ class V41ModelRunner:
     def execute_model(self, scheduled):
         if self.pending is not None:
             raise RuntimeError("Previous V4.1 execution has not completed sampling/verify")
+        if self.dspark_batch_runner is not None:
+            capacity = getattr(self, "dspark_batch_capacity", 0)
+            active = len(scheduled.num_scheduled_tokens)
+            if type(capacity) is not int or capacity <= 0 or active > capacity:
+                raise RuntimeError(
+                    f"DSpark scheduled request count {active} exceeds configured max_num_seqs {capacity}")
         self._update(scheduled)
         operations = getattr(scheduled, "auxiliary_prefix_operations", None)
         if self.prefix_checkpoints is not None:
@@ -2194,6 +2263,8 @@ class V41ModelRunner:
             raise RuntimeError("Auxiliary prefix operations reached a worker without checkpoint support")
         if not scheduled.num_scheduled_tokens:
             return EMPTY_MODEL_RUNNER_OUTPUT
+        if self.dspark_batch_runner is not None and self._dspark_batch_candidate(scheduled):
+            return self._execute_dspark_batch(scheduled)
         outputs, drafts, ids, async_result = [], [], [], None
         execution_rounds = []
         batch_size = len(scheduled.num_scheduled_tokens)
@@ -2266,6 +2337,59 @@ class V41ModelRunner:
             self.batch_result = None
         self.pending = "batch_ready"
         return None
+
+    def _dspark_batch_candidate(self, scheduled):
+        """Return whether every scheduled request is ready for one packed round.
+
+        A mixed round containing any prefill request deliberately falls back to
+        the serial path for that prefill phase. Once every active request is in
+        steady decode, one request in any physical slot is still packed.
+        """
+        if self.dspark_batch_runner is None:
+            return False
+        active = len(scheduled.num_scheduled_tokens)
+        capacity = getattr(self, "dspark_batch_capacity", 0)
+        if type(capacity) is not int or not 1 <= active <= capacity:
+            return False
+        for req_id, count in scheduled.num_scheduled_tokens.items():
+            request = self.requests.get(req_id)
+            if (request is None or not 1 <= count <= 6 or request.num_computed_tokens < request.decode_start
+                    or request.mm_features):
+                return False
+        return True
+
+    def _dspark_b2_candidate(self, scheduled):
+        """Compatibility wrapper for the original B2 entry name."""
+        return self._dspark_batch_candidate(scheduled)
+
+    def _execute_dspark_batch(self, scheduled):
+        capacity = getattr(self, "dspark_batch_capacity", 0)
+        if len(scheduled.num_scheduled_tokens) > capacity:
+            raise RuntimeError("DSpark packed round exceeds the configured max_num_seqs capacity")
+        owners = self.model.batch_state.slots.owners
+        plan = self.dspark_batch_runner.build_plan(
+            scheduled,
+            self.requests,
+            owners,
+            max_model_len=self.model_config.max_model_len,
+        )
+        active_owners = self.model.batch_state.slots.owners
+        for entry in plan.requests:
+            owner = active_owners.get(entry.req_id)
+            if owner is None or owner.index != entry.request_slot or owner.generation != entry.slot_generation:
+                raise RuntimeError("DSpark request slot changed before packed state preparation")
+            prepared = self._prepare_dspark_batch_request(entry.request)
+            if prepared != owner:
+                raise RuntimeError("DSpark packed preparation changed the request-slot owner")
+        model_output, draft_token_ids = self.dspark_batch_runner.execute(plan)
+        self.batch_result = model_output
+        self.draft_token_ids = draft_token_ids
+        self.pending = "batch_ready"
+        return None
+
+    def _execute_dspark_b2(self, scheduled):
+        """Compatibility wrapper for the original B2 execution entry name."""
+        return self._execute_dspark_batch(scheduled)
 
     @trace_phase
     def _execute_request(self, scheduled, req_id, count):
@@ -3318,6 +3442,25 @@ class V41ModelRunner:
         logger.info("V4.1 starting sampling protocol preparation")
         self._warm_device_round_inputs()
         logger.info("V4.1 sampling protocol preparation complete")
+        if self.dspark_batch_runner is not None:
+            from vllm.sampling_params import SamplingParams
+
+            def request_factory(req_id, page, token):
+                return RequestState(
+                    req_id=req_id,
+                    prompt=[],
+                    mm_features=[],
+                    sampling_params=SamplingParams(temperature=0, max_tokens=64, ignore_eos=True),
+                    block_ids=((page, ), ),
+                    num_computed_tokens=0,
+                    output=[token],
+                )
+
+            self.dspark_batch_runner.warmup(
+                pool_blocks=self.state.blocks,
+                max_model_len=self.model_config.max_model_len,
+                request_factory=request_factory,
+            )
         self.pp.group.barrier()
         self.state.clear()
         self.active_request = None

@@ -210,6 +210,8 @@ class HpuPlatform(Platform):
     ]
     simple_compile_backend = "hpu_backend"
     additional_env_vars = [k for k, v in os.environ.items() if retain_envs(k)]
+    _v41_dspark_batch_profile = False
+    _v41_dspark_b2_profile = False
 
     @classmethod
     def check_runner_kv_caches_multi_layer(cls) -> None:
@@ -313,6 +315,17 @@ class HpuPlatform(Platform):
 
     @classmethod
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
+        from vllm_gaudi.ops.deepseek_v41_config import is_dspark_batch_tp8_profile
+
+        # Request admission runs before the worker and has no VllmConfig
+        # argument. Record every engine profile so B1, sampled B1, DSpark-off,
+        # and non-V4.1 configurations cannot inherit a previous batch gate.
+        profile_sections = ("model_config", "parallel_config", "scheduler_config", "cache_config")
+        batch_profile = (all(hasattr(vllm_config, name) for name in profile_sections)
+                         and is_dspark_batch_tp8_profile(vllm_config))
+        cls._v41_dspark_batch_profile = batch_profile
+        # Retain the old exact-B2 class attribute for external integrations.
+        cls._v41_dspark_b2_profile = batch_profile and vllm_config.scheduler_config.max_num_seqs == 2
         if gaudi_envs.VLLM_HPU_DSV4_NATIVE_DECODE_GRAPH:
             from vllm_gaudi.ops.deepseek_v4_native import validate_config
             validate_config(vllm_config)
@@ -600,7 +613,7 @@ class HpuPlatform(Platform):
     def validate_request(cls, processed_inputs, params):
         if gaudi_envs.VLLM_HPU_DSV41_PREPARED_SHARDS:
             from vllm_gaudi.ops.deepseek_v41_config import validate_sampling
-            validate_sampling(params)
+            validate_sampling(params, batch=cls._v41_dspark_batch_profile)
 
     @classmethod
     def get_max_concurrent_batches(cls, vllm_config):

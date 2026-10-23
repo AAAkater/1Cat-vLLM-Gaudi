@@ -73,6 +73,9 @@ foreach(SOURCE IN LISTS KERNEL_SOURCES)
     elseif(NAME STREQUAL "deepseek_v41_mla_exp_bf16_gaudi2")
         list(APPEND EXTRA_HEADERS "${CMAKE_CURRENT_SOURCE_DIR}/kernels/deepseek_v41_mla_softmax_gaudi2.c")
     endif()
+    if(NAME STREQUAL "deepseek_v41_compressor_sequence_masked_bf16_gaudi2")
+        list(APPEND EXTRA_HEADERS "${CMAKE_CURRENT_SOURCE_DIR}/kernels/deepseek_v41_compressor_pair_bf16_gaudi2.c")
+    endif()
     add_custom_command(OUTPUT "${OBJECT}"
         COMMAND "${TPC_COMPILER}" -Wall -Werror -O2 -march=gaudi2
             -I${TPC_INCLUDE_DIR} -I${CMAKE_CURRENT_SOURCE_DIR}/include

@@ -2216,6 +2216,125 @@ class PreparedDecoderLayer(nn.Module):
         pre_mix = pre_mix.masked_fill(~active[:, None], 0)
         return residual, pre_mix, selected, candidates, main_ready, index_ready
 
+    def forward_batch_target(
+        self,
+        residual,
+        pre_mix,
+        positions,
+        image_mask,
+        engram_rows,
+        slots,
+        pages,
+        selected,
+        candidates,
+        main_ready,
+        index_ready,
+        row_valid,
+        request_lengths,
+        request_slots,
+    ):
+        """Run one fixed-capacity target round under request-batch math.
+
+        Each lane owns six physical rows; logical query counts are masked
+        by row_valid.  The method intentionally
+        avoids the C2-C6-only fused branches in :meth:`forward` and the
+        speculative rejection in :meth:`forward_batch`; all three DSpark target
+        state producers still emit their per-row context state for verify.
+        """
+        if self.draft:
+            raise RuntimeError("Draft layers cannot run in the target batch stage")
+        capacity = len(request_slots)
+        if capacity < 1 or residual.shape[0] != 6 * capacity or positions.numel() != 6 * capacity:
+            raise ValueError("DSpark target rows must equal six times the fixed capacity")
+        if tuple(request_lengths) != (6, ) * capacity:
+            raise ValueError("DSpark target graph is fixed at six physical rows per request")
+        active = row_valid.to(torch.bool) & (slots >= 0)
+
+        w = self.weights
+        if hasattr(w, "engram"):
+            if engram_rows is None:
+                raise RuntimeError("Batched target Engram requires completed request-owned rows")
+            local = engram_rows if engram_rows.dtype == torch.bfloat16 else unpack_swa(engram_rows, 256)
+            rows = self.all_gather(local, dim=1)
+            kv = linear(rows.flatten(1), w.engram.wkv)
+            residual = engram_update(residual, kv, w.engram.q_weight, w.engram.k_weight,
+                                     active & ~image_mask, self.eps)
+
+        target_state = None
+        if self.collect_target_state:
+            # The batch bank is larger than one request's six rows; retaining
+            # that full ring length keeps every real row instead of applying
+            # the single-request tail crop.
+            ring_capacity = self.attention.batch_state.swa.shape[0]
+            target_state = draft_context_state(residual, ring_capacity, grouped_prefill=False)
+            target_state = target_state.masked_fill(~active[:, None], 0)
+
+        value, new_pre, post, comb = hc_pre(
+            residual,
+            pre_mix,
+            w.hc_attn_fn,
+            w.hc_attn_scale,
+            w.hc_attn_base,
+            self.eps,
+            self.hc_eps,
+            self.iterations,
+            request_batch=True,
+            batch_control_reuse=self.batch_control_reuse,
+            batch_control_prefetch=self.batch_control_prefetch,
+            packed_fn=self.hc_attn_fn_packed if self.batch_mhc_fusion else None,
+        )
+        schedule = gaudi_envs.VLLM_HPU_DSV41_MHC_SCHEDULE
+        result = self.attention.forward_batch_target(
+            rms_norm(value, w.attn_norm.weight, self.eps, request_batch=True),
+            positions,
+            slots,
+            pages,
+            selected,
+            candidates,
+            main_ready,
+            index_ready,
+            row_valid=active,
+            request_lengths=request_lengths,
+            request_slots=request_slots,
+            ready_outputs=(post, comb) if schedule else (),
+        )
+        value, selected, candidates, main_ready, index_ready = result
+        residual = hc_post(value, residual, post, comb)
+
+        value, pre_mix, post, comb = hc_pre(
+            residual,
+            new_pre,
+            w.hc_ffn_fn,
+            w.hc_ffn_scale,
+            w.hc_ffn_base,
+            self.eps,
+            self.hc_eps,
+            self.iterations,
+            request_batch=True,
+            batch_control_reuse=self.batch_control_reuse,
+            batch_control_prefetch=self.batch_control_prefetch,
+            packed_fn=self.hc_ffn_fn_packed if self.batch_mhc_fusion else None,
+        )
+        prequant = None
+        if (self.batch_ffn_fusion and self.moe.n256_fused
+                and not (value.shape[0] == 64 and self.moe.concurrent_moe_rows)):
+            value, quantized, activation_scale = torch.ops.custom_op.custom_deepseek_v41_ffn_norm_quant_gaudi2(
+                value.contiguous(), w.ffn_norm.weight, self.eps)
+            prequant = quantized, activation_scale
+        else:
+            value = rms_norm(value, w.ffn_norm.weight, self.eps, request_batch=True)
+        value = self.moe(
+            value,
+            image_mask,
+            ready_outputs=(post, comb) if schedule else (),
+            ordinary_decode=True,
+            prequant=prequant,
+        )
+        residual = hc_post(value, residual, post, comb)
+        residual = residual.masked_fill(~active[:, None, None], 0)
+        pre_mix = pre_mix.masked_fill(~active[:, None], 0)
+        return residual, pre_mix, selected, candidates, main_ready, index_ready, target_state
+
 
 class PrefillInput:
     """Transfer a prompt's initial residual into the layer loop exactly once.

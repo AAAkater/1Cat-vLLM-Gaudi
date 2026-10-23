@@ -42,6 +42,7 @@ int main() {
     assert(capacity == count);
     assert(GetKernelGuids(DEVICE_ID_GAUDI2, &count, guids.data()) == GLUE_SUCCESS);
     uint32_t custom_count = 0;
+    uint32_t masked_sequence_count = 0;
     bool selected_kv_seen = false;
     bool device_engram_seen = false;
     for (const auto& guid : guids) {
@@ -51,6 +52,9 @@ int main() {
                 guid.name, "custom_deepseek_v41_selected_kv_bf16_gaudi2") == 0;
             device_engram_seen |= std::strcmp(
                 guid.name, "custom_deepseek_v41_engram_hash_gather_bf16_gaudi2") == 0;
+            masked_sequence_count += std::strcmp(
+                guid.name,
+                "custom_deepseek_v41_compressor_sequence_masked_bf16_gaudi2") == 0;
             HabanaKernelParams query{};
             query.guid = guid;
             uint32_t layouts_count = 0;
@@ -68,8 +72,32 @@ int main() {
         }
     }
     assert(custom_count >= 52);
+    assert(masked_sequence_count == 1);
     assert(selected_kv_seen);
     assert(device_engram_seen);
+    {
+        HabanaKernelParams p{}; HabanaKernelInstantiation out{};
+        Tensor inputs[5]{}, outputs[1]{};
+        TensorAccessPattern ia[5]{}, oa[1]{};
+        p.inputTensors=inputs; p.inputTensorNr=5;
+        p.outputTensors=outputs; p.outputTensorNr=1;
+        out.inputTensorAccessPattern=ia; out.outputTensorAccessPattern=oa;
+        std::strcpy(p.guid.name,
+                    "custom_deepseek_v41_compressor_sequence_masked_bf16_gaudi2");
+        auto set=[](Tensor& t,TensorDataType type,std::initializer_list<uint64_t> dims) {
+            t.geometry.dataType=type;t.geometry.dims=dims.size();unsigned i=0;
+            for(auto size:dims)t.geometry.maxSizes[i++]=size;
+        };
+        set(inputs[0],DATA_F32,{512,8}); set(inputs[1],DATA_F32,{512,8});
+        set(inputs[2],DATA_F32,{512,6}); set(inputs[3],DATA_F32,{512,6});
+        set(inputs[4],DATA_I32,{6}); set(outputs[0],DATA_BF16,{512,6});
+        assert(InstantiateTpcKernel(&p,&out)==GLUE_INSUFFICIENT_ELF_BUFFER);
+        assert(out.indexSpaceGeometry[0]==4 && out.indexSpaceGeometry[1]==6);
+        assert(ia[0].mapping[1].end_b==7 && ia[2].mapping[1].end_b==5);
+        inputs[2].geometry.maxSizes[1]=5; inputs[3].geometry.maxSizes[1]=5;
+        inputs[4].geometry.maxSizes[0]=5; outputs[0].geometry.maxSizes[1]=5;
+        assert(InstantiateTpcKernel(&p,&out)==GLUE_INCOMPATIBLE_INPUT_SIZE);
+    }
     // Horizontal three-route W2 must retain complete K for every TP width.
     for (unsigned k : {640u, 1280u, 2560u}) {
         HabanaKernelParams p{}; HabanaKernelInstantiation out{};

@@ -29,6 +29,28 @@ from vllm_gaudi.ops.deepseek_v41_prefill_capacity import prefill_capacity
 from vllm_gaudi.ops.deepseek_v41_replay import StageReplay, stage_collectives
 
 
+def _validate_dspark_batch_native_runtime(vllm_config):
+    """Fail before weight load when required concurrent DSpark ops are absent."""
+    from vllm_gaudi.ops.deepseek_v41_config import is_dspark_batch_tp8_profile
+
+    if not is_dspark_batch_tp8_profile(vllm_config):
+        return
+    capacity = vllm_config.scheduler_config.max_num_seqs
+    required = ("custom_deepseek_v41_compressor_sequence_masked_bf16_gaudi2",)
+    missing = [name for name in required if not hasattr(torch.ops.custom_op, name)]
+    if missing:
+        raise RuntimeError(
+            f"DSpark concurrent capacity {capacity} requires the unified masked-sequence runtime before model "
+            f"loading; missing {', '.join(missing)}. Rebuild/install the unified DSpark native runtime and "
+            "point VLLM_HPU_DSV41_NATIVE_LIBRARY_DIR or the launcher NATIVE_DIR at the new artifact."
+        )
+
+
+def _validate_dspark_b2_native_runtime(vllm_config):
+    """Compatibility alias for callers of the original B2-only check."""
+    return _validate_dspark_batch_native_runtime(vllm_config)
+
+
 @MULTIMODAL_REGISTRY.register_processor(
     DeepseekV4VLMultiModalProcessor, info=DeepseekV4VLProcessingInfo, dummy_inputs=DeepseekV4VLDummyInputsBuilder
 )
@@ -46,6 +68,13 @@ class HpuDeepseekV41ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
             raise ValueError("The prepared V4.1 profile requires TP2 x PP2 or TP4 x PP1")
         self.tensor_parallel_size = parallel.tensor_parallel_size
         self.pipeline_parallel_size = parallel.pipeline_parallel_size
+        self.max_model_len = vllm_config.model_config.max_model_len
+        if envs.VLLM_HPU_DSV41_DSPARK:
+            from vllm_gaudi.ops.deepseek_v41_config import validate_dspark_batch_capacity
+
+            self.dspark_batch_capacity = validate_dspark_batch_capacity(vllm_config)
+        else:
+            self.dspark_batch_capacity = 0
         self.prefill_capacity = prefill_capacity(
             vllm_config.scheduler_config.max_num_batched_tokens, self.tensor_parallel_size
         )
@@ -93,6 +122,7 @@ class HpuDeepseekV41ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
             )
         if any(not hasattr(torch.ops.custom_op, name) for name in required_ops):
             torch.ops.load_library(envs.VLLM_HPU_DSV4_TPC_OP_LIBRARY)
+        _validate_dspark_batch_native_runtime(vllm_config)
         if envs.VLLM_HPU_DSV41_PREFILL_ROPE:
             for name in (
                 "custom_deepseek_v41_prefill_rope_bf16_gaudi2",
@@ -334,17 +364,37 @@ class HpuDeepseekV41ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
             raise RuntimeError("complete_step_device expects the consumed committed scalar")
         self.complete_step(int(committed_inputs))
 
+    def _dspark_configured_capacity(self, requested=None):
+        config = getattr(self, "vllm_config", None)
+        if config is not None:
+            from vllm_gaudi.ops.deepseek_v41_config import validate_dspark_batch_capacity
+
+            configured = validate_dspark_batch_capacity(config)
+        else:
+            configured = getattr(self, "dspark_batch_capacity", requested)
+        if requested is not None:
+            if type(requested) is not int:
+                raise ValueError("DSpark request capacity must be an integer")
+            if configured != requested:
+                raise ValueError(
+                    f"DSpark request capacity {requested} does not match configured max_num_seqs {configured}")
+        if type(configured) is not int or not 1 <= configured <= 4:
+            raise ValueError("DSpark request capacity must be in 1..4")
+        return configured
+
     def initialize_request_state(self, capacity):
         """Request-owned state shared by native C1 and optional batch replay."""
         if not self.native:
             raise RuntimeError("Request slots require ordinary native replay")
-        if self.program.dspark and capacity != 1:
-            raise ValueError("DSpark prefix state currently requires one active request")
+        if self.program.dspark:
+            capacity = self._dspark_configured_capacity(capacity)
         from vllm_gaudi.ops.deepseek_v41_batch_state import BatchStageState
 
         self.batch_state = BatchStageState(self.program, capacity)
 
     def initialize_request_batches(self, capacity):
+        if self.program.dspark:
+            raise ValueError("Ordinary BatchStageReplay does not support DSpark")
         if not envs.VLLM_HPU_DSV41_BATCH_DECODE:
             raise RuntimeError("Request batches require the explicit ordinary native replay configuration")
         from vllm_gaudi.ops.deepseek_v41_batch_replay import BatchStageReplay
@@ -367,6 +417,65 @@ class HpuDeepseekV41ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
             if self.pp_rank == 0
             else {}
         )
+
+    def initialize_dspark_batch(self, capacity):
+        """Initialize one fixed-capacity packed target/draft owner, without fallback."""
+        if not self.program.dspark:
+            raise ValueError("DSpark batch initialization requires a DSpark prepared stage")
+        if not self.native:
+            raise RuntimeError("DSpark batch requires native target replay")
+        capacity = self._dspark_configured_capacity(capacity)
+        if not 2 <= capacity <= 4:
+            raise ValueError("DSpark packed initialization requires concurrent capacity in 2..4")
+        self.initialize_request_state(capacity)
+        state_capacity = getattr(self.batch_state, "capacity", None)
+        owner_slots = getattr(self.batch_state, "slots", None)
+        slots_capacity = getattr(owner_slots, "capacity", None)
+        owner_validator = getattr(owner_slots, "validate_batch_identities", None)
+        if not callable(owner_validator):
+            raise RuntimeError("DSpark batch requires authoritative RequestSlots owner validation")
+        if state_capacity != capacity or slots_capacity != capacity:
+            raise RuntimeError(
+                "DSpark target state and RequestSlots must use the configured deployment capacity "
+                f"{capacity} (state={state_capacity}, slots={slots_capacity})")
+        if (getattr(self.batch_state, "pending", None) is not None
+                or getattr(self.batch_state, "single_owner", None) is not None
+                or getattr(self.batch_state, "prefill_owner", None) is not None
+                or bool(getattr(owner_slots, "owners", None))):
+            raise RuntimeError(
+                "DSpark batch initialization requires drained B1 close-loop state and idle request bindings")
+        # Target-stage construction installs augmentations on the one bank.
+        # Never let initialize_target_batch_state create a second owner map.
+        self.program.batch_state = self.batch_state
+        from vllm_gaudi.ops.deepseek_v41_batch_draft import DSparkBatchDraftStage, DraftBatchState
+        from vllm_gaudi.ops.deepseek_v41_batch_verify import BatchVerifyRing
+        from vllm_gaudi.v1.worker.deepseek_v41_dspark_batch_runner import (
+            DSparkDraftBatch,
+            DSparkPackedTargetStages,
+        )
+
+        self.dspark_target_stages = DSparkPackedTargetStages(
+            self.program,
+            self.batch_state,
+            batch_capacity=capacity,
+            device=self.device,
+            engram_host=self.engram_host,
+        )
+        self.dspark_draft_state = DraftBatchState(self.program.draft, capacity=capacity)
+        self.dspark_verify_ring = BatchVerifyRing(
+            self.device,
+            batch_capacity=capacity,
+            owner_validator=owner_validator,
+        )
+        self.dspark_draft_stage = DSparkBatchDraftStage(
+            self.program.draft,
+            batch_state=self.dspark_draft_state,
+            verify_ring=self.dspark_verify_ring,
+            result_factory=DSparkDraftBatch,
+            batch_capacity=capacity,
+            max_model_len=self.max_model_len,
+        )
+        return self.dspark_target_stages, self.dspark_draft_stage
 
     def forward_request_batch(self, input_ids, positions, slots, pages, spans, intermediate_tensors=None, *, lane=0):
         """Run one C1 per request through one native stage entry."""

@@ -104,6 +104,7 @@ setup(
                 "hpu_dsv41_control_gemv_pt2.cpp",
                 "hpu_dsv41_csa2_prep_pt2.cpp",
                 "hpu_dsv41_compressor_pair_pt2.cpp",
+                "hpu_dsv41_compressor_sequence_masked_pt2.cpp",
                 "hpu_dsv41_compressor_batch_pt2.cpp",
                 "hpu_dsv41_compressor_batch_gather_pt2.cpp",
                 "hpu_dsv41_decoded_kv_pt2.cpp",
