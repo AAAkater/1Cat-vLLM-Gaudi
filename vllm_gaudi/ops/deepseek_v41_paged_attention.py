@@ -533,6 +533,14 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
             self.register_buffer(f"_tp4_index_query_shard_{shard}", None, False)
             self.register_buffer(f"_tp4_index_score_shard_{shard}", None, False)
         self.search_length = 512
+        # Keep the compiled target graph independent of the exact search bucket.
+        # The target path only needs to know whether local index queries are in
+        # their supported range; the concrete bucket remains scheduler metadata.
+        self.local_index_query_range = self.search_length <= 32768
+        # Bounded DSpark target attention is compiled once and reused across
+        # prefill search buckets. A full-length rotary table keeps its address
+        # and shape stable; positions still select the same rows at every bucket.
+        self.stable_rotary_identity = bool(gaudi_envs.VLLM_HPU_DSV41_DSPARK and self.length <= 32768)
         self.decode_visible_rows = None
         self.heads, self.groups = (
             config["num_attention_heads"] // tensor_parallel_size,
@@ -673,11 +681,12 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
             )
             self.register_buffer("score_history", torch.zeros_like(self.kv_history), False)
         self._rotary_name = "compressed_rotary" if self.ratio else "swa_rotary"
-        self.register_buffer("rotary", shared.rotary_bucket(self._rotary_name, self.search_length), False)
+        rotary_length = self.length if self.stable_rotary_identity else self.search_length
+        self.register_buffer("rotary", shared.rotary_bucket(self._rotary_name, rotary_length), False)
         if self.native_rope or self.q_scale_rope:
             self._rotary_native_name = f"{self._rotary_name}_native"
             self.register_buffer(
-                "rotary_native", shared.rotary_bucket(self._rotary_native_name, self.search_length), False
+                "rotary_native", shared.rotary_bucket(self._rotary_native_name, rotary_length), False
             )
         self.register_buffer("window_offsets", torch.arange(self.window, dtype=torch.int32, device=device), False)
         self.register_buffer("compressed_offsets", torch.arange(512, dtype=torch.int32, device=device), False)
@@ -727,8 +736,12 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
             prepare_local_index_queries(self, release_local=release_local, joint=True)
 
     def uses_local_index_queries(self, tokens):
-        return (self.tp4_local_index_queries and self.search_length <= 32768
+        # ``local_index_query_range`` is a stable bool for the compiled target
+        # graph. Do not compare the changing search bucket here: doing so makes
+        # Dynamo guard the exact bucket and rebuild every target-layer variant.
+        return (self.tp4_local_index_queries and self.local_index_query_range
                 and (tokens == 1 or self.local_index_query_joint and 2 <= tokens <= NATIVE_WORK_TOKENS))
+
     def prepare_index_gain_weight(self):
         if gaudi_envs.VLLM_HPU_DSV41_INDEX_GAIN_REPLICA:
             from vllm_gaudi.ops.deepseek_v41_index_gain import prepare_index_gain_weight
@@ -752,9 +765,17 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
     def set_search_length(self, length):
         """Bind this layer to the shared independent-storage RoPE bucket."""
         self.search_length = int(length)
+        self.local_index_query_range = self.search_length <= 32768
         # Runtime-position RoPE reads a sparse row of one persistent table;
         # prompt/decode transitions do not replace captured table addresses.
-        rotary_length = self.length if getattr(self, "runtime_indexer", False) else self.search_length
+        # Bounded (<=32768) DSpark target attention extends that invariant to
+        # the full configured context so a bucket change cannot invalidate its
+        # compiled graph. Larger contexts retain the bucket-sized fallback.
+        rotary_length = (
+            self.length
+            if getattr(self, "runtime_indexer", False) or getattr(self, "stable_rotary_identity", False)
+            else self.search_length
+        )
         self.rotary = self.shared.rotary_bucket(self._rotary_name, rotary_length)
         if self.native_rope or self.q_scale_rope:
             self.rotary_native = self.shared.rotary_bucket(self._rotary_native_name, rotary_length)

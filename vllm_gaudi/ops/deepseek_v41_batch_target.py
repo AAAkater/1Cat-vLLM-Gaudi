@@ -139,6 +139,11 @@ class DSparkTargetBatch:
     def target_rows(self) -> int:
         return target_rows_for_capacity(self.batch_capacity)
 
+    @property
+    def host_active_lanes(self) -> tuple[int, ...]:
+        """Return active physical lanes from the validated host mask only."""
+        return tuple(lane for lane, active in enumerate(self.host_request_active) if active)
+
     def to(self, device) -> "DSparkTargetBatch":
         """Move graph inputs while retaining the host-owned snapshot map."""
         device = torch.device(device)

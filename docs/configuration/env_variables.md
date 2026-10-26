@@ -1492,3 +1492,8 @@ builder. Ordered recipes may reuse adequate retained scratch. Different graphs
 remain isolated, addresses remain stable, and graph completion controls release.
 This changes allocation policy rather than numerical computation; actual pool
 headroom must still pass final admission after all production warmup shapes.
+
+`DSV41_NATIVE_WORKSPACE_LOG` (default `0`) gates successful per-segment scratch
+reuse diagnostics. Set it to `1` only while investigating allocation behavior;
+errors remain visible at the default. It does not change allocation or replay
+behavior.

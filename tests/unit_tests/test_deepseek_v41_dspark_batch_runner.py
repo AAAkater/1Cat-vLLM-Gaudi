@@ -465,6 +465,55 @@ def test_execute_calls_each_packed_stage_once_then_emits_structured_trace(tmp_pa
     assert records[0]["completion_event_observed"] is True
 
 
+def test_disabled_bug004_observer_keeps_runner_path_and_enabled_writes_round(tmp_path, monkeypatch):
+    scheduler, output, states, owners = _decode_case(
+        tmp_path / "scheduler", [[11, 12, 13, 14, 15], [21, 22]]
+    )
+    del scheduler
+    evidence = tmp_path / "evidence"
+    monkeypatch.setenv("DSV41_RUN_EVIDENCE", str(evidence))
+    observed = []
+
+    class TargetStage:
+        device = torch.device("cpu")
+
+        def forward_batch(self, metadata, input_ids, positions, padding_mask, pages):
+            del metadata, input_ids, positions, padding_mask, pages
+            observed.append("target")
+            return DSparkTargetBatch(token_ids=torch.zeros((2, 6), dtype=torch.int32))
+
+    class DraftStage:
+        _bug004_profile = None
+
+        def verify_and_propose(self, metadata, target):
+            del metadata, target
+            observed.append("draft")
+            return DSparkDraftBatch(
+                accepted=torch.tensor([4, 1], dtype=torch.int32),
+                output_token_ids=[[11, 12, 13, 99], [21]],
+                draft_token_ids=[[31, 32], []],
+                completion_event=SimpleNamespace(query=lambda: True),
+            )
+
+    monkeypatch.delenv("VLLM_HPU_DSV41_BUG004_PROFILE", raising=False)
+    runner = DSparkBatchRunner(TargetStage(), DraftStage(), trace=DSparkBatchTrace(rank=0))
+    plan = runner.build_plan(output, states, owners, max_model_len=8192)
+    runner.execute(plan)
+    assert observed == ["target", "draft"]
+    assert not list(evidence.glob("bug004-rounds.*.jsonl"))
+
+    monkeypatch.setenv("VLLM_HPU_DSV41_BUG004_PROFILE", "1")
+    runner = DSparkBatchRunner(TargetStage(), DraftStage(), trace=DSparkBatchTrace(rank=0))
+    plan = runner.build_plan(output, states, owners, max_model_len=8192)
+    runner.execute(plan)
+    path = evidence / "bug004-rounds.rank0.jsonl"
+    records = [json.loads(line) for line in path.read_text().splitlines()]
+    assert len(records) == 1
+    assert records[0]["schema"] == "dsv41.bug004.profile.v3"
+    assert records[0]["status"] == "complete"
+    assert any(segment["name"] == "target.input_prepare" for segment in records[0]["segments"])
+
+
 def test_execute_writes_real_jsonl_trace_with_committed_and_output_digests(tmp_path, monkeypatch):
     scheduler, output, states, owners = _decode_case(
         tmp_path / "scheduler", [[11, 12, 13, 14, 15], [21, 22]]

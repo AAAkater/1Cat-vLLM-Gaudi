@@ -10,6 +10,7 @@ from torch import nn
 from vllm_gaudi.models import deepseek_v41_batch_target_program as target_module
 from vllm_gaudi.models import deepseek_v41_program as program_module
 from vllm_gaudi.models.deepseek_v41_batch_target_program import (
+    CompiledTargetBatchStage,
     DSparkTargetStage,
     PreparedTargetBatchLayerGroup,
 )
@@ -134,11 +135,11 @@ class _FakePreparedLayer(PreparedDecoderLayer):
             self.calls.append((
                 "target_layer",
                 self.layer,
-                kwargs["publish_collapse"],
-                len(kwargs["collapse_handoffs"]),
+                kwargs.get("publish_collapse", False),
+                len(kwargs.get("collapse_handoffs", ())),
             ))
         result = super().forward_batch_target(*args, **kwargs)
-        if self.simulate_publish and kwargs["publish_collapse"]:
+        if self.simulate_publish and kwargs.get("publish_collapse", False):
             residual = result[0]
             for lane, handoff in enumerate(kwargs["collapse_handoffs"]):
                 start = lane * ROWS_PER_LANE
@@ -312,7 +313,8 @@ def _inputs(capacity, *, bases, valid_lengths, positions_offset=0):
     }
 
 
-def _run(group, inputs):
+def _run(group, inputs, active_lanes=None):
+    kwargs = {} if active_lanes is None else {"active_lanes": active_lanes}
     return group(
         inputs["residual"],
         inputs["pre_mix"],
@@ -326,6 +328,7 @@ def _run(group, inputs):
         inputs["candidates"],
         inputs["main_ready"],
         inputs["index_ready"],
+        **kwargs,
     )
 
 
@@ -419,6 +422,233 @@ def test_target_c6_slices_do_not_cross_lane_sentinels_or_change_calls_with_activ
     _run(group, partial)
     partial_counts = [call[0] for call in calls]
     assert partial_counts == first_counts == changed_counts
+
+
+def test_target_c6_slice_active_lanes_match_unfiltered_baseline(monkeypatch):
+    _disable_optional_target_branches(monkeypatch)
+    calls = []
+    _install_deterministic_math(monkeypatch, calls)
+    _install_target_helper_counters(monkeypatch, calls)
+    capacity = 4
+    active_lanes = (1, 3)
+    group = _make_group(capacity, calls, simulate_publish_layers=(0, 1))
+    inputs = _inputs(capacity, bases=(10, 20, 30, 40), valid_lengths=(0, 6, 0, 3))
+
+    baseline = _run(group, inputs)
+    calls.clear()
+
+    def forbidden_device_read(*_args, **_kwargs):
+        raise AssertionError("active lanes must not be derived from a device mask")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(torch.Tensor, "item", forbidden_device_read)
+        patch.setattr(torch.Tensor, "cpu", forbidden_device_read)
+        filtered = _run(group, inputs, active_lanes=active_lanes)
+
+    for lane in active_lanes:
+        lane_slice = slice(lane * ROWS_PER_LANE, (lane + 1) * ROWS_PER_LANE)
+        assert torch.equal(filtered[0][lane_slice], baseline[0][lane_slice])
+        assert torch.equal(filtered[1][lane_slice], baseline[1][lane_slice])
+        assert torch.equal(filtered[2][lane_slice], baseline[2][lane_slice])
+
+    lane_active = inputs["row_valid"].reshape(capacity, ROWS_PER_LANE).any(1)
+    inactive_rows = (~lane_active).repeat_interleave(ROWS_PER_LANE)
+    assert torch.equal(filtered[0][inactive_rows], torch.zeros_like(filtered[0][inactive_rows]))
+    assert torch.equal(filtered[1][inactive_rows], torch.zeros_like(filtered[1][inactive_rows]))
+    assert torch.equal(filtered[2][inactive_rows], torch.zeros_like(filtered[2][inactive_rows]))
+
+    assert len(_count(calls, "target_prefix")) == 4 * len(active_lanes)
+    assert len(_count(calls, "target_post")) == 4 * len(active_lanes)
+    assert len(_count(calls, "hc_pre")) == 4 * len(active_lanes) * 2
+    assert len(_count(calls, "norm")) == 4 * len(active_lanes)
+    assert len(_count(calls, "quant")) == 4 * len(active_lanes)
+    assert len(_count(calls, "moe")) == 4 * len(active_lanes)
+    assert len(_count(calls, "final_collapse")) == len(active_lanes)
+    assert len(_count(calls, "bf16_identity")) == len(active_lanes)
+    assert len(_count(calls, "context_state")) == len(active_lanes)
+    attention = _count(calls, "attention")
+    assert len(attention) == 4
+    assert all(row_count == capacity * ROWS_PER_LANE for _, row_count, _ in attention)
+
+
+@pytest.mark.parametrize(
+    ("capacity", "active_lanes"),
+    [
+        (1, (0, )),
+        (2, (1, )),
+        (3, (0, 2)),
+        (4, (1, 3)),
+        (8, (0, 7)),
+        (16, (1, 15)),
+        (32, (0, 31)),
+        (32, tuple(range(32))),
+    ],
+)
+def test_target_c6_slice_active_lanes_cover_generic_capacity(monkeypatch, capacity, active_lanes):
+    _disable_optional_target_branches(monkeypatch)
+    calls = []
+    _install_deterministic_math(monkeypatch, calls)
+    _install_target_helper_counters(monkeypatch, calls)
+    valid_lengths = [0] * capacity
+    for lane in active_lanes:
+        valid_lengths[lane] = 6 if lane % 2 == 0 else 1
+    bases = tuple(10 + lane for lane in range(capacity))
+    group = _make_group(capacity, calls, simulate_publish_layers=(0, 1))
+    inputs = _inputs(capacity, bases=bases, valid_lengths=tuple(valid_lengths))
+
+    baseline = _run(group, inputs)
+    calls.clear()
+    filtered = _run(group, inputs, active_lanes=active_lanes)
+
+    for lane in active_lanes:
+        lane_slice = slice(lane * ROWS_PER_LANE, (lane + 1) * ROWS_PER_LANE)
+        assert torch.equal(filtered[0][lane_slice], baseline[0][lane_slice])
+        assert torch.equal(filtered[1][lane_slice], baseline[1][lane_slice])
+        assert torch.equal(filtered[2][lane_slice], baseline[2][lane_slice])
+
+    lane_active = inputs["row_valid"].reshape(capacity, ROWS_PER_LANE).any(1)
+    inactive_rows = (~lane_active).repeat_interleave(ROWS_PER_LANE)
+    assert torch.equal(filtered[0][inactive_rows], torch.zeros_like(filtered[0][inactive_rows]))
+    assert torch.equal(filtered[1][inactive_rows], torch.zeros_like(filtered[1][inactive_rows]))
+    assert torch.equal(filtered[2][inactive_rows], torch.zeros_like(filtered[2][inactive_rows]))
+    assert len(_count(calls, "target_prefix")) == 4 * len(active_lanes)
+    assert len(_count(calls, "target_post")) == 4 * len(active_lanes)
+    assert len(_count(calls, "moe")) == 4 * len(active_lanes)
+    assert len(_count(calls, "final_collapse")) == len(active_lanes)
+    assert len(_count(calls, "bf16_identity")) == len(active_lanes)
+    attention = _count(calls, "attention")
+    assert len(attention) == 4
+    assert all(row_count == capacity * ROWS_PER_LANE for _, row_count, _ in attention)
+
+
+def test_target_c6_slice_active_lanes_reuse_sparse_patterns(monkeypatch):
+    _disable_optional_target_branches(monkeypatch)
+    calls = []
+    _install_deterministic_math(monkeypatch, calls)
+    _install_target_helper_counters(monkeypatch, calls)
+    capacity = 8
+    group = _make_group(capacity, calls, simulate_publish_layers=(0, 1))
+    patterns = ((0, ), (7, ), (1, 6), (0, 7))
+    for active_lanes in patterns:
+        valid_lengths = [0] * capacity
+        for lane in active_lanes:
+            valid_lengths[lane] = 6 if lane % 2 == 0 else 1
+        inputs = _inputs(
+            capacity,
+            bases=tuple(10 + lane for lane in range(capacity)),
+            valid_lengths=tuple(valid_lengths),
+        )
+        baseline = _run(group, inputs)
+        calls.clear()
+        filtered = _run(group, inputs, active_lanes=active_lanes)
+        for lane in active_lanes:
+            lane_slice = slice(lane * ROWS_PER_LANE, (lane + 1) * ROWS_PER_LANE)
+            assert torch.equal(filtered[0][lane_slice], baseline[0][lane_slice])
+            assert torch.equal(filtered[1][lane_slice], baseline[1][lane_slice])
+            assert torch.equal(filtered[2][lane_slice], baseline[2][lane_slice])
+        assert len(_count(calls, "target_prefix")) == 4 * len(active_lanes)
+        assert len(_count(calls, "target_post")) == 4 * len(active_lanes)
+        assert len(_count(calls, "moe")) == 4 * len(active_lanes)
+
+
+class _HostActiveBatch(SimpleNamespace):
+    @property
+    def host_active_lanes(self):
+        return tuple(lane for lane, active in enumerate(self.host_request_active) if active)
+
+
+def test_target_c6_stage_validates_host_active_lanes_without_device_reads(monkeypatch):
+    _disable_optional_target_branches(monkeypatch)
+    calls = []
+    _install_deterministic_math(monkeypatch, calls)
+    _install_target_helper_counters(monkeypatch, calls)
+    capacity = 4
+    stage = _make_stage(capacity, calls, simulate_publish_layers=(0, 1))
+    stage.batch_state = SimpleNamespace(capacity=capacity)
+    monkeypatch.setattr(target_module.torch, "compile", lambda call, **_kwargs: call)
+    target_stage = DSparkTargetStage(stage, (ROWS_PER_LANE, ) * capacity, tuple(range(capacity)), backend="eager")
+    inputs = _inputs(capacity, bases=(10, 20, 30, 40), valid_lengths=(0, 6, 0, 3))
+    batch = _HostActiveBatch(
+        batch_capacity=capacity,
+        host_request_active=(False, True, False, True),
+        request_lengths=(ROWS_PER_LANE, ) * capacity,
+        input_ids=inputs["input_ids"],
+        positions=inputs["positions"],
+        row_slots=inputs["slots"],
+        row_pages=inputs["pages"],
+        row_valid=inputs["row_valid"],
+    )
+    rows = capacity * ROWS_PER_LANE
+    hidden = torch.zeros((rows, 4, 4), dtype=torch.bfloat16)
+    pre_mix = torch.zeros((rows, 4), dtype=torch.float32)
+
+    def forbidden_device_read(*_args, **_kwargs):
+        raise AssertionError("stage boundary must use host_request_active only")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(torch.Tensor, "item", forbidden_device_read)
+        patch.setattr(torch.Tensor, "cpu", forbidden_device_read)
+        output, aux = target_stage(hidden, pre_mix, batch)
+
+    lane_active = inputs["row_valid"].reshape(capacity, ROWS_PER_LANE).any(1)
+    inactive_rows = (~lane_active).repeat_interleave(ROWS_PER_LANE)
+    assert torch.equal(output[inactive_rows], torch.zeros_like(output[inactive_rows]))
+    assert torch.equal(aux[inactive_rows], torch.zeros_like(aux[inactive_rows]))
+    assert len(_count(calls, "target_prefix")) == 4 * 2
+    assert len(_count(calls, "target_post")) == 4 * 2
+    assert len(_count(calls, "attention")) == 4
+
+    batch.host_request_active = (False, ) * capacity
+    with pytest.raises(ValueError, match="at least one active host lane"):
+        target_stage(hidden, pre_mix, batch)
+
+
+def test_target_c6_non_slice_stage_ignores_host_filter(monkeypatch):
+    _disable_optional_target_branches(monkeypatch)
+    calls = []
+    _install_deterministic_math(monkeypatch, calls)
+    capacity = 3
+    stage = _make_stage(capacity, calls)
+
+    class _NonSliceLayer(nn.Module):
+        _target_c6_slices = False
+
+        def __init__(self, index):
+            super().__init__()
+            self.layer = index
+            self.attention = SimpleNamespace(ratio=0)
+
+        def forward_batch_target(self, residual, pre_mix, positions, image_mask, engram_rows, slots, pages,
+                                 selected, candidates, main_ready, index_ready, row_valid, request_lengths,
+                                 request_slots):
+            calls.append(("target_layer", self.layer, residual.shape[0]))
+            return residual, pre_mix, selected, candidates, main_ready, index_ready, None
+
+    stage.layers = nn.ModuleList([_NonSliceLayer(index) for index in range(4)])
+    monkeypatch.setattr(target_module.torch, "compile", lambda call, **_kwargs: call)
+    compiled = CompiledTargetBatchStage(
+        stage,
+        (ROWS_PER_LANE, ) * capacity,
+        tuple(range(capacity)),
+        backend="eager",
+    )
+    inputs = _inputs(capacity, bases=(10, 20, 30), valid_lengths=(6, 0, 0))
+
+    compiled(
+        inputs["residual"],
+        inputs["pre_mix"],
+        inputs["input_ids"],
+        inputs["positions"],
+        inputs["slots"],
+        inputs["pages"],
+        inputs["row_valid"],
+        inputs["engram_rows"],
+        active_lanes=(1, ),
+    )
+
+    target_layers = _count(calls, "target_layer")
+    assert len(target_layers) == 4
+    assert all(row_count == capacity * ROWS_PER_LANE for _, _, row_count in target_layers)
 
 
 def test_target_c6_n2_fallback_quantizes_each_lane_without_shared_prequant(monkeypatch):

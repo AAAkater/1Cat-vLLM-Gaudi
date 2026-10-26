@@ -249,6 +249,14 @@ class BatchExecution:
                    allocator_free_total_bytes=list(torch.hpu.mem_get_info()),
                    synapse_global_memory=read_synapse_memory(),
                    cumulative_peak_allocated_bytes=torch.hpu.max_memory_allocated())
+        from vllm_gaudi.ops.tp2_prepared_plan import prepared_group_stats
+
+        native = prepared_group_stats()
+        row["native_graph_memory"] = {
+            name: native[name]
+            for name in ("native_graphs", "native_captures", "native_workspace_bytes",
+                         "native_global_program_bytes", "native_arc_program_bytes")
+        }
         # Do not reset the allocator high-water mark; native allocations require
         # the separate device telemetry and are not included in these counters.
         self.runner.audit.setdefault("batch_warmup_memory", []).append(row)

@@ -30,6 +30,23 @@ from vllm_gaudi.ops.deepseek_v41_batch_target import (
 )
 
 
+def _validated_active_lanes(active_lanes, capacity: int) -> tuple[int, ...]:
+    """Validate host lane ownership without reading a device mask."""
+    if active_lanes is None:
+        return tuple(range(capacity))
+    if not isinstance(active_lanes, tuple):
+        raise TypeError("DSpark host active lanes must be a tuple")
+    if not active_lanes:
+        raise ValueError("DSpark target stage requires at least one active host lane")
+    if any(type(lane) is not int for lane in active_lanes):
+        raise TypeError("DSpark host active lanes must contain integers")
+    if any(lane < 0 or lane >= capacity for lane in active_lanes):
+        raise ValueError("DSpark host active lane is outside the fixed capacity")
+    if tuple(sorted(set(active_lanes))) != active_lanes:
+        raise ValueError("DSpark host active lanes must be unique and strictly increasing")
+    return active_lanes
+
+
 class _TargetAttentionCall:
     """Plain callable binding one target layer to its fixed-capacity attention.
 
@@ -157,9 +174,14 @@ class PreparedTargetBatchLayerGroup(nn.Module):
         candidates,
         main_ready,
         index_ready,
+        *,
+        active_lanes=None,
     ):
         if residual.shape[0] != self.rows or positions.numel() != self.rows:
             raise ValueError(f"DSpark target layer group requires exactly {self.rows} rows")
+        lane_indices = (_validated_active_lanes(active_lanes, self.batch_capacity)
+                        if self.slice_target_layers else tuple(range(self.batch_capacity)))
+        active_lane_set = set(lane_indices)
         if self.input is not None:
             residual, pre_mix = self.input(input_ids)
         image_mask = (input_ids == 129264) | (input_ids == 129265)
@@ -208,6 +230,7 @@ class PreparedTargetBatchLayerGroup(nn.Module):
                     target_attention=self.attention_wrappers[layer_index],
                     collapse_handoffs=collapse_handoffs,
                     publish_collapse=publish_collapse,
+                    active_lanes=lane_indices,
                 )
             else:
                 # Preserve compatibility for synthetic target layers that do
@@ -224,17 +247,22 @@ class PreparedTargetBatchLayerGroup(nn.Module):
                 for lane in range(self.batch_capacity):
                     start = lane * 6
                     lane_residual = residual[start:start + 6]
-                    if layer.layer + 1 not in collapse_handoffs[lane]:
+                    if lane in active_lane_set and layer.layer + 1 not in collapse_handoffs[lane]:
                         lane_residual = decode_bf16_identity(lane_residual)
                     residual_lanes.append(lane_residual)
                 residual = torch.cat(residual_lanes)
         if not self.final:
             return residual, pre_mix, None, tuple(selections), candidates, tuple(main_ready), tuple(index_ready)
-        value_lanes = []
-        for lane in range(self.batch_capacity):
+        value_lanes = [None] * self.batch_capacity
+        for lane in lane_indices:
             start = lane * 6
-            value_lanes.append(
-                final_collapse_rms_norm(residual[start:start + 6], pre_mix[start:start + 6], self.norm.weight, self.eps))
+            value_lanes[lane] = final_collapse_rms_norm(
+                residual[start:start + 6], pre_mix[start:start + 6], self.norm.weight, self.eps)
+        if self.slice_target_layers and len(lane_indices) != self.batch_capacity:
+            zero_value = torch.zeros_like(value_lanes[lane_indices[0]])
+            for lane in range(self.batch_capacity):
+                if value_lanes[lane] is None:
+                    value_lanes[lane] = zero_value
         value = torch.cat(value_lanes)
         aux = torch.cat(target_states, -1) if target_states else None
         # A sentinel row may contain arbitrary tile-local arithmetic; it must
@@ -298,6 +326,7 @@ class CompiledTargetBatchStage:
         row_pages,
         row_valid,
         engram_rows=(),
+        active_lanes=None,
     ):
         if hidden.shape[0] != self.rows or positions.numel() != self.rows:
             raise ValueError(f"DSpark target batch requires fixed {self.rows}-row inputs")
@@ -326,7 +355,7 @@ class CompiledTargetBatchStage:
             config_patch["allow_unspec_int_on_nn_module"] = True
         with torch._dynamo.config.patch(**config_patch):
             for chunk in self.chunks:
-                hidden, pre_mix, aux, selections, candidates, main_ready, index_ready = chunk(
+                chunk_args = (
                     hidden,
                     pre_mix,
                     positions,
@@ -340,6 +369,11 @@ class CompiledTargetBatchStage:
                     main_ready,
                     index_ready,
                 )
+                if self.slice_target_layers:
+                    result = chunk(*chunk_args, active_lanes=active_lanes)
+                else:
+                    result = chunk(*chunk_args)
+                hidden, pre_mix, aux, selections, candidates, main_ready, index_ready = result
         return hidden, aux
 
 
@@ -368,6 +402,9 @@ class DSparkTargetStage(nn.Module):
         self.logical_request_lengths = tuple(request_lengths)
         self.request_lengths = (TARGET_ROWS_PER_REQUEST, ) * self.batch_capacity
         self.request_slots = tuple(int(slot) for slot in request_slots)
+        configure_recipes = getattr(program, "set_c6_scoped_recipe_backend", None)
+        if configure_recipes is not None:
+            configure_recipes(backend)
         self.state = initialize_target_batch_state(program, self.batch_capacity)
         self.compiled = CompiledTargetBatchStage(program, self.request_lengths, self.request_slots, backend=backend)
 
@@ -385,6 +422,14 @@ class DSparkTargetStage(nn.Module):
             raise ValueError("target stage request lengths differ from the compiled capacity")
         if hidden.shape[0] != self.rows or pre_mix.shape[0] != self.rows:
             raise ValueError("target stage hidden rows differ from the compiled capacity")
+        host_active = batch.host_request_active
+        if not isinstance(host_active, tuple) or len(host_active) != self.batch_capacity:
+            raise ValueError("target stage host_request_active must cover the fixed capacity")
+        if any(type(value) is not bool for value in host_active):
+            raise TypeError("target stage host_request_active must contain bools")
+        # This is the scheduler-owned host plan shared by every TP rank; never
+        # derive lane filtering from a rank-local device mask.
+        active_lanes = _validated_active_lanes(batch.host_active_lanes, self.batch_capacity)
         return self.compiled(
             hidden,
             pre_mix,
@@ -394,6 +439,7 @@ class DSparkTargetStage(nn.Module):
             batch.row_pages,
             batch.row_valid,
             engram_rows,
+            active_lanes,
         )
 
     def stage_interface(self) -> SimpleNamespace:
@@ -404,6 +450,16 @@ class DSparkTargetStage(nn.Module):
             request_offsets=target_request_offsets(self.batch_capacity),
             requests=self.batch_capacity,
         )
+
+    def scoped_recipe_status(self):
+        """Expose the shared C6 recipe cache state to warmup/probe callers."""
+        status = getattr(self.program, "scoped_recipe_status", None)
+        if status is not None:
+            return status()
+        cache = getattr(self.program, "_c6_scoped_recipe_cache", None)
+        if cache is None:
+            return {"state": "unavailable", "disabled_reason": None, "ineligible_reasons": {}}
+        return cache.status()
 
 
 __all__ = [

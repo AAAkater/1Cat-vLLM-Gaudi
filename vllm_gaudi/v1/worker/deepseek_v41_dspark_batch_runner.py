@@ -512,12 +512,16 @@ class DSparkPackedTargetStages:
             self.stage_key,
             backend=backend,
         )
+        self._bug004_profile = None
         # One mapping entry is retained for older introspection callers.  The
         # key is physical lane order, not request order or an active-lane set.
         self.stages = {self.stage_key: self.stage}
         hidden_size = int(program.config["text_config"]["hidden_size"])
         self.hidden_seed = torch.zeros((rows, 4, hidden_size), dtype=torch.bfloat16, device=self.device)
         self.pre_mix_seed = torch.zeros((rows, 4), dtype=torch.float32, device=self.device)
+
+    def scoped_recipe_status(self):
+        return self.stage.scoped_recipe_status()
 
     def stage_for(self, batch):
         if batch.batch_capacity != self.batch_capacity:
@@ -536,6 +540,7 @@ class DSparkPackedTargetStages:
         del positions, padding_mask
         from vllm_gaudi.ops.deepseek_v41_batch_target import DSparkTargetBatch as TargetBatch
 
+        profile = self._bug004_profile_for_round()
         batch = TargetBatch.from_metadata(
             metadata,
             input_ids,
@@ -547,9 +552,17 @@ class DSparkPackedTargetStages:
         ticket = None
         engram_owner = None
         try:
+            if profile is not None:
+                profile.mark("target.snapshot")
             ticket = stage.snapshot(batch)
+            if profile is not None:
+                profile.mark("target.engram")
             engram_rows, engram_owner = self._engram_rows(batch, input_ids)
+            if profile is not None:
+                profile.mark("target.forward")
             hidden, aux = stage(self.hidden_seed, self.pre_mix_seed, batch, engram_rows)
+            if profile is not None:
+                profile.mark("target.head_projection")
             target_ids = _target_greedy_ids(self.program, hidden)
             payload = {
                 "hidden": hidden,
@@ -577,6 +590,9 @@ class DSparkPackedTargetStages:
                         error.add_note(
                             f"DSpark Engram rollback failed: {type(cleanup_error).__name__}: {cleanup_error}")
             raise
+
+    def _bug004_profile_for_round(self):
+        return getattr(self, "_bug004_profile", None)
 
     def _engram_rows(self, batch, input_ids):
         owner = self.engram_host
@@ -806,6 +822,7 @@ class DSparkBatchRunner:
         self.target_stage = target_stage
         self.draft_stage = draft_stage
         self.trace = trace or DSparkBatchTrace()
+        trace_owner = self.trace
         self.slots = slots
         self.batch_capacity = _resolve_capacity(batch_capacity, slots, target_stage, draft_stage)
         self.round_generation = 0
@@ -814,6 +831,11 @@ class DSparkBatchRunner:
         self.draft_bank_generations = {}
         self.trace_failures = 0
         self.trace_available = True
+        # BUG-004 diagnostics are constructed only for an enabled round.
+        self._bug004_profile = None
+        self._bug004_rank = getattr(trace_owner, "rank", 0)
+        self._bug004_tp_rank = getattr(trace_owner, "tp_rank", 0)
+        self._bug004_pp_rank = getattr(trace_owner, "pp_rank", 0)
 
     def build_plan(
         self,
@@ -1071,7 +1093,12 @@ class DSparkBatchRunner:
         target = None
         finished = False
         self.pending = True
+        profile = None
+        profile_closed = False
         try:
+            profile = self.begin_bug004_profile()
+            if profile is not None:
+                profile.mark("target.input_prepare")
             self._leave_single()
             self._prepare_batched_generations(plan)
             target = self.target_stage.forward_batch(
@@ -1086,6 +1113,8 @@ class DSparkBatchRunner:
             result = self.draft_stage.verify_and_propose(plan.metadata, target)
             if not isinstance(result, DSparkDraftBatch):
                 raise TypeError("DSpark draft stage must return DSparkDraftBatch")
+            if profile is not None:
+                profile.mark("verify.commit")
             prepared = self._prepare_publication(plan, result)
             readback_observed_ns = self._observe_completion(result.completion_event)
             self._validate_final_owners(plan)
@@ -1095,16 +1124,33 @@ class DSparkBatchRunner:
                 readback_observed_ns=readback_observed_ns,
                 final_observed_ns=0,
             )
+            if profile is not None:
+                profile.mark("round.finish")
             finish = getattr(self.target_stage, "finish", None)
             if callable(finish):
                 finish(target, prepared.accepted)
             finished = True
+            if profile is not None:
+                profile.mark("round.final_event")
             _final_event, final_observed_ns = self._record_final_event(plan)
             trace_payload["final_event_observed_ns"] = final_observed_ns
+            if profile is not None:
+                profile.mark("round.commit")
             self._emit_trace(trace_payload)
             output, drafts = self._commit_publication(plan, prepared)
+            self.close_bug004_profile(profile)
+            profile_closed = True
             return output, drafts
         except BaseException as error:
+            if profile is not None and not profile_closed:
+                try:
+                    self.close_bug004_profile(
+                        profile, status="failed", error=f"{type(error).__name__}: {error}")
+                    profile_closed = True
+                except BaseException as profile_error:
+                    if hasattr(error, "add_note"):
+                        error.add_note(
+                            f"BUG004 profile finalization failed: {type(profile_error).__name__}: {profile_error}")
             abort = getattr(self.target_stage, "abort", None)
             if target is not None and not finished and callable(abort):
                 try:
@@ -1116,6 +1162,34 @@ class DSparkBatchRunner:
             raise
         finally:
             self.pending = False
+
+    def begin_bug004_profile(self, *, rank: int | None = None, tp_rank: int | None = None,
+                             pp_rank: int | None = None):
+        """Bind one diagnostic observer to a round without importing it by default."""
+        from vllm_gaudi.ops.deepseek_v41_bug004_profile import begin_round
+
+        device = getattr(self.target_stage, "device", None)
+        profile = begin_round(
+            rank=self._bug004_rank if rank is None else rank,
+            tp_rank=self._bug004_tp_rank if tp_rank is None else tp_rank,
+            pp_rank=self._bug004_pp_rank if pp_rank is None else pp_rank,
+            device=device,
+        )
+        self._bug004_profile = profile
+        if profile is not None:
+            self.target_stage._bug004_profile = profile
+            self.draft_stage._bug004_profile = profile
+        return profile
+
+    def close_bug004_profile(self, profile=None, *, status: str = "complete",
+                             error: str | None = None):
+        """Finalize the round observer and clear all temporary bindings."""
+        profile = getattr(self, "_bug004_profile", None) if profile is None else profile
+        self.target_stage._bug004_profile = None
+        if hasattr(self.draft_stage, "_bug004_profile"):
+            self.draft_stage._bug004_profile = None
+        self._bug004_profile = None
+        return None if profile is None else profile.close(status=status, error=error)
 
     @staticmethod
     def _observe_completion(event: Any) -> int:
@@ -1223,6 +1297,9 @@ class DSparkBatchRunner:
             "draft_stage": f"{type(self.draft_stage).__module__}.{type(self.draft_stage).__qualname__}",
             "target_stage_key": list(getattr(self.target_stage, "stage_key", ())),
         }
+        scoped_status = getattr(self.target_stage, "scoped_recipe_status", None)
+        if callable(scoped_status):
+            payload["c6_scoped_recipe"] = scoped_status()
         return payload
 
     def _emit_trace(self, payload: Mapping[str, Any]) -> None:

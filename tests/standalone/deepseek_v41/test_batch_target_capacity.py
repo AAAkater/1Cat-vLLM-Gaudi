@@ -22,6 +22,12 @@ from vllm_gaudi.ops.deepseek_v41_batch_target import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _cpu_dynamo_only(monkeypatch):
+    # Dynamo stream discovery must not acquire an HPU for these CPU contracts.
+    monkeypatch.setattr(torch.accelerator, "is_available", lambda: False)
+
+
 def _metadata(capacity, lengths, active, starts, slots, generations=None):
     logical_query_loc = [0]
     for length in lengths:
@@ -132,6 +138,7 @@ def test_from_metadata_integrates_explicit_active_metadata_capacity_bucket():
     assert batch.request_lengths == (0, 3, 0, 6)
     assert batch.request_ids == (None, "request-b", None, "request-d")
     assert batch.host_request_active == (False, True, False, True)
+    assert batch.host_active_lanes == (1, 3)
     assert batch.host_request_slots == (0, 1, 2, 3)
     assert batch.row_valid.reshape(4, 6).sum(1).tolist() == [0, 3, 0, 6]
     assert batch.positions.reshape(4, 6)[1, :3].tolist() == [50, 51, 52]
@@ -154,6 +161,7 @@ def test_inactive_lanes_are_six_no_write_rows_with_canonical_host_slots(active, 
     assert batch.host_request_slots == (0, 1, 2, 3)
     assert batch.request_slots.tolist() == list(slots)
     assert batch.host_request_active == active
+    assert batch.host_active_lanes == tuple(lane for lane, enabled in enumerate(active) if enabled)
     for lane, is_active in enumerate(active):
         if is_active:
             assert row_valid[lane].sum().item() == lengths[lane]
@@ -163,6 +171,19 @@ def test_inactive_lanes_are_six_no_write_rows_with_canonical_host_slots(active, 
             assert torch.equal(positions[lane], torch.full((6, ), -1, dtype=torch.int32))
             assert torch.equal(row_slots[lane], torch.full((6, ), -1, dtype=torch.int32))
             assert batch.slot_generations[lane].item() == 0
+
+
+def test_host_active_lanes_preserves_sparse_lane31():
+    capacity = 32
+    active = tuple(lane == 31 for lane in range(capacity))
+    lengths = tuple(6 if lane == 31 else 0 for lane in range(capacity))
+    starts = tuple(127 if lane == 31 else 0 for lane in range(capacity))
+    slots = tuple(31 if lane == 31 else -1 for lane in range(capacity))
+
+    batch = _batch(capacity, lengths, active, starts, slots)
+
+    assert batch.host_request_active == active
+    assert batch.host_active_lanes == (31, )
 
 
 def test_legacy_b2_permutation_is_preserved_but_canonical_slots_are_lane_order():

@@ -951,6 +951,12 @@ class DSparkBatchDraftStage:
         self.target_ids = target_ids
         self.target_context = target_context
         self.max_model_len = max_model_len
+        self._bug004_profile = None
+
+    def _bug004_mark(self, name):
+        profile = getattr(self, "_bug004_profile", None)
+        if profile is not None:
+            profile.mark(name)
 
     def _validate_capacity_contract(self):
         components = (
@@ -1005,6 +1011,8 @@ class DSparkBatchDraftStage:
             raise TypeError("DSpark target token_ids must be int32 or int64")
         device = target_ids.device
         batch_state, verify_ring, backbone, markov = self._ensure_runtime(device)
+        profile = getattr(self, "_bug004_profile", None)
+        self._bug004_mark("draft.control_prepare")
         active = torch.tensor(active_tuple, dtype=torch.bool, device=device)
         proposals = _fixed_proposals(proposal_counts, host["draft_token_ids"], active_tuple).to(device)
         control_host = batch_control_metadata(
@@ -1042,6 +1050,7 @@ class DSparkBatchDraftStage:
             active=active_tuple,
         )
         try:
+            self._bug004_mark("draft.verify_and_propose")
             if self.transaction is not None:
                 values = self.transaction(
                     target_ids, target_states, positions, slots, control, proposals, active, binding_sidecar)
@@ -1091,8 +1100,10 @@ class DSparkBatchDraftStage:
                 )
 
             ticket.record.copy_(record)
+            self._bug004_mark("draft.record_stage")
             verify_ring.stage(ticket)
             commit = verify_ring.consume(ticket)
+            self._bug004_mark("draft.consume")
 
             result = self.result_factory(
                 accepted=torch.tensor(commit.committed, dtype=torch.int64),
@@ -1103,6 +1114,7 @@ class DSparkBatchDraftStage:
             )
             verify_ring.release(ticket)
             ticket = None
+            self._bug004_mark("draft.publish")
             return result
         except BaseException as error:
             if ticket is not None:

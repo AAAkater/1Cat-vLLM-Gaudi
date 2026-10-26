@@ -63,6 +63,7 @@ def test_paged_kv_norm_rope_compound_is_decode_b1_only(monkeypatch):
     monkeypatch.setattr(torch.ops, "custom_op", SimpleNamespace(custom_deepseek_v41_kv_norm_rope_bf16_gaudi2=compound))
     attention = SimpleNamespace(
         fused_norm=True,
+        kv_norm_rope_decode=False,
         native_rope=True,
         eps=1e-20,
         weights=SimpleNamespace(kv_norm=SimpleNamespace(weight=torch.ones(512, dtype=torch.bfloat16))),
@@ -154,6 +155,48 @@ def test_paged_attention_rebinds_shared_rotary_bucket():
     assert attention.search_length == 8192
     assert attention._rotary_table() is shared.rotary_bucket("swa_rotary", 8192)
     assert attention._rotary_native_table() is shared.rotary_bucket("swa_rotary_native", 8192)
+
+
+def test_paged_local_index_query_decision_does_not_read_search_bucket():
+    class Owner:
+        tp4_local_index_queries = True
+        local_index_query_range = True
+        local_index_query_joint = True
+
+        @property
+        def search_length(self):
+            raise AssertionError("compiled target decision must not read the exact search bucket")
+
+    owner = Owner()
+    assert PagedCSA2Attention.uses_local_index_queries(owner, 1)
+    assert PagedCSA2Attention.uses_local_index_queries(owner, 6)
+
+
+def test_paged_dspark_rotary_identity_is_stable_across_search_buckets():
+    shared = _rotary_shared(8192)
+    attention = object.__new__(PagedCSA2Attention)
+    torch.nn.Module.__init__(attention)
+    attention.shared = shared
+    attention.length = shared.length
+    attention._rotary_name = "swa_rotary"
+    attention._rotary_native_name = "swa_rotary_native"
+    attention.native_rope = True
+    attention.q_scale_rope = True
+    attention.runtime_indexer = False
+    attention.stable_rotary_identity = True
+    attention.tp4_local_index_queries = True
+    attention.local_index_query_joint = False
+    attention.local_index_query_range = True
+    attention.register_buffer("rotary", shared.rotary_bucket("swa_rotary", shared.length), False)
+    attention.register_buffer("rotary_native", shared.rotary_bucket("swa_rotary_native", shared.length), False)
+    rotary = attention.rotary
+    rotary_native = attention.rotary_native
+    for search in (512, 1024, 2048, 4096, 6144):
+        attention.set_search_length(search)
+        assert attention.rotary is rotary
+        assert attention.rotary_native is rotary_native
+        assert attention.local_index_query_range
+        assert attention.uses_local_index_queries(1)
 
 
 @pytest.mark.parametrize("tensor_parallel_size", [2, 4])

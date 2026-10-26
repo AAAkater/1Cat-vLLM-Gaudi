@@ -14,6 +14,11 @@ from vllm_gaudi import envs as gaudi_envs
 
 from vllm_gaudi.ops.deepseek_v4_mxfp4 import mxfp4_bf16_lut
 from vllm_gaudi.ops.deepseek_v41_attention import CSA2Attention, CSA2SharedState
+from vllm_gaudi.models.deepseek_v41_c6_scoped_recipe import (
+    C6ScopedRecipeCache,
+    decode_ffn_dual_quant,
+    decode_mhc_post_collapse,
+)
 from vllm_gaudi.ops.deepseek_v41_math import (
     engram_update,
     prefill_engram_update,
@@ -1415,22 +1420,10 @@ def decode_bf16_identity(value):
         value.reshape(1, -1).contiguous()).reshape(shape)
 
 
-def decode_mhc_post_collapse(value, residual, post, comb, new_pre):
-    """Fuse the C6 attention post/collapse while preserving its BF16 boundary."""
-    return torch.ops.custom_op.custom_deepseek_v41_mhc_post_collapse_gaudi2(
-        value.contiguous(), residual.contiguous(), post.contiguous(), comb.contiguous(), new_pre.contiguous())
-
-
 def decode_mhc_publish_collapse(value, residual, post, comb, pre_mix):
     """Publish one C6 layer's BF16 residual to the immediately following layer."""
     return torch.ops.custom_op.custom_deepseek_v41_mhc_post_collapse_gaudi2(
         value.contiguous(), residual.contiguous(), post.contiguous(), comb.contiguous(), pre_mix.contiguous())
-
-
-def decode_ffn_dual_quant(value, weight, eps):
-    """Produce the C6 routed and shared N256 FP8 operands together."""
-    return torch.ops.custom_op.custom_deepseek_v41_ffn_norm_dual_quant_gaudi2(
-        value.contiguous(), weight, eps)
 
 
 class PreparedDecoderLayer(nn.Module):
@@ -1449,9 +1442,11 @@ class PreparedDecoderLayer(nn.Module):
         device,
         tensor_parallel_size=2,
         collect_target_state=False,
+        recipe_cache=None,
     ):
         super().__init__()
         self.weights, self.layer = weights, layer
+        self._c6_scoped_recipe_cache = recipe_cache
         self.draft = layer >= config["num_hidden_layers"]
         self.draft_mhc = self.draft and gaudi_envs.VLLM_HPU_DSV41_DSPARK_DRAFT_MHC
         self.collect_target_state = collect_target_state and layer in (37, 38, 39)
@@ -1667,6 +1662,101 @@ class PreparedDecoderLayer(nn.Module):
             return "C6 target requires the fused N256 FP8 MoE"
         return None
 
+    def _c6_scoped_recipe_error(self, *, fp8_decode: bool, residual):
+        """Return why the two bounded C6 graph recipes cannot be used."""
+        error = self._c6_slice_path_error()
+        if error is not None:
+            return error
+        if not getattr(self, "mhc_post_collapse", False):
+            return "C6 scoped recipe requires mHC post/collapse"
+        if not getattr(self, "mhc_control_rrms", False):
+            return "C6 scoped recipe requires mHC control RRMS"
+        if not gaudi_envs.VLLM_HPU_DSV41_MHC_GATES_FUSED:
+            return "C6 scoped recipe requires fused mHC gates"
+        if not gaudi_envs.VLLM_HPU_DSV41_MHC_POSITIVE_GATES:
+            return "C6 scoped recipe requires positive mHC gates"
+        if getattr(self, "batch_control_reuse", False):
+            return "C6 scoped recipe excludes batch control reuse"
+        if gaudi_envs.VLLM_HPU_DSV41_DSPARK_MHC_WEIGHT_REUSE:
+            return "C6 scoped recipe excludes reused mHC weights"
+        if gaudi_envs.VLLM_HPU_DSV41_DSPARK_MHC_CONTROL_TILES:
+            return "C6 scoped recipe excludes mHC control tiles"
+        if gaudi_envs.VLLM_HPU_DSV41_MHC_LINEAR_LOAD:
+            return "C6 scoped recipe excludes linear-load mHC control"
+        if gaudi_envs.VLLM_HPU_DSV41_DSPARK_NORM_ROUNDTRIP:
+            return "C6 scoped recipe excludes norm roundtrip"
+        if gaudi_envs.VLLM_HPU_DSV41_DSPARK_INPUT_QUANT_REMAT:
+            return "C6 scoped recipe excludes input quant remat"
+        if gaudi_envs.VLLM_HPU_DSV41_DSPARK_CONTROL_FP8:
+            return "C6 scoped recipe excludes FP8 mHC control"
+        if gaudi_envs.VLLM_HPU_DSV41_DSPARK_CONTROL_FP8_PAIR:
+            return "C6 scoped recipe excludes paired FP8 mHC control"
+        if self.mhc_control_mme and (self.hc_attn_fn_mme is None or self.hc_ffn_fn_mme is None):
+            return "C6 scoped recipe requires prepared MME control weights"
+        if fp8_decode:
+            return "C6 scoped recipe excludes FP8 decode"
+        if getattr(self, "hc_attn_fn_packed", None) is None or getattr(self, "hc_ffn_fn_packed", None) is None:
+            return "C6 scoped recipe requires packed mHC control weights"
+        if residual.dtype != torch.bfloat16:
+            return "C6 scoped recipe requires a BF16 residual"
+        if residual.device.type != "hpu":
+            return "C6 scoped recipe requires HPU tensors"
+        return None
+
+    def _c6_scoped_prefix_math(self, residual, pre_mix, collapsed_attention, *, fp8_decode):
+        cache = getattr(self, "_c6_scoped_recipe_cache", None)
+        if cache is None:
+            return None
+        error = self._c6_scoped_recipe_error(fp8_decode=fp8_decode, residual=residual)
+        if error is not None:
+            cache.record_ineligible(error)
+            return None
+        w = self.weights
+        return cache.run_prefix(
+            residual,
+            pre_mix,
+            collapsed_attention,
+            w.hc_attn_fn,
+            w.hc_attn_scale,
+            w.hc_attn_base,
+            self.hc_attn_fn_packed,
+            w.attn_norm.weight,
+            self.eps,
+            self.hc_eps,
+            self.iterations,
+            norm_mode=("fp8" if self.decode_attention_norm_quant
+                       and "fused_qkv_channel" in self.attention._buffers
+                       else "bf16_native" if self.dspark_input_norm else "bf16"),
+            control_mme_weight=self.hc_attn_fn_mme if self.mhc_control_mme else None,
+        )
+
+    def _c6_scoped_post_pre_moe_math(self, value, residual, new_pre, post, comb, *, fp8_decode):
+        cache = getattr(self, "_c6_scoped_recipe_cache", None)
+        if cache is None:
+            return None
+        error = self._c6_scoped_recipe_error(fp8_decode=fp8_decode, residual=residual)
+        if error is not None:
+            cache.record_ineligible(error)
+            return None
+        w = self.weights
+        return cache.run_post_pre_moe(
+            value,
+            residual,
+            new_pre,
+            post,
+            comb,
+            w.hc_ffn_fn,
+            w.hc_ffn_scale,
+            w.hc_ffn_base,
+            self.hc_ffn_fn_packed,
+            w.ffn_norm.weight,
+            self.eps,
+            self.hc_eps,
+            self.iterations,
+            dual_quant=(self.ffn_dual_quant and self.moe.shared_gate_up_channel is not None),
+            control_mme_weight=self.hc_ffn_fn_mme if self.mhc_control_mme else None,
+        )
+
     def _forward_c6_attention_prefix(
         self,
         residual,
@@ -1678,6 +1768,8 @@ class PreparedDecoderLayer(nn.Module):
         collapse_handoff=None,
         active_mask=None,
         target_ring_capacity=None,
+        fp8_decode=False,
+        use_scoped_recipe=False,
     ):
         """Run the serial C6 pre-attention mHC/Engram/norm arithmetic."""
         if residual.shape[0] != 6 or pre_mix.shape[0] != 6 or positions.numel() != 6:
@@ -1708,52 +1800,60 @@ class PreparedDecoderLayer(nn.Module):
             if active_mask is not None:
                 target_state = target_state.masked_fill(~active_mask[:, None], 0)
 
-        value, new_pre, post, comb = hc_pre(
-            residual,
-            pre_mix,
-            w.hc_attn_fn,
-            w.hc_attn_scale,
-            w.hc_attn_base,
-            self.eps,
-            self.hc_eps,
-            self.iterations,
-            packed_fn=self.hc_attn_fn_packed if not self.draft or self.draft_mhc else None,
-            decode=True,
-            collapsed_input=collapsed_attention,
-            batch_control_reuse=self.batch_control_reuse,
-            control_mme_weight=self.hc_attn_fn_mme if self.mhc_control_mme else None,
-            control_epilogue=self.draft_mhc,
-            control_fp8_weight=((self.hc_attn_fn_fp8, self.hc_attn_fn_fp8_channel)
-                                if self.hc_attn_fn_fp8 is not None else None),
-        )
         input_prequant = None
         input_roundtrip = None
-        if (gaudi_envs.VLLM_HPU_DSV41_DSPARK_NORM_ROUNDTRIP and value.dtype == torch.bfloat16
-                and self.attention._fused_qkv_quantized and self.attention._fused_qkv_weight is not None
-                and self.attention._fused_qkv_weight.dtype == torch.bfloat16
-                and "fused_qkv_channel" not in self.attention._buffers
-                and "dspark_hw_qkv" not in self.attention._buffers):
-            value, input_roundtrip = torch.ops.custom_op.custom_deepseek_v41_norm_roundtrip_bf16_gaudi2(
-                value.contiguous(), w.attn_norm.weight, self.eps)
-        elif (self.decode_attention_norm_quant and value.dtype == torch.bfloat16
-              and "fused_qkv_channel" in self.attention._buffers):
-            norm_quant = torch.ops.custom_op.custom_deepseek_v41_attention_norm_quant_gaudi2
-            if gaudi_envs.VLLM_HPU_DSV41_DSPARK_INPUT_QUANT_REMAT:
-                norm_quant = torch.ops.custom_op.custom_deepseek_v41_attention_norm_quant_gaudi2_remat
-            value, quantized, activation_scale = norm_quant(
-                value.contiguous(), w.attn_norm.weight, self.eps)
-            input_prequant = quantized, activation_scale
+        scoped = (self._c6_scoped_prefix_math(residual, pre_mix, collapsed_attention, fp8_decode=fp8_decode)
+                  if use_scoped_recipe else None)
+        if scoped is not None:
+            value, new_pre, post, comb, quantized, activation_scale = scoped
+            input_prequant = None if quantized is None else (quantized, activation_scale)
         else:
-            value = rms_norm(value, w.attn_norm.weight, self.eps,
-                             native_decode=self.dspark_input_norm)
-        if collapsed_attention is not None and input_prequant is None:
-            value = value.to(residual.dtype)
+            value, new_pre, post, comb = hc_pre(
+                residual,
+                pre_mix,
+                w.hc_attn_fn,
+                w.hc_attn_scale,
+                w.hc_attn_base,
+                self.eps,
+                self.hc_eps,
+                self.iterations,
+                packed_fn=self.hc_attn_fn_packed if not self.draft or self.draft_mhc else None,
+                decode=True,
+                collapsed_input=collapsed_attention,
+                batch_control_reuse=self.batch_control_reuse,
+                control_mme_weight=self.hc_attn_fn_mme if self.mhc_control_mme else None,
+                control_epilogue=self.draft_mhc,
+                control_fp8_weight=((self.hc_attn_fn_fp8, self.hc_attn_fn_fp8_channel)
+                                    if self.hc_attn_fn_fp8 is not None else None),
+            )
+            if (gaudi_envs.VLLM_HPU_DSV41_DSPARK_NORM_ROUNDTRIP and value.dtype == torch.bfloat16
+                    and self.attention._fused_qkv_quantized and self.attention._fused_qkv_weight is not None
+                    and self.attention._fused_qkv_weight.dtype == torch.bfloat16
+                    and "fused_qkv_channel" not in self.attention._buffers
+                    and "dspark_hw_qkv" not in self.attention._buffers):
+                value, input_roundtrip = torch.ops.custom_op.custom_deepseek_v41_norm_roundtrip_bf16_gaudi2(
+                    value.contiguous(), w.attn_norm.weight, self.eps)
+            elif (self.decode_attention_norm_quant and value.dtype == torch.bfloat16
+                  and "fused_qkv_channel" in self.attention._buffers):
+                norm_quant = torch.ops.custom_op.custom_deepseek_v41_attention_norm_quant_gaudi2
+                if gaudi_envs.VLLM_HPU_DSV41_DSPARK_INPUT_QUANT_REMAT:
+                    norm_quant = torch.ops.custom_op.custom_deepseek_v41_attention_norm_quant_gaudi2_remat
+                value, quantized, activation_scale = norm_quant(
+                    value.contiguous(), w.attn_norm.weight, self.eps)
+                input_prequant = quantized, activation_scale
+            else:
+                value = rms_norm(value, w.attn_norm.weight, self.eps,
+                                 native_decode=self.dspark_input_norm)
+            if collapsed_attention is not None and input_prequant is None:
+                value = value.to(residual.dtype)
         schedule = gaudi_envs.VLLM_HPU_DSV41_MHC_SCHEDULE and not self.draft
         return value, new_pre, post, comb, target_state, input_prequant, input_roundtrip, schedule
 
     @torch._dynamo.disable
     def _target_c6_attention_prefix(self, *args, **kwargs):
         """Keep target-only C6 prefix math out of the compiled target group."""
+        kwargs = dict(kwargs)
+        kwargs["use_scoped_recipe"] = True
         return self._forward_c6_attention_prefix(*args, **kwargs)
 
     def _forward_c6_post_attention(
@@ -1769,49 +1869,66 @@ class PreparedDecoderLayer(nn.Module):
         fp8_decode,
         collapse_handoff,
         publish_collapse,
+        use_scoped_recipe=False,
     ):
         """Run the serial C6 post-attention mHC/FFN norm/MoE/collapse arithmetic."""
         if value.shape[0] != 6 or residual.shape[0] != 6:
             raise ValueError("shared C6 attention suffix requires exactly six rows")
         w = self.weights
-        collapsed_ffn = None
-        if self.mhc_post_collapse and value.device.type == "hpu":
-            residual, collapsed_ffn = decode_mhc_post_collapse(value, residual, post, comb, new_pre)
+        scoped = (self._c6_scoped_post_pre_moe_math(value, residual, new_pre, post, comb, fp8_decode=fp8_decode)
+                  if use_scoped_recipe else None)
+        if scoped is not None:
+            (
+                residual,
+                normalized,
+                quantized,
+                activation_scale,
+                shared_q,
+                shared_scale,
+                pre_mix,
+                post,
+                comb,
+            ) = scoped
+            shared_prequant = None if shared_q is None else (shared_q, shared_scale)
         else:
-            residual = hc_post(value, residual, post, comb)
-
-        value, pre_mix, post, comb = hc_pre(
-            residual,
-            new_pre,
-            w.hc_ffn_fn,
-            w.hc_ffn_scale,
-            w.hc_ffn_base,
-            self.eps,
-            self.hc_eps,
-            self.iterations,
-            packed_fn=self.hc_ffn_fn_packed if not self.draft or self.draft_mhc else None,
-            decode=True,
-            collapsed_input=collapsed_ffn,
-            batch_control_reuse=self.batch_control_reuse,
-            control_mme_weight=self.hc_ffn_fn_mme if self.mhc_control_mme else None,
-            control_epilogue=self.draft_mhc,
-            control_fp8_weight=((self.hc_ffn_fn_fp8, self.hc_ffn_fn_fp8_channel)
-                                if self.hc_ffn_fn_fp8 is not None else None),
-        )
-        if self.ffn_dual_quant and getattr(self.moe, "shared_gate_up_channel", None) is not None:
-            if self.ffn_bf16_quant and value.shape[0] == 1:
-                normalized, quantized, activation_scale, shared_q, shared_scale = (
-                    torch.ops.custom_op.custom_deepseek_v41_ffn_norm_dual_bf16_quant_gaudi2(
-                        value.contiguous(), w.ffn_norm.weight, self.eps))
+            collapsed_ffn = None
+            if self.mhc_post_collapse and value.device.type == "hpu":
+                residual, collapsed_ffn = decode_mhc_post_collapse(value, residual, post, comb, new_pre)
             else:
-                normalized, quantized, activation_scale, shared_q, shared_scale = decode_ffn_dual_quant(
-                    value, w.ffn_norm.weight, self.eps)
-            shared_prequant = shared_q, shared_scale
-        else:
-            normalized, quantized, activation_scale = (
-                torch.ops.custom_op.custom_deepseek_v41_ffn_norm_quant_gaudi2(
-                    value.contiguous(), w.ffn_norm.weight, self.eps))
-            shared_prequant = None
+                residual = hc_post(value, residual, post, comb)
+
+            value, pre_mix, post, comb = hc_pre(
+                residual,
+                new_pre,
+                w.hc_ffn_fn,
+                w.hc_ffn_scale,
+                w.hc_ffn_base,
+                self.eps,
+                self.hc_eps,
+                self.iterations,
+                packed_fn=self.hc_ffn_fn_packed if not self.draft or self.draft_mhc else None,
+                decode=True,
+                collapsed_input=collapsed_ffn,
+                batch_control_reuse=self.batch_control_reuse,
+                control_mme_weight=self.hc_ffn_fn_mme if self.mhc_control_mme else None,
+                control_epilogue=self.draft_mhc,
+                control_fp8_weight=((self.hc_ffn_fn_fp8, self.hc_ffn_fn_fp8_channel)
+                                    if self.hc_ffn_fn_fp8 is not None else None),
+            )
+            if self.ffn_dual_quant and getattr(self.moe, "shared_gate_up_channel", None) is not None:
+                if self.ffn_bf16_quant and value.shape[0] == 1:
+                    normalized, quantized, activation_scale, shared_q, shared_scale = (
+                        torch.ops.custom_op.custom_deepseek_v41_ffn_norm_dual_bf16_quant_gaudi2(
+                            value.contiguous(), w.ffn_norm.weight, self.eps))
+                else:
+                    normalized, quantized, activation_scale, shared_q, shared_scale = decode_ffn_dual_quant(
+                        value, w.ffn_norm.weight, self.eps)
+                shared_prequant = shared_q, shared_scale
+            else:
+                normalized, quantized, activation_scale = (
+                    torch.ops.custom_op.custom_deepseek_v41_ffn_norm_quant_gaudi2(
+                        value.contiguous(), w.ffn_norm.weight, self.eps))
+                shared_prequant = None
         value = self.moe(
             normalized,
             image_mask,
@@ -1833,6 +1950,8 @@ class PreparedDecoderLayer(nn.Module):
     @torch._dynamo.disable
     def _target_c6_post_attention(self, *args, **kwargs):
         """Keep target-only C6 suffix math out of the compiled target group."""
+        kwargs = dict(kwargs)
+        kwargs["use_scoped_recipe"] = True
         return self._forward_c6_post_attention(*args, **kwargs)
 
     def _forward_c6_slice(
@@ -1856,6 +1975,7 @@ class PreparedDecoderLayer(nn.Module):
             image_mask,
             engram_rows,
             collapse_handoff=collapse_handoff,
+            fp8_decode=fp8_decode,
         )
         value, new_pre, post, comb, target_state, input_prequant, input_roundtrip, schedule = prefix
         attention_kwargs = {"decode": True}
@@ -2549,6 +2669,7 @@ class PreparedDecoderLayer(nn.Module):
         target_attention=None,
         collapse_handoffs=None,
         publish_collapse=False,
+        active_lanes=None,
     ):
         """Run one packed target layer through serial C6 request-local math.
 
@@ -2573,14 +2694,23 @@ class PreparedDecoderLayer(nn.Module):
             collapse_handoffs = tuple({} for _ in range(capacity))
         elif len(collapse_handoffs) != capacity:
             raise ValueError("DSpark target collapse handoffs must match the fixed capacity")
-
-        attention_values = []
-        new_pres = []
-        posts = []
-        combs = []
-        target_states = []
+        # Keep the packed 6*N attention and device ownership mask fixed.  Only
+        # the eager C6 lane math is filtered to the validated host lanes.
+        lane_indices = tuple(range(capacity)) if active_lanes is None else active_lanes
+        if not lane_indices:
+            raise ValueError("DSpark target layer requires at least one active lane")
+        if any(lane < 0 or lane >= capacity for lane in lane_indices):
+            raise ValueError("DSpark target active lane is outside the fixed capacity")
+        if tuple(sorted(set(lane_indices))) != lane_indices:
+            raise ValueError("DSpark target active lanes must be unique and strictly increasing")
+        active_lane_set = set(lane_indices)
+        attention_values = [None] * capacity
+        new_pres = [None] * capacity
+        posts = [None] * capacity
+        combs = [None] * capacity
+        target_states = [None] * capacity
         schedules = []
-        for lane in range(capacity):
+        for lane in lane_indices:
             start = lane * 6
             stop = start + 6
             lane_slice = slice(start, stop)
@@ -2597,12 +2727,26 @@ class PreparedDecoderLayer(nn.Module):
                                       if self.collect_target_state else None),
             )
             value, new_pre, post, comb, target_state, _, _, schedule = prefix
-            attention_values.append(value)
-            new_pres.append(new_pre)
-            posts.append(post)
-            combs.append(comb)
-            target_states.append(target_state)
+            attention_values[lane] = value
+            new_pres[lane] = new_pre
+            posts[lane] = post
+            combs[lane] = comb
+            target_states[lane] = target_state
             schedules.append(schedule)
+        if len(lane_indices) != capacity:
+            zero_value = torch.zeros_like(attention_values[lane_indices[0]])
+            zero_pre = torch.zeros_like(new_pres[lane_indices[0]])
+            zero_post = torch.zeros_like(posts[lane_indices[0]])
+            zero_comb = torch.zeros_like(combs[lane_indices[0]])
+            zero_target = (torch.zeros_like(target_states[lane_indices[0]])
+                           if self.collect_target_state else None)
+            for lane in range(capacity):
+                if attention_values[lane] is None:
+                    attention_values[lane] = zero_value
+                    new_pres[lane] = zero_pre
+                    posts[lane] = zero_post
+                    combs[lane] = zero_comb
+                    target_states[lane] = zero_target
         if any(schedule != schedules[0] for schedule in schedules):
             raise RuntimeError("C6 target lanes disagree on the static mHC schedule")
         schedule = schedules[0]
@@ -2626,6 +2770,10 @@ class PreparedDecoderLayer(nn.Module):
             start = lane * 6
             stop = start + 6
             lane_slice = slice(start, stop)
+            if lane not in active_lane_set:
+                residual_lanes.append(residual[lane_slice])
+                pre_mix_lanes.append(pre_mix[lane_slice])
+                continue
             lane_residual, lane_pre_mix = self._target_c6_post_attention(
                 attention_value[lane_slice],
                 residual[lane_slice],
@@ -2825,6 +2973,7 @@ class PreparedStage(nn.Module):
         else:
             self.shared = CSA2SharedState(config, self.start, self.stop, device, max_length)
         lookup = mxfp4_bf16_lut(torch.device(device))
+        self._c6_scoped_recipe_cache = C6ScopedRecipeCache(self)
         self.layers = nn.ModuleList()
         for layer in range(self.start, self.stop):
             normal = self.shard.manifest["normal_scales"][f"layers.{layer}.ffn.experts"][tp_rank]
@@ -2841,6 +2990,7 @@ class PreparedStage(nn.Module):
                     device,
                     tensor_parallel_size,
                     collect_target_state=self.dspark,
+                    recipe_cache=self._c6_scoped_recipe_cache,
                 )
             )
             # Lightweight loader/ownership tests replace the decoder layer
@@ -3183,6 +3333,13 @@ class PreparedStage(nn.Module):
                 del layer.recipe_constant_contract
         self.loaded = False
         self.generation += 1
+
+    def set_c6_scoped_recipe_backend(self, backend: str):
+        self._c6_scoped_recipe_cache.set_backend(backend)
+
+    def scoped_recipe_status(self):
+        """Expose bounded C6 graph eligibility, hits, misses, and failures."""
+        return self._c6_scoped_recipe_cache.status()
 
     def embed(self, input_ids, *, draft=False):
         embedding = self.weights.mtp.embed if draft else self.weights.embed
@@ -4042,7 +4199,8 @@ class PreparedDraft(nn.Module):
                                      self.reduce,
                                      self.all_gather,
                                      device,
-                                     tensor_parallel_size=self.tensor_parallel_size))
+                                     tensor_parallel_size=self.tensor_parallel_size,
+                                     recipe_cache=None))
             if self.layers[-1].moe.mtp_cache:
                 from vllm_gaudi.ops.deepseek_v41_mtp_cache import prepare_draft_weight_cache
                 prepare_draft_weight_cache(self.layers[-1].moe)
