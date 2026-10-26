@@ -15,6 +15,11 @@ from vllm_gaudi.models.deepseek_v41 import (
     _validate_dspark_batch_native_runtime,
 )
 from vllm_gaudi.ops.deepseek_v41_batch import RequestSlots
+from vllm_gaudi.ops.deepseek_v41_capacity import (
+    MAX_DSV41_DSPARK_CAPACITY,
+    MIN_DSV41_DSPARK_CAPACITY,
+    validate_dspark_capacity,
+)
 from vllm_gaudi.ops.deepseek_v41_config import (
     is_dspark_b2_tp8_profile,
     is_dspark_batch_tp8_profile,
@@ -96,7 +101,21 @@ def _runner(config):
     return runner
 
 
-@pytest.mark.parametrize("capacity", (2, 3, 4))
+def test_shared_capacity_contract_keeps_serial_and_concurrent_bounds_distinct():
+    assert (MIN_DSV41_DSPARK_CAPACITY, MAX_DSV41_DSPARK_CAPACITY) == (2, 64)
+    for capacity in (2, 3, 6, 8, 11, 16, 64):
+        assert validate_dspark_capacity(capacity) == capacity
+        assert validate_dspark_capacity(capacity, allow_serial=True) == capacity
+    assert validate_dspark_capacity(1, allow_serial=True) == 1
+    for capacity in (1, 65, True, 2.0):
+        with pytest.raises(ValueError, match="integer in 2..64"):
+            validate_dspark_capacity(capacity)
+    assert RequestSlots(64).capacity == 64
+    with pytest.raises(ValueError, match="1..64"):
+        RequestSlots(65)
+
+
+@pytest.mark.parametrize("capacity", (2, 3, 6, 8, 16, 64))
 def test_generic_profile_accepts_each_concurrent_capacity(capacity):
     config = _config(max_num_seqs=capacity)
 
@@ -106,13 +125,13 @@ def test_generic_profile_accepts_each_concurrent_capacity(capacity):
     validate_dspark_tp8_profile(config)
 
 
-@pytest.mark.parametrize("capacity", (0, -1, 5, True, False, 2.0, "2", None))
+@pytest.mark.parametrize("capacity", (0, -1, 65, True, False, 2.0, "2", None))
 def test_capacity_validation_rejects_invalid_values_early(capacity):
     config = _config(max_num_seqs=capacity)
 
-    with pytest.raises(ValueError, match="integer in 1..4"):
+    with pytest.raises(ValueError, match="integer in 1..64"):
         validate_dspark_batch_capacity(config)
-    with pytest.raises(ValueError, match="integer in 1..4"):
+    with pytest.raises(ValueError, match="integer in 1..64"):
         validate_dspark_tp8_profile(config)
     assert not is_dspark_batch_tp8_profile(config)
     assert not is_dspark_b2_tp8_profile(config)
@@ -158,7 +177,7 @@ def test_n1_preserves_topology_and_sampled_device_verify(tp, pp, monkeypatch):
     _runner(config)._validate_sampling(sampled)
 
 
-@pytest.mark.parametrize("capacity", (1, 2, 4))
+@pytest.mark.parametrize("capacity", (1, 2, 3, 6, 8, 16, 64))
 def test_unsupported_sampling_is_http_400_at_every_service_capacity(capacity, monkeypatch):
     monkeypatch.setenv("VLLM_HPU_DSV41_DEVICE_VERIFY", "1")
     config = _config(max_num_seqs=capacity)
@@ -182,7 +201,7 @@ def test_profile_reset_from_n4_to_n1_restores_sampled_admission(monkeypatch):
     HpuPlatform.validate_request(None, sampled)
 
 
-@pytest.mark.parametrize("capacity", (2, 3, 4))
+@pytest.mark.parametrize("capacity", (2, 3, 6, 8, 16, 64))
 def test_native_masked_compressor_is_required_before_weight_load(capacity, monkeypatch):
     monkeypatch.setattr(torch.ops, "custom_op", SimpleNamespace(), raising=False)
 
@@ -190,7 +209,7 @@ def test_native_masked_compressor_is_required_before_weight_load(capacity, monke
         _validate_dspark_batch_native_runtime(_config(max_num_seqs=capacity))
 
 
-@pytest.mark.parametrize("capacity", (2, 3, 4))
+@pytest.mark.parametrize("capacity", (2, 3, 6, 8, 16, 64))
 def test_native_masked_compressor_presence_satisfies_batch_runtime(capacity, monkeypatch):
     monkeypatch.setattr(
         torch.ops,
@@ -208,7 +227,7 @@ def test_native_masked_compressor_is_not_imposed_on_n1(monkeypatch):
     _validate_dspark_batch_native_runtime(_config(max_num_seqs=1, tp=4, pp=1))
 
 
-def test_request_state_accepts_n4_and_rejects_configured_capacity_mismatch(monkeypatch):
+def test_request_state_accepts_custom_capacity_and_rejects_configured_capacity_mismatch(monkeypatch):
     from vllm_gaudi.ops import deepseek_v41_batch_state
 
     monkeypatch.setattr(
@@ -219,12 +238,12 @@ def test_request_state_accepts_n4_and_rejects_configured_capacity_mismatch(monke
     model = object.__new__(HpuDeepseekV41ForCausalLM)
     model.native = True
     model.program = SimpleNamespace(dspark=True)
-    model.vllm_config = _config(max_num_seqs=4)
+    model.vllm_config = _config(max_num_seqs=64)
 
-    model.initialize_request_state(4)
-    assert model.batch_state.capacity == 4
-    assert model.batch_state.slots.capacity == 4
-    with pytest.raises(ValueError, match="does not match configured max_num_seqs 4"):
+    model.initialize_request_state(64)
+    assert model.batch_state.capacity == 64
+    assert model.batch_state.slots.capacity == 64
+    with pytest.raises(ValueError, match="does not match configured max_num_seqs 64"):
         model.initialize_request_state(3)
 
 

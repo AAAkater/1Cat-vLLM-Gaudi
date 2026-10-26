@@ -15,8 +15,14 @@ from typing import Callable, Sequence
 
 import torch
 
-DEFAULT_BATCH_CAPACITY = 2
-MAX_BATCH_REQUESTS = 8
+from vllm_gaudi.ops.deepseek_v41_capacity import (
+    MAX_DSV41_DSPARK_CAPACITY,
+    MIN_DSV41_DSPARK_CAPACITY,
+    validate_dspark_capacity,
+)
+
+DEFAULT_BATCH_CAPACITY = MIN_DSV41_DSPARK_CAPACITY
+MAX_BATCH_REQUESTS = MAX_DSV41_DSPARK_CAPACITY
 MAX_TARGET_QUERIES = 6
 MAX_DRAFT_TOKENS = 5
 BATCH_RECORD_SIZE = 16
@@ -141,8 +147,7 @@ def batch_binding_words(
             batch_size = len(request_slots)
         except TypeError as error:
             raise ValueError("request_slots must be a CPU vector") from error
-    if not 1 <= batch_size <= MAX_BATCH_REQUESTS:
-        raise ValueError(f"slot_generations must contain 1..{MAX_BATCH_REQUESTS} values")
+    validate_dspark_capacity(batch_size, allow_serial=True, name="slot_generations")
     slots, generations, active_values = _slot_identity(request_slots, slot_generations, active, batch_size)
     return torch.tensor([
         pack_binding_word(round_generation, generations[index], slots[index]) if active_values[index] else 0
@@ -163,7 +168,8 @@ def batch_binding_sidecar(control: torch.Tensor) -> torch.Tensor:
     ``control`` remains record/provenance data and is never inspected on HPU.
     """
     if (not isinstance(control, torch.Tensor) or control.device.type != "cpu" or control.dtype != torch.int64
-            or control.ndim != 2 or control.shape[1] != 7 or not 1 <= control.shape[0] <= MAX_BATCH_REQUESTS):
+            or control.ndim != 2 or control.shape[1] != 7
+            or not 1 <= control.shape[0] <= MAX_BATCH_REQUESTS):
         raise ValueError("binding sidecar requires authoritative CPU I64 control [B, 7]")
     rows = []
     for binding in control[:, 0].tolist():
@@ -296,8 +302,7 @@ def verify_control_from_target_batch(
     if target.dtype not in (torch.int32, torch.int64):
         raise TypeError("batched target ids must be int32 or int64")
     batch_size = target.shape[0]
-    if not 1 <= batch_size <= MAX_BATCH_REQUESTS:
-        raise ValueError(f"batch size must be in 1..{MAX_BATCH_REQUESTS}")
+    validate_dspark_capacity(batch_size, allow_serial=True, name="batch size")
     if proposed.shape != (batch_size, MAX_DRAFT_TOKENS) or proposed.device != target.device:
         raise ValueError("batched verification requires matching [B, 5] proposals")
     if proposed.dtype not in (torch.int32, torch.int64):
@@ -393,8 +398,7 @@ def pack_record_batch(
     if metadata.ndim != 2 or metadata.shape[1] != 7 or metadata.dtype != torch.int64:
         raise ValueError("batch commit metadata must be I64 [B, 7]")
     batch_size = metadata.shape[0]
-    if not 1 <= batch_size <= MAX_BATCH_REQUESTS:
-        raise ValueError(f"batch size must be in 1..{MAX_BATCH_REQUESTS}")
+    validate_dspark_capacity(batch_size, allow_serial=True, name="batch size")
     if committed.shape != (batch_size, ) or output_count.shape != (batch_size, ):
         raise ValueError("batch commit counts must be [B]")
     if committed.dtype not in (torch.int32, torch.int64) or output_count.dtype not in (torch.int32, torch.int64):
@@ -532,8 +536,7 @@ class BatchVerifyRing:
         native_readback: Callable[[torch.Tensor], tuple[torch.Tensor, object]] | None = None,
         owner_validator: Callable[[tuple[int, ...], tuple[int, ...], tuple[bool, ...]], bool] | None = None,
     ):
-        if type(batch_capacity) is not int or not 1 <= batch_capacity <= MAX_BATCH_REQUESTS:
-            raise ValueError(f"batch capacity must be in 1..{MAX_BATCH_REQUESTS}")
+        validate_dspark_capacity(batch_capacity, allow_serial=True, name="batch capacity")
         if size < 2:
             raise ValueError("batch verify ring needs at least two retained tickets")
         self.device = torch.device(device)

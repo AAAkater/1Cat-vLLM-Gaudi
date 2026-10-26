@@ -13,6 +13,8 @@ import threading
 
 import numpy as np
 
+from vllm_gaudi.ops.deepseek_v41_capacity import MAX_DSV41_DSPARK_CAPACITY
+
 
 def _is_prime(n: int) -> bool:
     """Deterministic Miller-Rabin for n < 2**32 (avoids a sympy import)."""
@@ -352,7 +354,8 @@ class EngramHistoryBatch:
     @classmethod
     def prepare(cls, histories, spans, capacity):
         spans = tuple(spans)
-        if not spans or len(spans) > 64 or len({item[0] for item in spans}) != len(spans):
+        if (not spans or len(spans) > MAX_DSV41_DSPARK_CAPACITY
+                or len({item[0] for item in spans}) != len(spans)):
             raise ValueError("Engram batch requires distinct request owners")
         count = sum(len(item[2]) for item in spans)
         if not count <= capacity <= 8192:

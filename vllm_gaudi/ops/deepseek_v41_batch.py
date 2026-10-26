@@ -13,6 +13,8 @@ import threading
 
 import torch
 
+from vllm_gaudi.ops.deepseek_v41_capacity import validate_dspark_capacity
+
 
 class Phase(IntEnum):
     PAD = 0
@@ -31,8 +33,7 @@ class RequestSlots:
     """Bounded host ownership; no live slot can be overwritten by reuse."""
 
     def __init__(self, capacity):
-        if not 1 <= capacity <= 64:
-            raise ValueError("V4.1 request capacity must be in 1..64")
+        validate_dspark_capacity(capacity, allow_serial=True, name="V4.1 request capacity")
         self.capacity = capacity
         self.generations = [0] * capacity
         self.owners = {}
@@ -133,7 +134,8 @@ class FlatBatch:
     @classmethod
     def create(cls, spans, *, maximum, budget, capacity, page_size=128):
         spans = tuple(spans)
-        if not spans or len(spans) > capacity or not 1 <= capacity <= 64 or maximum > 1048576:
+        validate_dspark_capacity(capacity, allow_serial=True, name="V4.1 batch/request capacity")
+        if not spans or len(spans) > capacity or maximum > 1048576:
             raise ValueError("Invalid V4.1 batch/request capacity")
         offsets, owners, request_ids = [0], set(), set()
         for span in spans:

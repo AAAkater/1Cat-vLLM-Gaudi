@@ -24,6 +24,7 @@ from vllm.sequence import IntermediateTensors
 
 from vllm_gaudi import envs
 from vllm_gaudi.models.deepseek_v41_program import CompiledStage, PreparedStage, PreparedInput, PrefillInput
+from vllm_gaudi.ops.deepseek_v41_capacity import validate_dspark_capacity
 from vllm_gaudi.ops.deepseek_v41_host import EngramHost
 from vllm_gaudi.ops.deepseek_v41_prefill_capacity import prefill_capacity
 from vllm_gaudi.ops.deepseek_v41_replay import StageReplay, stage_collectives
@@ -378,9 +379,7 @@ class HpuDeepseekV41ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
             if configured != requested:
                 raise ValueError(
                     f"DSpark request capacity {requested} does not match configured max_num_seqs {configured}")
-        if type(configured) is not int or not 1 <= configured <= 4:
-            raise ValueError("DSpark request capacity must be in 1..4")
-        return configured
+        return validate_dspark_capacity(configured, allow_serial=True, name="DSpark request capacity")
 
     def initialize_request_state(self, capacity):
         """Request-owned state shared by native C1 and optional batch replay."""
@@ -425,8 +424,7 @@ class HpuDeepseekV41ForCausalLM(nn.Module, SupportsMultiModal, SupportsPP):
         if not self.native:
             raise RuntimeError("DSpark batch requires native target replay")
         capacity = self._dspark_configured_capacity(capacity)
-        if not 2 <= capacity <= 4:
-            raise ValueError("DSpark packed initialization requires concurrent capacity in 2..4")
+        validate_dspark_capacity(capacity, name="DSpark packed initialization capacity")
         self.initialize_request_state(capacity)
         state_capacity = getattr(self.batch_state, "capacity", None)
         owner_slots = getattr(self.batch_state, "slots", None)

@@ -24,6 +24,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from vllm_gaudi import envs as gaudi_envs
+from vllm_gaudi.ops.deepseek_v41_capacity import MAX_DSV41_NATIVE_STATE_ROWS
 from vllm_gaudi.ops.deepseek_v41_indexer import INDEX_MME_HOT_TOKENS
 from vllm_gaudi.ops.deepseek_v41_qkv import FusedCompressorInput, FusedQKVInput
 from vllm_gaudi.ops.deepseek_v41_trace import prefill_scope
@@ -51,6 +52,13 @@ NATIVE_WORK_TOKENS = 6
 SWA_ROWS = 256
 HISTORY_ROWS = 8
 INDEX_QUERY_TP_MIN_TOKENS = 1024
+
+
+def _trace_layer(module):
+    """Keep the diagnostic layer out of compiled module-attribute guards."""
+    if torch.compiler.is_compiling():
+        return None
+    return getattr(module, "layer", None)
 
 
 def can_partition_prefill_index(tokens, source_rows):
@@ -767,6 +775,32 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
         # Ordinary concurrent decode must keep the C1 FP32 multiply/FMA
         # sequence before BF16 rounding, including inverse RoPE before WO.
         maximum_rows = 64 if request_batch else NATIVE_WORK_TOKENS
+        native_rows = (
+            self.native_rope
+            and value.dtype == torch.bfloat16
+            and value.ndim in (2, 3)
+            and (value.ndim == 2 or 1 <= value.shape[1] <= 128)
+            and 128 <= value.shape[-1] <= 512
+            and value.shape[-1] % 128 == 0
+        )
+        if request_batch and native_rows and value.shape[0] > maximum_rows:
+            op = (
+                torch.ops.custom_op.custom_deepseek_v41_rope_inverse_bf16_gaudi2
+                if inverse
+                else torch.ops.custom_op.custom_deepseek_v41_rope_bf16_gaudi2
+            )
+            outputs = []
+            for start in range(0, value.shape[0], maximum_rows):
+                stop = min(start + maximum_rows, value.shape[0])
+                shaped = value[start:stop].reshape(stop - start, -1, value.shape[-1]).contiguous()
+                outputs.append(
+                    op(
+                        shaped,
+                        positions[start:stop].to(torch.int32).contiguous(),
+                        self._rotary_native_table(),
+                    )
+                )
+            return torch.cat(outputs, dim=0).reshape(value.shape)
         if (
             not request_batch
             and self.native_rope
@@ -788,13 +822,8 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
             shaped = value.reshape(value.shape[0], -1, value.shape[-1]).contiguous()
             return op(shaped, positions.to(torch.int32).contiguous(), self._rotary_native_table()).reshape(value.shape)
         if (
-            self.native_rope
-            and value.dtype == torch.bfloat16
-            and value.ndim in (2, 3)
-            and (value.ndim == 2 or 1 <= value.shape[1] <= 128)
+            native_rows
             and 1 <= value.shape[0] <= maximum_rows
-            and 128 <= value.shape[-1] <= 512
-            and value.shape[-1] % 128 == 0
         ):
             op = (
                 torch.ops.custom_op.custom_deepseek_v41_rope_inverse_bf16_gaudi2
@@ -874,9 +903,9 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
                 and (not request_batch or getattr(weight, "dense_fp8", False))):
             if not getattr(weight, "dense_fp8", False) or self.heads not in (8, 16, 32):
                 raise ValueError("Prefill Q projection requires prepared FP8 weights and 8/16/32 local heads")
-            with prefill_event_span("attention_query_quantization", self.layer, value.shape[0]):
+            with prefill_event_span("attention_query_quantization", _trace_layer(self), value.shape[0]):
                 value = quantize_activation(value) if hasattr(weight, "scale") else value
-            with prefill_event_span("attention_query_projection_rope", self.layer, value.shape[0]):
+            with prefill_event_span("attention_query_projection_rope", _trace_layer(self), value.shape[0]):
                 return prefill_q_projection(
                     value.contiguous(),
                     weight.weight,
@@ -914,15 +943,21 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
         carries its own scale and absolute rotary position.
         """
         weight = self.weights.wq_b
-        return torch.ops.custom_op.custom_deepseek_v41_q_norm_projection_rope_gaudi2(
-            value.contiguous(),
-            self.weights.q_norm.weight,
-            weight.weight,
-            weight.channel_scale,
-            positions.to(torch.int32).contiguous(),
-            self._rotary_native_table(),
-            self.eps,
-        ).reshape(-1, self.heads, 512)
+        projections = []
+        for start in range(0, value.shape[0], MAX_DSV41_NATIVE_STATE_ROWS):
+            stop = min(start + MAX_DSV41_NATIVE_STATE_ROWS, value.shape[0])
+            projections.append(
+                torch.ops.custom_op.custom_deepseek_v41_q_norm_projection_rope_gaudi2(
+                    value[start:stop].contiguous(),
+                    self.weights.q_norm.weight,
+                    weight.weight,
+                    weight.channel_scale,
+                    positions[start:stop].to(torch.int32).contiguous(),
+                    self._rotary_native_table(),
+                    self.eps,
+                ).reshape(-1, self.heads, 512)
+            )
+        return projections[0] if len(projections) == 1 else torch.cat(projections, dim=0)
 
     def project_kv(self, value, positions, *, decode=False):
         """Normalize and rotate KV at its exact BF16 boundary."""
@@ -1408,7 +1443,7 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
                     invalid_scores = q.new_full(shape, -torch.inf, dtype=torch.float32)
                 scores = invalid_scores
             else:
-                with prefill_event_span("index_scores", getattr(self, "layer", None), positions.numel()):
+                with prefill_event_span("index_scores", _trace_layer(self), positions.numel()):
                     scores = (
                         scorer(positions, current_rows, q, weights)
                         if prefix_scores is None
@@ -1424,7 +1459,7 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
             # large merge is exact after invalid rows are normalized to -1,
             # while retaining candidate-block merges preserves their tie order.
             if not invisible_tile:
-                with prefill_event_span("index_topk", getattr(self, "layer", None), positions.numel()):
+                with prefill_event_span("index_topk", _trace_layer(self), positions.numel()):
                     best_scores, best_rows = self._merge_topk(best_scores, best_rows, scores, current_rows, width)
             if collect_blocks:
                 if scores.shape[-1] % 8:
@@ -1438,7 +1473,7 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
                 # Match the reference: keep the block containing the newest
                 # visible token so its causal prefix cannot be dropped.
                 grouped = grouped.masked_fill(ids == ((count - 1) // 8), torch.inf)
-                with prefill_event_span("index_candidates", getattr(self, "layer", None), positions.numel()):
+                with prefill_event_span("index_candidates", _trace_layer(self), positions.numel()):
                     block_scores, block_ids = self._merge_topk(block_scores, block_ids, grouped, ids, 2048)
 
         if threshold_selection:
@@ -1650,7 +1685,7 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
                 positions.to(torch.int32).contiguous(), self._rotary_native_table())
             return self._reduce_decode_output(partial, ready_outputs, decode=decode)
         if prefill:
-            with prefill_event_span("attention_output_inverse_rope", self.layer, output.shape[0]):
+            with prefill_event_span("attention_output_inverse_rope", _trace_layer(self), output.shape[0]):
                 output = self._rope(output, positions, inverse=True, request_batch=request_batch)
         elif not inverse_rotated:
             output = self._rope(output, positions, inverse=True, request_batch=request_batch)
@@ -1659,17 +1694,17 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
             wa, wb = self.weights.wo_a, self.weights.wo_b
             if not (self.woa_fp8 and self.woa_output_roundtrip and getattr(wb, "dense_fp8", False)):
                 raise ValueError("Prefill output projection requires prepared FP8 weights and the group codec")
-            with prefill_event_span("attention_output_projection", self.layer, output.shape[0]):
+            with prefill_event_span("attention_output_projection", _trace_layer(self), output.shape[0]):
                 partial = prefill_output_projection(
                     output.contiguous(), wa.weight, wa.channel_scale, wb.weight, wb.channel_scale
                 )
-            with prefill_event_span("attention_output_reduce", self.layer, output.shape[0]):
+            with prefill_event_span("attention_output_reduce", _trace_layer(self), output.shape[0]):
                 return self._reduce_prefill_output(partial, ready_outputs, prefill_sequence)
         if prefill:
-            with prefill_event_span("attention_output_projection", self.layer, output.shape[0]):
+            with prefill_event_span("attention_output_projection", _trace_layer(self), output.shape[0]):
                 output = self.project_output(output)
                 partial = self.project_output_consumer(output)
-            with prefill_event_span("attention_output_reduce", self.layer, output.shape[0]):
+            with prefill_event_span("attention_output_reduce", _trace_layer(self), output.shape[0]):
                 return self._reduce_prefill_output(partial, ready_outputs, prefill_sequence)
         if (decode and output.shape[0] == 1 and gaudi_envs.VLLM_HPU_DSV41_WOA_DENSE_HANDOFF
                 and self.woa_fp8 and self.woa_output_roundtrip
@@ -1918,7 +1953,7 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
             # Keep the gathered working set bounded inside a larger compiled
             # recipe, while the caller retains the complete query sequence.
             outer_rows = 2048
-            with prefill_event_span("mla_local_tiles", self.layer, query.shape[0]):
+            with prefill_event_span("mla_local_tiles", _trace_layer(self), query.shape[0]):
                 for start in range(0, query.shape[0], outer_rows):
                     stop = min(start + outer_rows, query.shape[0])
                     signature = (stop - start, tuple(query.shape[1:]), tuple(cache.shape), indices.shape[1])
@@ -1985,10 +2020,10 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
             and self.search_length // self.ratio <= self.cache.decoded_main.shape[0]
         )
         if self.ratio and self.owns_kv:
-            with prefill_event_span("attention_compress_kv", self.layer, value.shape[0]):
+            with prefill_event_span("attention_compress_kv", _trace_layer(self), value.shape[0]):
                 self._compress(value, positions, decoded=decoded)
         boundary("compress")
-        with prefill_event_span("attention_index_query", self.layer, value.shape[0]):
+        with prefill_event_span("attention_index_query", _trace_layer(self), value.shape[0]):
             prepared = (
                 self._prepare_index_queries(value, qr, positions, prefill=True)
                 if self.ratio and self.owns_index
@@ -2045,7 +2080,7 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
                                            prefill=True, prefill_sequence=prefill_sequence)
             return self._prefill_attention_tiled(value, query, kv, positions, selected, ready_outputs, prefill_sequence)
 
-        with prefill_event_span("attention_swa_workspace", self.layer, value.shape[0]):
+        with prefill_event_span("attention_swa_workspace", _trace_layer(self), value.shape[0]):
             cache, indices = self._prefill_swa_workspace(kv, positions, decoded=decoded)
         boundary("swa")
         columns = indices.shape[1] + (selected.shape[1] if self.ratio else 0)
@@ -2069,7 +2104,7 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
             selected = selected[owner]
         if self.ratio:
             logical = torch.arange(main_rows, device=value.device, dtype=torch.int32)
-            with prefill_event_span("attention_main_workspace", self.layer, value.shape[0]):
+            with prefill_event_span("attention_main_workspace", _trace_layer(self), value.shape[0]):
                 cache, indices = self._prefill_main_workspace(cache, indices, selected, logical)
         boundary("main")
         output = self._prefill_sparse(query, cache, indices, indices_partitioned=indices_partitioned)
@@ -2126,7 +2161,7 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
             if value.shape[0] == positions.numel():
                 projection_value = value[token_owner(positions.numel(), group.rank_in_group)]
         if prefill:
-            with prefill_event_span("attention_input_projection", self.layer, projection_value.shape[0]):
+            with prefill_event_span("attention_input_projection", _trace_layer(self), projection_value.shape[0]):
                 query_input, kv_input = self._project_qkv_input(projection_value, token_group=token_group)
         else:
             fused_fp8_prologue = (self.fp8_qkv_prologue and decode and 2 <= value.shape[0] <= NATIVE_WORK_TOKENS
@@ -2216,8 +2251,8 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
             query = self.project_query_input(query_input, positions)
         else:
             if prefill:
-                with prefill_event_span("attention_query_norm_projection", self.layer, value.shape[0]):
-                    with prefill_event_span("attention_query_normalize", self.layer, value.shape[0]):
+                with prefill_event_span("attention_query_norm_projection", _trace_layer(self), value.shape[0]):
+                    with prefill_event_span("attention_query_normalize", _trace_layer(self), value.shape[0]):
                         qr = norm(query_input.contiguous(), self.weights.q_norm.weight, self.eps)
                     query = self.project_query(qr, positions, decode=decode)
             else:
@@ -2273,7 +2308,7 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
             # subsequent logical gather; alias annotations alone do not.
             positions = publish_completion[:, 0].contiguous()
         elif prefill:
-            with prefill_event_span("attention_kv_norm_rope", self.layer, value.shape[0]):
+            with prefill_event_span("attention_kv_norm_rope", _trace_layer(self), value.shape[0]):
                 kv = self.project_kv(kv_input, positions, decode=decode)
         else:
             kv = self.project_kv(kv_input, positions, decode=decode)
@@ -2937,16 +2972,16 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
 
         request_slots = tuple(int(slot) for slot in request_slots)
         capacity = len(request_slots)
-        rows = 6 * capacity
+        row_count = 6 * capacity
         if tuple(request_lengths) != (6, ) * capacity:
             raise ValueError("target attention graph is fixed at six physical rows per lane")
         if (capacity < 1 or len(set(request_slots)) != capacity
                 or any(slot < 0 or slot >= capacity for slot in request_slots)):
             raise ValueError("target request slot ownership must be distinct host-static lane slots")
-        if (value.shape[0] != rows or positions.shape != (rows, ) or slots.shape != (rows, )
-                or row_valid.shape != (rows, ) or selected.shape != (rows, 512)
-                or candidates.shape != (rows, 2048) or main_done.shape != (rows, )
-                or index_done.shape != (rows, ) or pages.shape[0] != rows):
+        if (value.shape[0] != row_count or positions.shape != (row_count, ) or slots.shape != (row_count, )
+                or row_valid.shape != (row_count, ) or selected.shape != (row_count, 512)
+                or candidates.shape != (row_count, 2048) or main_done.shape != (row_count, )
+                or index_done.shape != (row_count, ) or pages.shape[0] != row_count):
             raise ValueError("target attention inputs must match the fixed 6*N capacity")
         safe_positions = positions.clamp_min(0)
         active = row_valid.to(torch.bool) & (slots >= 0)
@@ -2981,60 +3016,87 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
                 )
             if self.owns_index:
                 q, weights = self._prepare_index_queries(value, qr, safe_positions, request_batch=True)
-                q = read_state_rows(
-                    q.reshape(q.shape[0], -1).contiguous(),
-                    torch.arange(q.shape[0], device=q.device, dtype=torch.int32),
-                    index_done.clamp_min(0),
-                ).reshape(q.shape)
-                if self.batch_full_index_mme and q.shape[0] > 1 and self.layer <= self.candidate_source:
-                    from vllm_gaudi.ops.deepseek_v41_full_index_mme import full_index_mme_select
+                # Native index selection accepts at most 64 rows. Ten fixed
+                # six-row lanes keep every chunk within that ABI while
+                # retaining row order after the selected/blocks concatenation.
+                selected_parts = []
+                updated_parts = []
+                for first_lane in range(0, capacity, 10):
+                    first_row = first_lane * 6
+                    last_row = min(first_row + 60, row_count)
+                    lane_q = q[first_row:last_row]
+                    lane_weights = weights[first_row:last_row]
+                    lane_pages = pages[first_row:last_row]
+                    lane_positions = safe_positions[first_row:last_row]
+                    lane_candidates = candidates[first_row:last_row]
+                    lane_index_done = index_done[first_row:last_row]
+                    lane_q = read_state_rows(
+                        lane_q.reshape(lane_q.shape[0], -1).contiguous(),
+                        torch.arange(lane_q.shape[0], device=q.device, dtype=torch.int32),
+                        lane_index_done.clamp_min(0),
+                    ).reshape(lane_q.shape)
+                    if self.batch_full_index_mme and lane_q.shape[0] > 1 and self.layer <= self.candidate_source:
+                        from vllm_gaudi.ops.deepseek_v41_full_index_mme import full_index_mme_select
 
-                    selected, updated = full_index_mme_select(
-                        q.contiguous(),
-                        weights.contiguous(),
-                        self.cache.index,
-                        pages,
-                        safe_positions.contiguous(),
-                        candidates,
-                        ratio=self.ratio,
-                        capacity=self.length // self.ratio,
-                        publish_candidates=self.layer == self.candidate_source,
-                        key_ready=index_done,
-                        tiled_keys=self.batch_index_tiled_keys and q.shape[0] in (8, 32),
-                        local_heads=self.index_heads,
-                        prefix_tokens=self.batch_full_index_mme_prefix_tokens,
-                    )
-                elif self.batch_reindex_mme and q.shape[0] > 1 and self.layer > self.candidate_source:
-                    from vllm_gaudi.ops.deepseek_v41_reindex_mme import (
-                        bounded_reindex_mme_select,
-                        reindex_mme_select,
-                    )
-                    from vllm_gaudi.ops.deepseek_v41_reindex_compact import bounded_reindex_bucket
+                        lane_selected, updated = full_index_mme_select(
+                            lane_q.contiguous(),
+                            lane_weights.contiguous(),
+                            self.cache.index,
+                            lane_pages,
+                            lane_positions.contiguous(),
+                            lane_candidates,
+                            ratio=self.ratio,
+                            capacity=self.length // self.ratio,
+                            publish_candidates=self.layer == self.candidate_source,
+                            key_ready=lane_index_done,
+                            tiled_keys=self.batch_index_tiled_keys and lane_q.shape[0] in (8, 32),
+                            local_heads=self.index_heads,
+                            prefix_tokens=self.batch_full_index_mme_prefix_tokens,
+                        )
+                    elif self.batch_reindex_mme and lane_q.shape[0] > 1 and self.layer > self.candidate_source:
+                        from vllm_gaudi.ops.deepseek_v41_reindex_mme import (
+                            bounded_reindex_mme_select,
+                            reindex_mme_select,
+                        )
+                        from vllm_gaudi.ops.deepseek_v41_reindex_compact import bounded_reindex_bucket
 
-                    select = (bounded_reindex_mme_select
-                              if self.bounded_reindex and bounded_reindex_bucket(q.shape[0]) else reindex_mme_select)
-                    options = {"tiled_keys": self.batch_index_tiled_keys and q.shape[0] in (8, 32)}
-                    if select is reindex_mme_select:
-                        options["local_heads"] = self.index_heads
-                    selected = select(q.contiguous(), weights.contiguous(), self.cache.index, pages,
-                                      safe_positions.contiguous(), candidates, ratio=self.ratio, **options)
-                    updated = None
-                else:
-                    selected, updated = runtime_index_select(
-                        q.contiguous(),
-                        weights.contiguous(),
-                        self.cache.index,
-                        pages,
-                        safe_positions.contiguous(),
-                        candidates,
-                        ratio=self.ratio,
-                        capacity=self.length // self.ratio,
-                        reindex=self.layer > self.candidate_source,
-                        publish_candidates=self.layer == self.candidate_source,
-                        local_heads=self.index_heads,
-                    )
-                if updated is not None:
-                    blocks = updated
+                        select = (bounded_reindex_mme_select
+                                  if self.bounded_reindex and bounded_reindex_bucket(lane_q.shape[0])
+                                  else reindex_mme_select)
+                        options = {"tiled_keys": self.batch_index_tiled_keys and lane_q.shape[0] in (8, 32)}
+                        if select is reindex_mme_select:
+                            options["local_heads"] = self.index_heads
+                        lane_selected = select(
+                            lane_q.contiguous(),
+                            lane_weights.contiguous(),
+                            self.cache.index,
+                            lane_pages,
+                            lane_positions.contiguous(),
+                            lane_candidates,
+                            ratio=self.ratio,
+                            **options,
+                        )
+                        updated = None
+                    else:
+                        lane_selected, updated = runtime_index_select(
+                            lane_q.contiguous(),
+                            lane_weights.contiguous(),
+                            self.cache.index,
+                            lane_pages,
+                            lane_positions.contiguous(),
+                            lane_candidates,
+                            ratio=self.ratio,
+                            capacity=self.length // self.ratio,
+                            reindex=self.layer > self.candidate_source,
+                            publish_candidates=self.layer == self.candidate_source,
+                            local_heads=self.index_heads,
+                        )
+                    selected_parts.append(lane_selected)
+                    if updated is not None:
+                        updated_parts.append(updated)
+                selected = torch.cat(selected_parts, dim=0)
+                if updated_parts:
+                    blocks = torch.cat(updated_parts, dim=0)
             selected = torch.where(
                 active[:, None] & (selected < ((safe_positions + 1) // self.ratio)[:, None]), selected, -1
             ).int()
@@ -3066,7 +3128,21 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
             sram_gather=packed_gather and self.batch_packed_mla_sram,
             vector_gather=packed_gather and self.batch_packed_mla_vector,
         )
-        result = self._finish_output(output, safe_positions, ready_outputs, request_batch=True)
+        finished_outputs = []
+        for lane in range(capacity):
+            start = lane * 6
+            stop = start + 6
+            lane_ready_outputs = tuple(ready[start:stop] for ready in ready_outputs)
+            finished_outputs.append(
+                self._finish_output(
+                    output[start:stop],
+                    safe_positions[start:stop],
+                    lane_ready_outputs,
+                    request_batch=True,
+                    decode=True,
+                )
+            )
+        result = torch.cat(finished_outputs, dim=0)
         result = torch.where(active[:, None], result, torch.zeros_like(result))
         return result, selected, blocks, main_done, index_done
 

@@ -15,7 +15,11 @@ import torch
 import torch._dynamo
 from torch import nn
 
-from vllm_gaudi.models.deepseek_v41_program import PreparedInput, final_collapse_rms_norm
+from vllm_gaudi.models.deepseek_v41_program import (
+    PreparedInput,
+    decode_bf16_identity,
+    final_collapse_rms_norm,
+)
 from vllm_gaudi.ops.deepseek_v41_batch_target import (
     TARGET_ROWS_PER_REQUEST,
     DSparkTargetBatch,
@@ -24,6 +28,50 @@ from vllm_gaudi.ops.deepseek_v41_batch_target import (
     target_request_offsets,
     target_rows_for_capacity,
 )
+
+
+class _TargetAttentionCall:
+    """Plain callable binding one target layer to its fixed-capacity attention.
+
+    This deliberately is not an ``nn.Module``.  The target layer already owns
+    the attention module, and registering this holder would duplicate its
+    parameters and buffers in ``state_dict``.  ``torch.compile`` compiles the
+    callable itself while keeping its fixed request ownership as static
+    attributes.
+    """
+
+    def __init__(self, attention, *, request_lengths: tuple[int, ...], request_slots: tuple[int, ...]):
+        self.attention = attention
+        self.request_lengths = tuple(request_lengths)
+        self.request_slots = tuple(request_slots)
+
+    def __call__(
+        self,
+        value,
+        positions,
+        slots,
+        pages,
+        selected,
+        candidates,
+        main_done,
+        index_done,
+        row_valid,
+        ready_outputs,
+    ):
+        return self.attention.forward_batch_target(
+            value,
+            positions,
+            slots,
+            pages,
+            selected,
+            candidates,
+            main_done,
+            index_done,
+            row_valid=row_valid,
+            request_lengths=self.request_lengths,
+            request_slots=self.request_slots,
+            ready_outputs=ready_outputs,
+        )
 
 
 class PreparedTargetBatchLayerGroup(nn.Module):
@@ -55,6 +103,20 @@ class PreparedTargetBatchLayerGroup(nn.Module):
                 or any(slot < 0 or slot >= self.batch_capacity for slot in self.request_slots)):
             raise ValueError("target request slots must be distinct nonnegative owners")
         self.layers = nn.ModuleList(list(stage.layers[start:stop]))
+        self.preserve_layer_rounding = getattr(stage, "tensor_parallel_size", 2) in (4, 8)
+        self.slice_target_layers = all(getattr(layer, "_target_c6_slices", False) for layer in self.layers)
+        self.attention_calls = (tuple(
+            _TargetAttentionCall(
+                layer.attention,
+                request_lengths=self.request_lengths,
+                request_slots=self.request_slots,
+            )
+            for layer in self.layers
+        ) if self.slice_target_layers else ())
+        # Direct group users exercise the same callable path eagerly.  The
+        # production stage replaces these with fullgraph wrappers below.
+        self.attention_wrappers = self.attention_calls
+        self.attention_wrappers_compiled = False
         self.input = PreparedInput(stage.weights.embed, stage.tp_rank, stage.reduce) if text_input else None
         self.final = bool(getattr(stage, "is_last_stage", stage.pp_rank == 1)) and stop == len(stage.layers)
         self.norm = getattr(stage.weights, "norm", None) if self.final else None
@@ -67,6 +129,19 @@ class PreparedTargetBatchLayerGroup(nn.Module):
             if layer.attention.ratio else (-1, -1)
             for layer in self.layers
         )
+
+    def compile_attention_wrappers(self, backend: str):
+        """Compile each fixed-capacity attention call as its own graph."""
+        if not self.slice_target_layers:
+            return self.attention_wrappers
+        if self.attention_wrappers_compiled:
+            return self.attention_wrappers
+        self.attention_wrappers = tuple(
+            torch.compile(wrapper, backend=backend, fullgraph=True, dynamic=False)
+            for wrapper in self.attention_calls
+        )
+        self.attention_wrappers_compiled = True
+        return self.attention_wrappers
 
     def forward(
         self,
@@ -92,12 +167,26 @@ class PreparedTargetBatchLayerGroup(nn.Module):
         main_ready = list(main_ready)
         index_ready = list(index_ready)
         target_states = []
-        for layer, (index_source, kv_source) in zip(self.layers, self.mapping, strict=True):
+        collapse_handoffs = (tuple({} for _ in range(self.batch_capacity))
+                             if self.slice_target_layers and self.preserve_layer_rounding else None)
+        for layer_index, (layer, (index_source, kv_source)) in enumerate(
+                zip(self.layers, self.mapping, strict=True)):
             rows = engram_rows[0 if layer.layer == 1 else 1] if layer.layer in (1, 14) and engram_rows else None
             selection = selections[index_source] if index_source >= 0 else selections[0]
             main_done = main_ready[kv_source] if kv_source >= 0 else main_ready[0]
             index_done = index_ready[kv_source] if kv_source >= 0 else index_ready[0]
-            result = layer.forward_batch_target(
+            publish_collapse = False
+            if collapse_handoffs is not None and getattr(layer, "mhc_interlayer_collapse", False):
+                following = self.layers[layer_index + 1] if layer_index + 1 < len(self.layers) else None
+                publish_collapse = (
+                    following is not None
+                    and following.layer == layer.layer + 1
+                    and getattr(following, "mhc_interlayer_collapse", False)
+                    and not getattr(layer, "draft", False)
+                    and not getattr(following, "draft", False)
+                    and not hasattr(following.weights, "engram")
+                )
+            target_args = (
                 residual,
                 pre_mix,
                 positions,
@@ -113,15 +202,40 @@ class PreparedTargetBatchLayerGroup(nn.Module):
                 self.request_lengths,
                 self.request_slots,
             )
+            if self.slice_target_layers:
+                result = layer.forward_batch_target(
+                    *target_args,
+                    target_attention=self.attention_wrappers[layer_index],
+                    collapse_handoffs=collapse_handoffs,
+                    publish_collapse=publish_collapse,
+                )
+            else:
+                # Preserve compatibility for synthetic target layers that do
+                # not implement the fixed C6 slice contract.
+                result = layer.forward_batch_target(*target_args)
             residual, pre_mix, selection, candidates, main_done, index_done, target = result
             if index_source >= 0:
                 selections[index_source] = selection
                 main_ready[kv_source], index_ready[kv_source] = main_done, index_done
             if target is not None:
                 target_states.append(target)
+            if collapse_handoffs is not None and layer_index + 1 < len(self.layers):
+                residual_lanes = []
+                for lane in range(self.batch_capacity):
+                    start = lane * 6
+                    lane_residual = residual[start:start + 6]
+                    if layer.layer + 1 not in collapse_handoffs[lane]:
+                        lane_residual = decode_bf16_identity(lane_residual)
+                    residual_lanes.append(lane_residual)
+                residual = torch.cat(residual_lanes)
         if not self.final:
             return residual, pre_mix, None, tuple(selections), candidates, tuple(main_ready), tuple(index_ready)
-        value = final_collapse_rms_norm(residual, pre_mix, self.norm.weight, self.eps)
+        value_lanes = []
+        for lane in range(self.batch_capacity):
+            start = lane * 6
+            value_lanes.append(
+                final_collapse_rms_norm(residual[start:start + 6], pre_mix[start:start + 6], self.norm.weight, self.eps))
+        value = torch.cat(value_lanes)
         aux = torch.cat(target_states, -1) if target_states else None
         # A sentinel row may contain arbitrary tile-local arithmetic; it must
         # never escape into verify or a draft producer.
@@ -163,8 +277,16 @@ class CompiledTargetBatchStage:
             )
             for start in range(0, len(stage.layers), group_size)
         ])
-        self.chunks = tuple(
-            torch.compile(group, backend=backend, fullgraph=True, dynamic=False) for group in self.groups)
+        self.slice_target_layers = all(group.slice_target_layers for group in self.groups)
+        if self.slice_target_layers:
+            # Per-lane C6 mHC/MoE stays eager.  Only attention is a fullgraph
+            # boundary so batch_packed_mla can bind into recipe-owned SRAM.
+            for group in self.groups:
+                group.compile_attention_wrappers(backend)
+            self.chunks = tuple(self.groups)
+        else:
+            self.chunks = tuple(
+                torch.compile(group, backend=backend, fullgraph=True, dynamic=False) for group in self.groups)
 
     def __call__(
         self,
@@ -189,8 +311,20 @@ class CompiledTargetBatchStage:
         index_ready = tuple(torch.zeros(self.rows, dtype=torch.int32, device=positions.device)
                             for _ in self.stage.shared.sources)
         aux = None
-        recompile_limit = max(torch._dynamo.config.recompile_limit, 2 * len(self.chunks) + 1)
-        with torch._dynamo.config.patch(recompile_limit=recompile_limit):
+        if self.slice_target_layers:
+            # The compiled attention wrappers lazily compile on their first
+            # invocation.  They share one callable code object, so the budget
+            # must cover every target layer rather than every eager chunk.
+            recompile_limit = max(torch._dynamo.config.recompile_limit, 2 * len(self.stage.layers) + 1)
+        else:
+            recompile_limit = max(torch._dynamo.config.recompile_limit, 2 * len(self.chunks) + 1)
+        config_patch = {"recompile_limit": recompile_limit}
+        if self.slice_target_layers:
+            # The wrappers keep ``attention.layer`` as an integer attribute of
+            # an nn.Module.  Specializing it per layer creates one Dynamo
+            # variant per layer and exhausts the budget during the first call.
+            config_patch["allow_unspec_int_on_nn_module"] = True
+        with torch._dynamo.config.patch(**config_patch):
             for chunk in self.chunks:
                 hidden, pre_mix, aux, selections, candidates, main_ready, index_ready = chunk(
                     hidden,

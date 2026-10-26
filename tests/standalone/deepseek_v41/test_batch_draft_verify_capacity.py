@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""CPU contracts for verify-ring capacities N=1, 2 and 4."""
+"""CPU contracts for verify-ring capacities through N=64."""
 from types import SimpleNamespace
 
 import pytest
@@ -22,7 +22,12 @@ from vllm_gaudi.ops.deepseek_v41_batch_verify import (
 _CAPACITY_CASES = (
     (1, (True, )),
     (2, (True, False)),
+    (3, (True, False, True)),
     (4, (True, False, True, False)),
+    (6, (True, False, True, False, True, False)),
+    (8, (True, False, True, False, True, False, True, False)),
+    (16, tuple(index % 2 == 0 for index in range(16))),
+    (64, tuple(index % 2 == 0 for index in range(64))),
 )
 
 
@@ -63,7 +68,7 @@ def _record(capacity, active, *, round_generation=1, slots=None, generations=Non
         target_counts=target_counts,
         proposal_counts=proposal_counts,
         remaining_output_budget=[64 if enabled else 0 for enabled in active],
-        target_start_positions=[10 + 20 * index if enabled else 0 for index, enabled in enumerate(active)],
+        target_start_positions=[10 + index if enabled else 0 for index, enabled in enumerate(active)],
         max_model_len=128,
         need_sample=[1 if enabled else 0 for enabled in active],
         active=active,
@@ -220,7 +225,7 @@ def test_stage_capacity_mismatch_fails_before_target_or_ticket(monkeypatch):
 def test_verify_constants_and_capacity_bounds(monkeypatch):
     _patch_ring_runtime(monkeypatch)
     assert DEFAULT_BATCH_CAPACITY == 2
-    assert MAX_BATCH_REQUESTS == 8
+    assert MAX_BATCH_REQUESTS == 64
     assert BatchVerifyRing("cpu").batch_capacity == DEFAULT_BATCH_CAPACITY
     with pytest.raises(ValueError, match="batch capacity"):
         BatchVerifyRing("cpu", batch_capacity=0)

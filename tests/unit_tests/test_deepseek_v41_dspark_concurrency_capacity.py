@@ -73,26 +73,37 @@ def write_trace(directory, rows):
 
 
 class CapacityQualifierTests(unittest.TestCase):
-    def test_batch_capacity_default_range_and_implementation_three(self):
+    def test_batch_capacity_default_range_is_two_through_sixty_four(self):
         args = qualifier.parser().parse_args(["--output", "/tmp/unused"])
         self.assertEqual(args.batch_capacity, 2)
-        for value in (2, 3, 4):
+        for value in (2, 3, 6, 8, 12, 16, 64):
             self.assertEqual(qualifier.validate_batch_capacity(value), value)
-        for value in (1, 5):
-            with self.assertRaisesRegex(ValueError, "2..4"):
+        for value in (1, 65):
+            with self.assertRaisesRegex(ValueError, "2..64"):
                 qualifier.validate_batch_capacity(value)
 
-    def test_a1_partial_and_n4_four_client_budgets_are_distinct(self):
+    def test_default_and_explicit_budgets_cycle_for_many_clients(self):
         one = qualifier.build_requests(2, 1, None)
         four = qualifier.build_requests(2, 4, None)
+        six = qualifier.build_requests(2, 6, None)
+        twelve = qualifier.build_requests(2, 12, None)
+        cycled = qualifier.build_requests(2, 3, [8, 16])
         self.assertEqual(len(one), 1)
         self.assertEqual([row["max_tokens"] for row in four], [8, 16, 24, 32])
-        self.assertEqual(len({row["id"] for row in four}), 4)
-        self.assertEqual(len({row["max_tokens"] for row in four}), 4)
-        with self.assertRaisesRegex(ValueError, "1..12"):
+        self.assertEqual([row["max_tokens"] for row in six], [8, 16, 24, 32, 8, 16])
+        self.assertEqual([row["max_tokens"] for row in twelve], [8, 16, 24, 32] * 3)
+        self.assertEqual([row["max_tokens"] for row in cycled], [8, 16, 8])
+        for requests in (four, six, twelve, cycled):
+            self.assertEqual(len({row["id"] for row in requests}), len(requests))
+        self.assertEqual(len(qualifier.build_requests(2, 64, None)), 64)
+        with self.assertRaisesRegex(ValueError, "1..64"):
             qualifier.build_requests(2, 0, None)
-        with self.assertRaisesRegex(ValueError, "distinct"):
-            qualifier.build_requests(2, 2, [8, 8])
+        with self.assertRaisesRegex(ValueError, "1..64"):
+            qualifier.build_requests(2, 65, None)
+        with self.assertRaisesRegex(ValueError, "at least one"):
+            qualifier.build_requests(2, 2, [])
+        repeated = qualifier.build_requests(2, 2, [8, 8])
+        self.assertEqual([row["max_tokens"] for row in repeated], [8, 8])
 
     def test_v2_n4_full_capacity_correlates_fixed_n_fields(self):
         requests = qualifier.build_requests(2, 4, None)
@@ -133,6 +144,21 @@ class CapacityQualifierTests(unittest.TestCase):
         self.assertEqual(event["target_rows"], 24)
         self.assertEqual(event["draft_rows"], 20)
         self.assertEqual(event["request_evidence"][request["id"]]["slot"], 2)
+
+    def test_v2_trace_rows_and_lane_arrays_scale_through_n64(self):
+        request = qualifier.build_requests(2, 1, None)[0]
+        for capacity in (11, 12, 64):
+            with self.subTest(capacity=capacity), tempfile.TemporaryDirectory() as temporary:
+                reqids = [None] * capacity
+                reqids[capacity - 1] = request["id"]
+                row = trace_row(capacity, [capacity - 1], reqids)
+                result = qualifier.assess_evidence(
+                    write_trace(Path(temporary), [row]), records_for([request]), batch_capacity=capacity)
+                self.assertEqual(result["status"], "runner_evidence_correlated")
+                event = result["matched_events"][0]
+                self.assertEqual(event["target_rows"], capacity * 6)
+                self.assertEqual(event["draft_rows"], capacity * 5)
+                self.assertEqual(event["active_lanes"], [capacity - 1])
 
     def test_two_active_lanes_at_n4_do_not_prove_full_capacity(self):
         requests = qualifier.build_requests(2, 2, None)
@@ -307,6 +333,12 @@ class LauncherTests(unittest.TestCase):
             "  printf 'ARG=%s\\n' \"$@\"\n"
             "} > \"$FAKE_UV_LOG\"\n")
         fake_uv.chmod(0o755)
+        fake_python = self.bin / "python"
+        fake_python.write_text(
+            "#!/usr/bin/env bash\n"
+            "set -euo pipefail\n"
+            "printf 'ARG=%s\\n' \"$@\" > \"$FAKE_PYTHON_LOG\"\n")
+        fake_python.chmod(0o755)
         (self.root / "repo").mkdir()
 
     def tearDown(self):
@@ -317,6 +349,7 @@ class LauncherTests(unittest.TestCase):
         environment.update({
             "PATH": str(self.bin) + os.pathsep + environment["PATH"],
             "FAKE_UV_LOG": str(self.log),
+            "FAKE_PYTHON_LOG": str(self.root / "python.log"),
             "REPO": str(self.root / "repo"),
             "RUN_DIR": str(self.root / run_name),
             "PYTHON": "/data/project/.venv/bin/python",
@@ -328,12 +361,13 @@ class LauncherTests(unittest.TestCase):
         return subprocess.run([str(SCRIPTS / script), *arguments], env=self.environment(values.pop(
             "run_name", "run"), **values), text=True, capture_output=True, check=False)
 
-    def test_bash_syntax_and_fake_uv_argv_for_n2_and_n4(self):
-        syntax = subprocess.run(["bash", "-n", str(SCRIPTS / "run_tp8_dspark.sh"),
+    def test_bash_syntax_and_fake_uv_argv_accepts_every_capacity_from_two_through_sixty_four(self):
+        syntax = subprocess.run(["bash", "-n", str(SCRIPTS / "run_tp8.sh"),
+                                 str(SCRIPTS / "run_tp8_dspark.sh"),
                                  str(SCRIPTS / "run_tp8_dspark_batch.sh"),
                                  str(SCRIPTS / "run_tp8_dspark_b2.sh")], capture_output=True, text=True, check=False)
         self.assertEqual(syntax.returncode, 0, syntax.stderr)
-        for capacity in (2, 4):
+        for capacity in range(2, 65):
             with self.subTest(capacity=capacity):
                 self.log.unlink(missing_ok=True)
                 result = self.invoke("run_tp8_dspark_batch.sh", run_name=f"run-n{capacity}", MAX_NUM_SEQS=str(capacity))
@@ -356,9 +390,35 @@ class LauncherTests(unittest.TestCase):
         argv_lines = [line.removeprefix("ARG=") for line in log.splitlines() if line.startswith("ARG=")]
         self.assertEqual(argv_lines[argv_lines.index("--max-num-seqs") + 1], "2")
 
+    def test_generic_tp8_launcher_defaults_serial_and_forwards_custom_capacity(self):
+        for capacity in (None, "1", "16", "64"):
+            with self.subTest(capacity=capacity):
+                python_log = self.root / "python.log"
+                python_log.unlink(missing_ok=True)
+                values = {
+                    "run_name": f"run-tp8-{capacity or 'default'}",
+                    "PYTHON": str(self.bin / "python"),
+                    "DSV41_RECIPE_CACHE_ENABLED": "0",
+                    "DSV41_CONFIG_ONLY": "0",
+                }
+                if capacity is not None:
+                    values["MAX_NUM_SEQS"] = capacity
+                result = self.invoke("run_tp8.sh", **values)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                argv_lines = [line.removeprefix("ARG=") for line in python_log.read_text().splitlines()]
+                self.assertEqual(
+                    argv_lines[argv_lines.index("--max-num-seqs") + 1],
+                    capacity or "1",
+                )
+
     def test_invalid_capacity_and_b2_override_fail_before_uv_or_run_dir(self):
         for script, capacity in (("run_tp8_dspark_batch.sh", "1"),
-                                 ("run_tp8_dspark_batch.sh", "5"),
+                                 ("run_tp8_dspark_batch.sh", "0"),
+                                 ("run_tp8_dspark_batch.sh", "-1"),
+                                 ("run_tp8_dspark_batch.sh", "1.5"),
+                                 ("run_tp8_dspark_batch.sh", "abc"),
+                                 ("run_tp8_dspark_batch.sh", "65"),
+                                 ("run_tp8_dspark_batch.sh", "100000000000000000000"),
                                  ("run_tp8_dspark_b2.sh", "4")):
             with self.subTest(script=script, capacity=capacity):
                 self.log.unlink(missing_ok=True)
@@ -369,12 +429,32 @@ class LauncherTests(unittest.TestCase):
                 self.assertFalse(run_dir.exists())
                 self.assertIn("MAX_NUM_SEQS", result.stderr)
 
+    def test_generic_tp8_invalid_capacity_fails_before_config_only_or_run_dir(self):
+        for capacity in ("0", "-1", "1.5", "abc", "65", "100000000000000000000"):
+            with self.subTest(capacity=capacity):
+                run_dir = self.root / f"generic-must-not-exist-{capacity}"
+                result = self.invoke(
+                    "run_tp8.sh",
+                    run_name=run_dir.name,
+                    MAX_NUM_SEQS=capacity,
+                    DSV41_CONFIG_ONLY="1",
+                    DSV41_RECIPE_CACHE_ENABLED="0",
+                )
+                self.assertEqual(result.returncode, 2)
+                self.assertFalse((self.root / "python.log").exists())
+                self.assertFalse(run_dir.exists())
+                self.assertIn("MAX_NUM_SEQS", result.stderr)
+
     def test_cli_capacity_override_is_rejected_even_when_value_matches(self):
         for script, capacity, argument in (
                 ("run_tp8_dspark_batch.sh", "2", "--max-num-seqs"),
                 ("run_tp8_dspark_batch.sh", "4", "--max-num-seqs=4"),
                 ("run_tp8_dspark_batch.sh", "4", "--max_num_seqs=3"),
                 ("run_tp8_dspark_batch.sh", "4", "--max-num-se"),
+                ("run_tp8.sh", "4", "--max-num-seqs"),
+                ("run_tp8.sh", "4", "--max-num-seqs=4"),
+                ("run_tp8.sh", "4", "--max_num_seqs=3"),
+                ("run_tp8.sh", "4", "--max-num-se"),
                 ("run_tp8_dspark_b2.sh", "2", "--max-num-seqs=4")):
             with self.subTest(script=script, argument=argument):
                 self.log.unlink(missing_ok=True)

@@ -40,7 +40,7 @@ def _capacity_metadata():
         ),
     ),
 )
-def test_explicit_active_capacity_buckets_one_two_and_four(
+def test_explicit_active_preserves_small_capacity_buckets(
         requests, active, target_lengths, drafts, slots, generations, budgets):
     metadata = DSparkBatchMetadata.build(
         requests=requests,
@@ -96,6 +96,39 @@ def test_explicit_active_accepts_cpu_boolean_tensor_mask():
 
     assert metadata.request_active.tolist() == [False, True]
     assert metadata.active_request_ids == ("request-b",)
+
+
+@pytest.mark.parametrize("capacity", (3, 6, 8, 11, 12, 16, 64))
+def test_explicit_capacity_keeps_six_n_rows_and_metadata_dynamic(capacity):
+    active = [index % 2 == 0 for index in range(capacity)]
+    lengths = [1 if enabled and index % 4 == 0 else 6 if enabled else 0
+               for index, enabled in enumerate(active)]
+    drafts = [
+        [] if length <= 1 else list(range(index * 10, index * 10 + length - 1))
+        for index, length in enumerate(lengths)
+    ]
+    metadata = DSparkBatchMetadata.build(
+        requests=[f"request-{index}" if enabled else None for index, enabled in enumerate(active)],
+        active=active,
+        target_query_lengths=lengths,
+        draft_token_ids=drafts,
+        request_slots=[index if enabled else -1 for index, enabled in enumerate(active)],
+        slot_generations=[index + 1 if enabled else 0 for index, enabled in enumerate(active)],
+        remaining_output_budget=[32 if enabled else 0 for enabled in active],
+        target_start_positions=[10 + index * 20 if enabled else 0
+                                for index, enabled in enumerate(active)],
+        round_generation=11,
+    )
+    query_rows = sum(lengths)
+    source = torch.arange(query_rows * 3, dtype=torch.int32).reshape(query_rows, 3)
+
+    packed = metadata.pack_target_queries(source)
+
+    assert metadata.capacity == capacity
+    assert metadata.target_query_start_loc.tolist()[-1] == query_rows
+    assert len(metadata.request_active) == len(metadata.target_start_positions) == capacity
+    assert packed.queries.shape == (capacity, 6, 3)
+    assert torch.equal(metadata.unpack_target_queries(packed), source)
 
 
 def test_explicit_active_pack_and_unpack_keep_inactive_lanes_no_write():
@@ -162,17 +195,17 @@ def test_explicit_active_rejects_noncanonical_or_non_sentinel_lanes(overrides):
         DSparkBatchMetadata.build(**{**values, **overrides})
 
 
-def test_explicit_active_rejects_more_than_eight_lanes_and_non_boolean_mask():
+def test_explicit_active_rejects_more_than_contract_lanes_and_non_boolean_mask():
     values = {
-        "target_query_lengths": [0] * 9,
-        "draft_token_ids": [[] for _ in range(9)],
-        "request_slots": [-1] * 9,
-        "slot_generations": [0] * 9,
-        "remaining_output_budget": [0] * 9,
-        "active": [False] * 9,
+        "target_query_lengths": [0] * 65,
+        "draft_token_ids": [[] for _ in range(65)],
+        "request_slots": [-1] * 65,
+        "slot_generations": [0] * 65,
+        "remaining_output_budget": [0] * 65,
+        "active": [False] * 65,
     }
     with pytest.raises(ValueError, match="batch size"):
-        DSparkBatchMetadata.build(requests=[None] * 9, **values)
+        DSparkBatchMetadata.build(requests=[None] * 65, **values)
 
     values["active"] = torch.tensor([True, False], dtype=torch.int64)
     with pytest.raises(TypeError, match="boolean"):

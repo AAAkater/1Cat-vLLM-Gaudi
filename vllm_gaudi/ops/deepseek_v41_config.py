@@ -2,10 +2,11 @@
 """Explicit configuration contract for the bounded four-device V4.1 runner."""
 
 from vllm_gaudi import envs
-
-
-_DSPARK_BATCH_MIN_CAPACITY = 2
-_DSPARK_BATCH_MAX_CAPACITY = 4
+from vllm_gaudi.ops.deepseek_v41_capacity import (
+    MAX_DSV41_DSPARK_CAPACITY,
+    MIN_DSV41_DSPARK_CAPACITY,
+    validate_dspark_capacity,
+)
 
 
 def select_native_warmup_geometries(geometries, additional_config):
@@ -121,13 +122,11 @@ def validate_sampling(params, *, dspark=None, batch=False):
 def validate_dspark_batch_capacity(config):
     """Return the deployment capacity and reject invalid DSpark values early."""
     capacity = getattr(getattr(config, "scheduler_config", None), "max_num_seqs", None)
-    if type(capacity) is not int or not 1 <= capacity <= _DSPARK_BATCH_MAX_CAPACITY:
-        raise ValueError("DSpark max_num_seqs must be an integer in 1..4")
-    return capacity
+    return validate_dspark_capacity(capacity, allow_serial=True, name="DSpark max_num_seqs")
 
 
 def is_dspark_batch_tp8_profile(config):
-    """Return whether a 2..4 greedy TP8 x PP1 batch profile was requested.
+    """Return whether a 2..64 greedy TP8 x PP1 batch profile was requested.
 
     This is a configuration gate, not a hardware-qualification claim. The
     serial N=1 profiles retain their existing topology-specific behavior.
@@ -142,7 +141,8 @@ def is_dspark_batch_tp8_profile(config):
     if (parallel.tensor_parallel_size, parallel.pipeline_parallel_size) != (8, 1):
         return False
     capacity = getattr(scheduler, "max_num_seqs", None)
-    if type(capacity) is not int or not _DSPARK_BATCH_MIN_CAPACITY <= capacity <= _DSPARK_BATCH_MAX_CAPACITY:
+    if (type(capacity) is not int
+            or not MIN_DSV41_DSPARK_CAPACITY <= capacity <= MAX_DSV41_DSPARK_CAPACITY):
         return False
     if not hasattr(scheduler, "async_scheduling") or not hasattr(cache, "enable_prefix_caching"):
         return False
@@ -167,7 +167,7 @@ def validate_dspark_tp8_profile(config):
         if not tp8_pp1:
             return
     else:
-        # B1 keeps the existing TP2 x PP2 and TP4 x PP1 paths. Capacities 2..4
+        # B1 keeps the existing TP2 x PP2 and TP4 x PP1 paths. Concurrent capacities 2..64
         # are deliberately narrower and must not be inferred from max_num_seqs.
         if not tp8_pp1:
             raise ValueError("DSpark concurrency requires TP8 x PP1")
@@ -186,7 +186,8 @@ def validate_dspark_tp8_profile(config):
         if not is_dspark_batch_tp8_profile(config):
             raise ValueError(
                 "DSpark concurrency requires the greedy TP8 x PP1, prefix-off, synchronous-scheduling "
-                f"profile with max_num_seqs in 2..4 (got {max_num_seqs})")
+                f"profile with max_num_seqs in {MIN_DSV41_DSPARK_CAPACITY}..{MAX_DSV41_DSPARK_CAPACITY} "
+                f"(got {max_num_seqs})")
     enabled = [name for name in _DSPARK_TP8_DEFAULTS if getattr(envs, name)]
     if enabled:
         raise ValueError(
@@ -235,9 +236,11 @@ def configure(config):
                 raise ValueError("V4.1 DSpark prefix caching requires the engine's owned speculative-state ABI")
     if envs.VLLM_HPU_DSV41_BATCH_DECODE:
         if (not paged or not envs.VLLM_HPU_DSV41_GRAPH_REPLAY or not envs.VLLM_HPU_DSV41_RUNTIME_INDEXER
-                or envs.VLLM_HPU_DSV41_DSPARK or not 1 <= config.scheduler_config.max_num_seqs <= 64):
+                or envs.VLLM_HPU_DSV41_DSPARK
+                or not 1 <= config.scheduler_config.max_num_seqs <= MAX_DSV41_DSPARK_CAPACITY):
             raise ValueError(
-                "V4.1 request batches require paged native runtime-position decode, DSpark off, capacity1..64")
+                "V4.1 request batches require paged native runtime-position decode, DSpark off, "
+                f"capacity 1..{MAX_DSV41_DSPARK_CAPACITY}")
         if uses_v2(config) and config.scheduler_config.scheduler_cls is None:
             # Select through the normal scheduler interface, independently
             # of whether another HPU utility happened to import first.

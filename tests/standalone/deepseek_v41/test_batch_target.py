@@ -2,7 +2,7 @@
 """CPU contracts for the packed B2 DSpark target stage."""
 from __future__ import annotations
 
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 
 import pytest
 import torch
@@ -543,7 +543,13 @@ def _fake_stage(lengths=(1, 6), slots=(0, 1)):
 def test_prepared_decoder_target_method_forwards_fixed_args_and_aux(monkeypatch, capacity):
     from vllm_gaudi.ops.deepseek_v41_batch_speculation import DSparkBatchMetadata
 
-    calls = []
+    attention_calls = []
+    target_attention_calls = []
+    hc_pre_calls = []
+    hc_post_calls = []
+    norm_calls = []
+    quant_calls = []
+    moe_calls = []
 
     class FakeAttention(nn.Module):
         def __init__(self):
@@ -551,10 +557,13 @@ def test_prepared_decoder_target_method_forwards_fixed_args_and_aux(monkeypatch,
             self.ratio = 0
             self.batch_state = _LaneState()
             self.swa = self.batch_state.swa
+            self._fused_qkv_quantized = False
+            self._fused_qkv_weight = None
+            self.shared_decode_metadata = False
 
         def forward_batch_target(self, value, positions, slots, pages, selected, candidates,
                                  main_done, index_done, **kwargs):
-            calls.append({
+            attention_calls.append({
                 "value_shape": tuple(value.shape),
                 "positions_shape": tuple(positions.shape),
                 "slots": slots.clone(),
@@ -568,27 +577,72 @@ def test_prepared_decoder_target_method_forwards_fixed_args_and_aux(monkeypatch,
             return value, selected, candidates, main_done, index_done
 
     class FakeMoE(nn.Module):
-        n256_fused = False
+        n256_fp8 = True
+        n256_fused = True
+        shared_gate_up_channel = torch.ones(1)
         concurrent_moe_rows = 0
 
         def forward(self, value, image_mask, **kwargs):
+            moe_calls.append({
+                "rows": value.shape[0],
+                "decode": kwargs.get("decode"),
+                "ordinary_decode": kwargs.get("ordinary_decode", False),
+            })
             return value
 
     def fake_hc_pre(residual, previous_pre, *args, **kwargs):
+        hc_pre_calls.append({
+            "rows": residual.shape[0],
+            "decode": kwargs.get("decode"),
+            "request_batch": kwargs.get("request_batch"),
+        })
         return residual, previous_pre, residual, residual
 
     def fake_hc_post(value, residual, post, comb):
+        hc_post_calls.append(value.shape[0])
         return value + residual
+
+    def fake_rms_norm(value, *args, **kwargs):
+        norm_calls.append(value.shape[0])
+        return value
+
+    def fake_ffn_dual_quant(value, weight, eps):
+        quant_calls.append(value.shape[0])
+        scale = torch.ones((value.shape[0],), dtype=torch.float32)
+        return value, value, scale, value, scale
 
     monkeypatch.setattr(program_module, "hc_pre", fake_hc_pre)
     monkeypatch.setattr(program_module, "hc_post", fake_hc_post)
-    monkeypatch.setattr(program_module, "rms_norm", lambda value, *args, **kwargs: value)
+    monkeypatch.setattr(program_module, "rms_norm", fake_rms_norm)
+    monkeypatch.setattr(program_module, "decode_ffn_dual_quant", fake_ffn_dual_quant)
     monkeypatch.setattr(program_module, "draft_context_state", lambda residual, *args, **kwargs: residual.mean(1))
     monkeypatch.setattr(program_module.gaudi_envs, "VLLM_HPU_DSV41_MHC_SCHEDULE", False)
 
     layer = SimpleNamespace(
+        layer=1,
         draft=False,
+        draft_mhc=False,
         collect_target_state=True,
+        dspark_mhc_deferred=False,
+        dspark_peer_post_collapse=False,
+        dspark_moe_peer_post=False,
+        dspark_peer_post_norm=False,
+        mhc_post_collapse=True,
+        mhc_interlayer_collapse=True,
+        mhc_interlayer_bf16=True,
+        ffn_dual_quant=True,
+        ffn_bf16_quant=True,
+        mhc_control_mme=False,
+        decode_attention_norm_quant=False,
+        dspark_input_norm=False,
+        hc_attn_fn_packed=torch.ones(1),
+        hc_ffn_fn_packed=torch.ones(1),
+        hc_attn_fn_mme=None,
+        hc_ffn_fn_mme=None,
+        hc_attn_fn_fp8=None,
+        hc_attn_fn_fp8_channel=None,
+        hc_ffn_fn_fp8=None,
+        hc_ffn_fn_fp8_channel=None,
         weights=SimpleNamespace(
             hc_attn_fn=torch.empty(1),
             hc_attn_scale=torch.empty(1),
@@ -610,6 +664,33 @@ def test_prepared_decoder_target_method_forwards_fixed_args_and_aux(monkeypatch,
         batch_ffn_fusion=False,
         moe=FakeMoE(),
     )
+    for method in (
+        "_c6_slice_path_error",
+        "_forward_c6_attention_prefix",
+        "_forward_c6_post_attention",
+        "_target_c6_attention_prefix",
+        "_target_c6_post_attention",
+    ):
+        setattr(layer, method, MethodType(getattr(PreparedDecoderLayer, method), layer))
+
+    def target_attention(value, positions, slots, pages, selected, candidates,
+                         main_done, index_done, row_valid, ready_outputs):
+        target_attention_calls.append((value.shape[0], tuple(row_valid.shape)))
+        return layer.attention.forward_batch_target(
+            value,
+            positions,
+            slots,
+            pages,
+            selected,
+            candidates,
+            main_done,
+            index_done,
+            row_valid=row_valid,
+            request_lengths=(6, ) * capacity,
+            request_slots=tuple(range(capacity)),
+            ready_outputs=ready_outputs,
+        )
+
     lengths = tuple(1 if lane % 2 == 0 else 6 for lane in range(capacity))
     starts = tuple(100 + lane * 100 for lane in range(capacity))
     metadata = DSparkBatchMetadata.build(
@@ -648,6 +729,7 @@ def test_prepared_decoder_target_method_forwards_fixed_args_and_aux(monkeypatch,
         batch.row_valid,
         (6, ) * capacity,
         batch.host_request_slots,
+        target_attention=target_attention,
     )
     residual, returned_pre, returned_selected, returned_candidates, _, _, aux = result
     assert residual.shape == (rows, 4, 4)
@@ -656,12 +738,26 @@ def test_prepared_decoder_target_method_forwards_fixed_args_and_aux(monkeypatch,
     assert torch.equal(returned_candidates, candidates)
     assert aux.shape == (rows, 4)
     assert torch.equal(residual[~batch.row_valid], torch.zeros_like(residual[~batch.row_valid]))
-    assert len(calls) == 1
-    assert calls[0]["value_shape"] == (rows, 4, 4)
-    assert calls[0]["pages_shape"] == (rows, 4)
-    assert calls[0]["request_lengths"] == (6, ) * capacity
-    assert calls[0]["request_slots"] == tuple(range(capacity))
-    assert torch.equal(calls[0]["row_valid"], batch.row_valid)
+
+    # Attention remains one packed 6*N call.  The serial C6 prefix/suffix
+    # math and MoE consume exactly one six-row lane at a time.
+    assert target_attention_calls == [(rows, (rows, ))]
+    assert len(attention_calls) == 1
+    assert attention_calls[0]["value_shape"] == (rows, 4, 4)
+    assert attention_calls[0]["positions_shape"] == (rows, )
+    assert attention_calls[0]["pages_shape"] == (rows, 4)
+    assert attention_calls[0]["request_lengths"] == (6, ) * capacity
+    assert attention_calls[0]["request_slots"] == tuple(range(capacity))
+    assert torch.equal(attention_calls[0]["row_valid"], batch.row_valid)
+
+    assert [call["rows"] for call in hc_pre_calls] == [6] * (2 * capacity)
+    assert all(call["decode"] is True for call in hc_pre_calls)
+    assert all(call["request_batch"] is None for call in hc_pre_calls)
+    assert hc_post_calls == [6] * (2 * capacity)
+    assert norm_calls == [6] * capacity
+    assert quant_calls == [6] * capacity
+    assert [call["rows"] for call in moe_calls] == [6] * capacity
+    assert all(call["decode"] is True and call["ordinary_decode"] is False for call in moe_calls)
 
 
 def test_compiled_target_group_uses_one_12row_loop_and_mixed_mask():

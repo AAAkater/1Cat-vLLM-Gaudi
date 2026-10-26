@@ -1002,6 +1002,13 @@ class PreparedMoE(nn.Module):
                     if self.n256_fused_reduce and ordinary_decode
                     else torch.ops.custom_op.custom_deepseek_v41_expert_n256_moe_prequant_fused_fp8_gaudi2
                 )
+                if (not torch.compiler.is_compiling() and gaudi_envs.VLLM_HPU_DSV41_DSPARK
+                        and tile_value.device.type == "hpu" and tile_value.shape[0] == 6
+                        and op is torch.ops.custom_op.custom_deepseek_v41_expert_n256_moe_prequant_fused_fp8_gaudi2):
+                    from vllm_gaudi.ops.deepseek_v41_c6_recipe import c6_prequant_moe
+
+                    return c6_prequant_moe(
+                        *operands, channel13, channel2, quantized, activation_scale, bool(self.normal_scales))
                 return op(*operands, channel13, channel2, quantized, activation_scale, bool(self.normal_scales))
             op = (
                 torch.ops.custom_op.custom_deepseek_v41_expert_n256_moe_direct_finalize_prefetch_w2_fp8_gaudi2
@@ -1397,7 +1404,38 @@ def draft_context_state(residual, ring_capacity, *, grouped_prefill):
     return residual.mean(1)
 
 
+def decode_bf16_identity(value):
+    """Apply the replay-visible BF16 boundary used between C6 layers."""
+    if value.device.type != "hpu":
+        return value
+    if not hasattr(torch.ops.custom_op, "custom_deepseek_v41_bf16_identity_gaudi2"):
+        raise RuntimeError("C6 layer rounding requires the BF16 identity native operator")
+    shape = value.shape
+    return torch.ops.custom_op.custom_deepseek_v41_bf16_identity_gaudi2(
+        value.reshape(1, -1).contiguous()).reshape(shape)
+
+
+def decode_mhc_post_collapse(value, residual, post, comb, new_pre):
+    """Fuse the C6 attention post/collapse while preserving its BF16 boundary."""
+    return torch.ops.custom_op.custom_deepseek_v41_mhc_post_collapse_gaudi2(
+        value.contiguous(), residual.contiguous(), post.contiguous(), comb.contiguous(), new_pre.contiguous())
+
+
+def decode_mhc_publish_collapse(value, residual, post, comb, pre_mix):
+    """Publish one C6 layer's BF16 residual to the immediately following layer."""
+    return torch.ops.custom_op.custom_deepseek_v41_mhc_post_collapse_gaudi2(
+        value.contiguous(), residual.contiguous(), post.contiguous(), comb.contiguous(), pre_mix.contiguous())
+
+
+def decode_ffn_dual_quant(value, weight, eps):
+    """Produce the C6 routed and shared N256 FP8 operands together."""
+    return torch.ops.custom_op.custom_deepseek_v41_ffn_norm_dual_quant_gaudi2(
+        value.contiguous(), weight, eps)
+
+
 class PreparedDecoderLayer(nn.Module):
+    _target_c6_slices = True
+
     def __init__(
         self,
         weights,
@@ -1590,6 +1628,266 @@ class PreparedDecoderLayer(nn.Module):
         self.hc_attn_fn_swizzled = self.hc_ffn_fn_swizzled = None
         self.hc_attn_fn_bf16 = self.hc_ffn_fn_bf16 = None
 
+    def _c6_slice_path_error(self):
+        """Return why the fixed six-row serial math cannot be shared, if any."""
+        if self.draft:
+            return "draft layers do not own the target C6 serial path"
+        unsupported = (
+            ("deferred mHC", self.dspark_mhc_deferred),
+            ("mHC gate packet", gaudi_envs.VLLM_HPU_DSV41_DSPARK_MHC_GATE_PACKET),
+            ("mHC post statistics", gaudi_envs.VLLM_HPU_DSV41_DSPARK_MHC_POST_STATS),
+            ("DSpark peer/post/collapse", self.dspark_peer_post_collapse),
+            ("DSpark MoE peer/post", self.dspark_moe_peer_post),
+            ("DSpark peer/post/norm", self.dspark_peer_post_norm),
+            ("peer/post/collapse", gaudi_envs.VLLM_HPU_DSV41_PEER_POST_COLLAPSE),
+            ("peer/post/norm", gaudi_envs.VLLM_HPU_DSV41_PEER_POST_NORM),
+            ("scheduled peer", gaudi_envs.VLLM_HPU_DSV41_DSPARK_SCHEDULED_PEER),
+            ("layer-main split", gaudi_envs.VLLM_HPU_DSV41_DSPARK_LAYER_MAIN_SPLIT),
+            ("layer-main reuse", gaudi_envs.VLLM_HPU_DSV41_DSPARK_LAYER_MAIN_REUSE),
+            ("DSpark WO handoff", gaudi_envs.VLLM_HPU_DSV41_DSPARK_WO_HANDOFF),
+            ("DSpark query prologue", gaudi_envs.VLLM_HPU_DSV41_DSPARK_Q_PROLOGUE),
+            ("DSpark C1 dense chain", gaudi_envs.VLLM_HPU_DSV41_DSPARK_C1_DENSE_CHAIN),
+            ("DSpark FP8 QKV prologue", gaudi_envs.VLLM_HPU_DSV41_DSPARK_FP8_QKV_PROLOGUE),
+            ("split DSpark FP8 QKV prologue", gaudi_envs.VLLM_HPU_DSV41_DSPARK_FP8_QKV_PROLOGUE_SPLIT),
+            ("DSpark input FP8", gaudi_envs.VLLM_HPU_DSV41_DSPARK_INPUT_FP8),
+            ("DSpark output FP8", gaudi_envs.VLLM_HPU_DSV41_DSPARK_OUTPUT_FP8),
+            ("packed decode metadata",
+             getattr(gaudi_envs, "VLLM_HPU_DSV4_PACKED_DECODE_METADATA", False)),
+        )
+        for name, enabled in unsupported:
+            if enabled:
+                return f"{name} is not supported by the shared C6 slice path"
+        if not getattr(self, "mhc_post_collapse", False):
+            return "C6 target requires the mHC post/collapse native operator"
+        if not getattr(self, "mhc_interlayer_collapse", False):
+            return "C6 target requires the inter-layer collapse native operator"
+        if not getattr(self, "mhc_interlayer_bf16", False):
+            return "C6 target requires the BF16 inter-layer collapse boundary"
+        if not getattr(self.moe, "n256_fp8", False) or not getattr(self.moe, "n256_fused", False):
+            return "C6 target requires the fused N256 FP8 MoE"
+        return None
+
+    def _forward_c6_attention_prefix(
+        self,
+        residual,
+        pre_mix,
+        positions,
+        image_mask,
+        engram_rows=None,
+        *,
+        collapse_handoff=None,
+        active_mask=None,
+        target_ring_capacity=None,
+    ):
+        """Run the serial C6 pre-attention mHC/Engram/norm arithmetic."""
+        if residual.shape[0] != 6 or pre_mix.shape[0] != 6 or positions.numel() != 6:
+            raise ValueError("shared C6 attention prefix requires exactly six rows")
+        w = self.weights
+        collapsed_attention = None if collapse_handoff is None else collapse_handoff.pop(self.layer, None)
+        if hasattr(w, "engram") and collapsed_attention is not None:
+            raise RuntimeError("An Engram update invalidates a preceding residual collapse")
+        if hasattr(w, "engram"):
+            if engram_rows is None:
+                raise RuntimeError("Engram layer requires its completed host gather and DMA generation")
+            if engram_rows.shape[0] != 6:
+                raise ValueError("shared C6 Engram rows must match the six-row lane")
+            local_rows = engram_rows if engram_rows.dtype == torch.bfloat16 else unpack_swa(engram_rows, 256)
+            rows = self.all_gather(local_rows, dim=1)
+            kv = linear(rows.flatten(1), w.engram.wkv)
+            update = (torch.ops.custom_op.custom_deepseek_v41_engram_update_bf16_gaudi2
+                      if getattr(self, "decode_engram_update", False)
+                      and residual.device.type == "hpu" else engram_update)
+            active = ~image_mask if active_mask is None else active_mask & ~image_mask
+            residual = update(residual, kv, w.engram.q_weight, w.engram.k_weight, active, self.eps)
+            del kv, rows, local_rows
+
+        target_state = None
+        if self.collect_target_state:
+            capacity = (self.attention.swa.shape[0] if target_ring_capacity is None else target_ring_capacity)
+            target_state = draft_context_state(residual, capacity, grouped_prefill=False)
+            if active_mask is not None:
+                target_state = target_state.masked_fill(~active_mask[:, None], 0)
+
+        value, new_pre, post, comb = hc_pre(
+            residual,
+            pre_mix,
+            w.hc_attn_fn,
+            w.hc_attn_scale,
+            w.hc_attn_base,
+            self.eps,
+            self.hc_eps,
+            self.iterations,
+            packed_fn=self.hc_attn_fn_packed if not self.draft or self.draft_mhc else None,
+            decode=True,
+            collapsed_input=collapsed_attention,
+            batch_control_reuse=self.batch_control_reuse,
+            control_mme_weight=self.hc_attn_fn_mme if self.mhc_control_mme else None,
+            control_epilogue=self.draft_mhc,
+            control_fp8_weight=((self.hc_attn_fn_fp8, self.hc_attn_fn_fp8_channel)
+                                if self.hc_attn_fn_fp8 is not None else None),
+        )
+        input_prequant = None
+        input_roundtrip = None
+        if (gaudi_envs.VLLM_HPU_DSV41_DSPARK_NORM_ROUNDTRIP and value.dtype == torch.bfloat16
+                and self.attention._fused_qkv_quantized and self.attention._fused_qkv_weight is not None
+                and self.attention._fused_qkv_weight.dtype == torch.bfloat16
+                and "fused_qkv_channel" not in self.attention._buffers
+                and "dspark_hw_qkv" not in self.attention._buffers):
+            value, input_roundtrip = torch.ops.custom_op.custom_deepseek_v41_norm_roundtrip_bf16_gaudi2(
+                value.contiguous(), w.attn_norm.weight, self.eps)
+        elif (self.decode_attention_norm_quant and value.dtype == torch.bfloat16
+              and "fused_qkv_channel" in self.attention._buffers):
+            norm_quant = torch.ops.custom_op.custom_deepseek_v41_attention_norm_quant_gaudi2
+            if gaudi_envs.VLLM_HPU_DSV41_DSPARK_INPUT_QUANT_REMAT:
+                norm_quant = torch.ops.custom_op.custom_deepseek_v41_attention_norm_quant_gaudi2_remat
+            value, quantized, activation_scale = norm_quant(
+                value.contiguous(), w.attn_norm.weight, self.eps)
+            input_prequant = quantized, activation_scale
+        else:
+            value = rms_norm(value, w.attn_norm.weight, self.eps,
+                             native_decode=self.dspark_input_norm)
+        if collapsed_attention is not None and input_prequant is None:
+            value = value.to(residual.dtype)
+        schedule = gaudi_envs.VLLM_HPU_DSV41_MHC_SCHEDULE and not self.draft
+        return value, new_pre, post, comb, target_state, input_prequant, input_roundtrip, schedule
+
+    @torch._dynamo.disable
+    def _target_c6_attention_prefix(self, *args, **kwargs):
+        """Keep target-only C6 prefix math out of the compiled target group."""
+        return self._forward_c6_attention_prefix(*args, **kwargs)
+
+    def _forward_c6_post_attention(
+        self,
+        value,
+        residual,
+        new_pre,
+        post,
+        comb,
+        image_mask,
+        *,
+        schedule,
+        fp8_decode,
+        collapse_handoff,
+        publish_collapse,
+    ):
+        """Run the serial C6 post-attention mHC/FFN norm/MoE/collapse arithmetic."""
+        if value.shape[0] != 6 or residual.shape[0] != 6:
+            raise ValueError("shared C6 attention suffix requires exactly six rows")
+        w = self.weights
+        collapsed_ffn = None
+        if self.mhc_post_collapse and value.device.type == "hpu":
+            residual, collapsed_ffn = decode_mhc_post_collapse(value, residual, post, comb, new_pre)
+        else:
+            residual = hc_post(value, residual, post, comb)
+
+        value, pre_mix, post, comb = hc_pre(
+            residual,
+            new_pre,
+            w.hc_ffn_fn,
+            w.hc_ffn_scale,
+            w.hc_ffn_base,
+            self.eps,
+            self.hc_eps,
+            self.iterations,
+            packed_fn=self.hc_ffn_fn_packed if not self.draft or self.draft_mhc else None,
+            decode=True,
+            collapsed_input=collapsed_ffn,
+            batch_control_reuse=self.batch_control_reuse,
+            control_mme_weight=self.hc_ffn_fn_mme if self.mhc_control_mme else None,
+            control_epilogue=self.draft_mhc,
+            control_fp8_weight=((self.hc_ffn_fn_fp8, self.hc_ffn_fn_fp8_channel)
+                                if self.hc_ffn_fn_fp8 is not None else None),
+        )
+        if self.ffn_dual_quant and getattr(self.moe, "shared_gate_up_channel", None) is not None:
+            if self.ffn_bf16_quant and value.shape[0] == 1:
+                normalized, quantized, activation_scale, shared_q, shared_scale = (
+                    torch.ops.custom_op.custom_deepseek_v41_ffn_norm_dual_bf16_quant_gaudi2(
+                        value.contiguous(), w.ffn_norm.weight, self.eps))
+            else:
+                normalized, quantized, activation_scale, shared_q, shared_scale = decode_ffn_dual_quant(
+                    value, w.ffn_norm.weight, self.eps)
+            shared_prequant = shared_q, shared_scale
+        else:
+            normalized, quantized, activation_scale = (
+                torch.ops.custom_op.custom_deepseek_v41_ffn_norm_quant_gaudi2(
+                    value.contiguous(), w.ffn_norm.weight, self.eps))
+            shared_prequant = None
+        value = self.moe(
+            normalized,
+            image_mask,
+            ready_outputs=(post, comb) if schedule else (),
+            fp8_decode=fp8_decode,
+            decode=True,
+            prequant=(quantized, activation_scale),
+            shared_prequant=shared_prequant,
+            deferred_output=False,
+        )
+        if (publish_collapse and collapse_handoff is not None and self.mhc_interlayer_collapse
+                and value.device.type == "hpu"):
+            residual, collapsed = decode_mhc_publish_collapse(value, residual, post, comb, pre_mix)
+            collapse_handoff[self.layer + 1] = collapsed
+        else:
+            residual = hc_post(value, residual, post, comb)
+        return residual, pre_mix
+
+    @torch._dynamo.disable
+    def _target_c6_post_attention(self, *args, **kwargs):
+        """Keep target-only C6 suffix math out of the compiled target group."""
+        return self._forward_c6_post_attention(*args, **kwargs)
+
+    def _forward_c6_slice(
+        self,
+        residual,
+        pre_mix,
+        positions,
+        image_mask,
+        engram_rows,
+        *,
+        fp8_decode,
+        selected_main,
+        decode_metadata,
+        collapse_handoff,
+        publish_collapse,
+    ):
+        prefix = self._forward_c6_attention_prefix(
+            residual,
+            pre_mix,
+            positions,
+            image_mask,
+            engram_rows,
+            collapse_handoff=collapse_handoff,
+        )
+        value, new_pre, post, comb, target_state, input_prequant, input_roundtrip, schedule = prefix
+        attention_kwargs = {"decode": True}
+        if input_prequant is not None:
+            attention_kwargs["input_prequant"] = input_prequant
+        if input_roundtrip is not None:
+            attention_kwargs["input_roundtrip"] = input_roundtrip
+        if selected_main is not None and (
+                getattr(self.attention, "shared_main_mla", False)
+                or (getattr(self.attention, "dspark_layer_main_reuse", False)
+                    or getattr(self.attention, "dspark_layer_main_split", False)) and 2 <= value.shape[0] <= 6):
+            attention_kwargs["selected_main"] = selected_main
+        if decode_metadata is not None and getattr(self.attention, "shared_decode_metadata", False):
+            attention_kwargs["decode_metadata"] = decode_metadata
+        if schedule:
+            value = self.attention(value, positions, ready_outputs=(post, comb), **attention_kwargs)
+        else:
+            value = self.attention(value, positions, **attention_kwargs)
+        residual, pre_mix = self._forward_c6_post_attention(
+            value,
+            residual,
+            new_pre,
+            post,
+            comb,
+            image_mask,
+            schedule=schedule,
+            fp8_decode=fp8_decode,
+            collapse_handoff=collapse_handoff,
+            publish_collapse=publish_collapse,
+        )
+        return residual, pre_mix, target_state
+
     @prefill_span("layer")
     def forward(
         self,
@@ -1610,6 +1908,21 @@ class PreparedDecoderLayer(nn.Module):
         memory_ready=None,
     ):
         w = self.weights
+        if (decode and not prefill_sequence and residual.shape[0] == 6
+                and prefill_router_tokens == 0 and memory_ready is None
+                and self._c6_slice_path_error() is None):
+            return self._forward_c6_slice(
+                residual,
+                pre_mix,
+                positions,
+                image_mask,
+                engram_rows,
+                fp8_decode=fp8_decode,
+                selected_main=selected_main,
+                decode_metadata=decode_metadata,
+                collapse_handoff=collapse_handoff,
+                publish_collapse=publish_collapse,
+            )
         deferred_gates = (self.dspark_mhc_deferred and decode and not self.draft
                           and 2 <= residual.shape[0] <= 6 and self.mhc_control_mme)
         post_stats = (gaudi_envs.VLLM_HPU_DSV41_DSPARK_MHC_POST_STATS and decode and not self.draft
@@ -2232,14 +2545,16 @@ class PreparedDecoderLayer(nn.Module):
         row_valid,
         request_lengths,
         request_slots,
+        *,
+        target_attention=None,
+        collapse_handoffs=None,
+        publish_collapse=False,
     ):
-        """Run one fixed-capacity target round under request-batch math.
+        """Run one packed target layer through serial C6 request-local math.
 
-        Each lane owns six physical rows; logical query counts are masked
-        by row_valid.  The method intentionally
-        avoids the C2-C6-only fused branches in :meth:`forward` and the
-        speculative rejection in :meth:`forward_batch`; all three DSpark target
-        state producers still emit their per-row context state for verify.
+        Attention remains one packed ``6*N`` call.  Every other mHC/Engram/norm,
+        FFN and collapse producer consumes one fixed six-row lane at a time so
+        it follows the same arithmetic as the serial C6 decoder layer.
         """
         if self.draft:
             raise RuntimeError("Draft layers cannot run in the target batch stage")
@@ -2248,44 +2563,52 @@ class PreparedDecoderLayer(nn.Module):
             raise ValueError("DSpark target rows must equal six times the fixed capacity")
         if tuple(request_lengths) != (6, ) * capacity:
             raise ValueError("DSpark target graph is fixed at six physical rows per request")
+        if target_attention is None:
+            raise RuntimeError("DSpark target attention requires the target program's compiled wrapper")
+        error = self._c6_slice_path_error()
+        if error is not None:
+            raise RuntimeError(error)
         active = row_valid.to(torch.bool) & (slots >= 0)
+        if collapse_handoffs is None:
+            collapse_handoffs = tuple({} for _ in range(capacity))
+        elif len(collapse_handoffs) != capacity:
+            raise ValueError("DSpark target collapse handoffs must match the fixed capacity")
 
-        w = self.weights
-        if hasattr(w, "engram"):
-            if engram_rows is None:
-                raise RuntimeError("Batched target Engram requires completed request-owned rows")
-            local = engram_rows if engram_rows.dtype == torch.bfloat16 else unpack_swa(engram_rows, 256)
-            rows = self.all_gather(local, dim=1)
-            kv = linear(rows.flatten(1), w.engram.wkv)
-            residual = engram_update(residual, kv, w.engram.q_weight, w.engram.k_weight,
-                                     active & ~image_mask, self.eps)
-
-        target_state = None
-        if self.collect_target_state:
-            # The batch bank is larger than one request's six rows; retaining
-            # that full ring length keeps every real row instead of applying
-            # the single-request tail crop.
-            ring_capacity = self.attention.batch_state.swa.shape[0]
-            target_state = draft_context_state(residual, ring_capacity, grouped_prefill=False)
-            target_state = target_state.masked_fill(~active[:, None], 0)
-
-        value, new_pre, post, comb = hc_pre(
-            residual,
-            pre_mix,
-            w.hc_attn_fn,
-            w.hc_attn_scale,
-            w.hc_attn_base,
-            self.eps,
-            self.hc_eps,
-            self.iterations,
-            request_batch=True,
-            batch_control_reuse=self.batch_control_reuse,
-            batch_control_prefetch=self.batch_control_prefetch,
-            packed_fn=self.hc_attn_fn_packed if self.batch_mhc_fusion else None,
-        )
-        schedule = gaudi_envs.VLLM_HPU_DSV41_MHC_SCHEDULE
-        result = self.attention.forward_batch_target(
-            rms_norm(value, w.attn_norm.weight, self.eps, request_batch=True),
+        attention_values = []
+        new_pres = []
+        posts = []
+        combs = []
+        target_states = []
+        schedules = []
+        for lane in range(capacity):
+            start = lane * 6
+            stop = start + 6
+            lane_slice = slice(start, stop)
+            lane_engram = (engram_rows[lane_slice] if engram_rows is not None and len(engram_rows) else None)
+            prefix = self._target_c6_attention_prefix(
+                residual[lane_slice],
+                pre_mix[lane_slice],
+                positions[lane_slice],
+                image_mask[lane_slice],
+                lane_engram,
+                collapse_handoff=collapse_handoffs[lane],
+                active_mask=active[lane_slice],
+                target_ring_capacity=(self.attention.batch_state.swa.shape[0]
+                                      if self.collect_target_state else None),
+            )
+            value, new_pre, post, comb, target_state, _, _, schedule = prefix
+            attention_values.append(value)
+            new_pres.append(new_pre)
+            posts.append(post)
+            combs.append(comb)
+            target_states.append(target_state)
+            schedules.append(schedule)
+        if any(schedule != schedules[0] for schedule in schedules):
+            raise RuntimeError("C6 target lanes disagree on the static mHC schedule")
+        schedule = schedules[0]
+        ready_outputs = (torch.cat(posts), torch.cat(combs)) if schedule else ()
+        result = target_attention(
+            torch.cat(attention_values),
             positions,
             slots,
             pages,
@@ -2293,46 +2616,37 @@ class PreparedDecoderLayer(nn.Module):
             candidates,
             main_ready,
             index_ready,
-            row_valid=active,
-            request_lengths=request_lengths,
-            request_slots=request_slots,
-            ready_outputs=(post, comb) if schedule else (),
+            active,
+            ready_outputs,
         )
-        value, selected, candidates, main_ready, index_ready = result
-        residual = hc_post(value, residual, post, comb)
-
-        value, pre_mix, post, comb = hc_pre(
-            residual,
-            new_pre,
-            w.hc_ffn_fn,
-            w.hc_ffn_scale,
-            w.hc_ffn_base,
-            self.eps,
-            self.hc_eps,
-            self.iterations,
-            request_batch=True,
-            batch_control_reuse=self.batch_control_reuse,
-            batch_control_prefetch=self.batch_control_prefetch,
-            packed_fn=self.hc_ffn_fn_packed if self.batch_mhc_fusion else None,
-        )
-        prequant = None
-        if (self.batch_ffn_fusion and self.moe.n256_fused
-                and not (value.shape[0] == 64 and self.moe.concurrent_moe_rows)):
-            value, quantized, activation_scale = torch.ops.custom_op.custom_deepseek_v41_ffn_norm_quant_gaudi2(
-                value.contiguous(), w.ffn_norm.weight, self.eps)
-            prequant = quantized, activation_scale
-        else:
-            value = rms_norm(value, w.ffn_norm.weight, self.eps, request_batch=True)
-        value = self.moe(
-            value,
-            image_mask,
-            ready_outputs=(post, comb) if schedule else (),
-            ordinary_decode=True,
-            prequant=prequant,
-        )
-        residual = hc_post(value, residual, post, comb)
+        attention_value, selected, candidates, main_ready, index_ready = result
+        residual_lanes = []
+        pre_mix_lanes = []
+        for lane in range(capacity):
+            start = lane * 6
+            stop = start + 6
+            lane_slice = slice(start, stop)
+            lane_residual, lane_pre_mix = self._target_c6_post_attention(
+                attention_value[lane_slice],
+                residual[lane_slice],
+                new_pres[lane],
+                posts[lane],
+                combs[lane],
+                image_mask[lane_slice],
+                schedule=schedule,
+                fp8_decode=False,
+                collapse_handoff=collapse_handoffs[lane],
+                publish_collapse=publish_collapse,
+            )
+            residual_lanes.append(lane_residual)
+            pre_mix_lanes.append(lane_pre_mix)
+        residual = torch.cat(residual_lanes)
+        pre_mix = torch.cat(pre_mix_lanes)
+        target_state = torch.cat(target_states) if self.collect_target_state else None
         residual = residual.masked_fill(~active[:, None, None], 0)
         pre_mix = pre_mix.masked_fill(~active[:, None], 0)
+        if target_state is not None:
+            target_state = target_state.masked_fill(~active[:, None], 0)
         return residual, pre_mix, selected, candidates, main_ready, index_ready, target_state
 
 
@@ -3332,10 +3646,7 @@ class PreparedLayerGroup(nn.Module):
                     continue
                 # Preserve the same BF16 residual boundary as separate layer
                 # recipes; cross-layer fusion otherwise changes cached KV.
-                shape = residual.shape
-                residual = torch.ops.custom_op.custom_deepseek_v41_bf16_identity_gaudi2(
-                    residual.reshape(1, -1).contiguous()
-                ).reshape(shape)
+                residual = decode_bf16_identity(residual)
         if gaudi_envs.VLLM_HPU_DSV41_MHC_GATES_FUSED:
             # The last layer's pre gate is a narrow view into one packed
             # kernel output. Materialize it at the recipe boundary because

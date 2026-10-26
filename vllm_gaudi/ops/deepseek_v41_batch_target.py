@@ -17,8 +17,10 @@ from types import SimpleNamespace
 
 import torch
 
+from vllm_gaudi.ops.deepseek_v41_capacity import MIN_DSV41_DSPARK_CAPACITY, validate_dspark_capacity
 
-TARGET_REQUESTS = 2
+
+TARGET_REQUESTS = MIN_DSV41_DSPARK_CAPACITY
 TARGET_ROWS_PER_REQUEST = 6
 TARGET_ROWS = TARGET_REQUESTS * TARGET_ROWS_PER_REQUEST
 TARGET_REQUEST_OFFSETS = (0, TARGET_ROWS_PER_REQUEST, TARGET_ROWS)
@@ -64,8 +66,7 @@ def _unique_host_indices(values: list[int]) -> list[int]:
 
 def target_rows_for_capacity(capacity: int) -> int:
     """Return the fixed physical target-row count for one capacity."""
-    if isinstance(capacity, bool) or not isinstance(capacity, int) or capacity < 1:
-        raise ValueError("target batch capacity must be a positive integer")
+    validate_dspark_capacity(capacity, allow_serial=True, name="target batch capacity")
     return capacity * TARGET_ROWS_PER_REQUEST
 
 

@@ -371,12 +371,12 @@ def test_invalid_batch_shapes_and_values_are_rejected():
     assert_value_error(
         lambda: DSparkBatchMetadata.build(**{
             **valid,
-            "requests": [f"request-{index}" for index in range(9)],
-            "target_query_lengths": [6] * 9,
-            "draft_token_ids": [[1]] * 9,
-            "request_slots": list(range(9)),
-            "slot_generations": [0] * 9,
-            "remaining_output_budget": [1] * 9,
+            "requests": [f"request-{index}" for index in range(65)],
+            "target_query_lengths": [6] * 65,
+            "draft_token_ids": [[1]] * 65,
+            "request_slots": list(range(65)),
+            "slot_generations": [0] * 65,
+            "remaining_output_budget": [1] * 65,
         })
     )
     for field in ("target_query_lengths", "draft_token_ids", "request_slots", "slot_generations",

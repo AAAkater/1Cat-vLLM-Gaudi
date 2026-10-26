@@ -1,0 +1,785 @@
+# SPDX-License-Identifier: Apache-2.0
+"""CPU contracts for request-local C6 math inside the packed target stage."""
+
+from types import SimpleNamespace
+
+import pytest
+import torch
+from torch import nn
+
+from vllm_gaudi.models import deepseek_v41_batch_target_program as target_module
+from vllm_gaudi.models import deepseek_v41_program as program_module
+from vllm_gaudi.models.deepseek_v41_batch_target_program import (
+    DSparkTargetStage,
+    PreparedTargetBatchLayerGroup,
+)
+from vllm_gaudi.models.deepseek_v41_program import PreparedDecoderLayer
+
+
+ROWS_PER_LANE = 6
+
+
+@pytest.fixture(autouse=True)
+def restore_lazy_environment_attributes():
+    # monkeypatch restores values obtained through module __getattr__ as real
+    # attributes. Remove those shadows so later configuration tests stay lazy.
+    from vllm_gaudi import envs
+
+    original = {name: envs.__dict__[name] for name in envs.environment_variables if name in envs.__dict__}
+    yield
+    for name in envs.environment_variables:
+        if name in original:
+            envs.__dict__[name] = original[name]
+        else:
+            envs.__dict__.pop(name, None)
+
+
+class _PackedAttention(nn.Module):
+    def __init__(self, capacity, calls):
+        super().__init__()
+        self.ratio = 0
+        self.batch_state = SimpleNamespace(swa=torch.empty(64, 8, 8))
+        self.swa = self.batch_state.swa
+        self._buffers = {}
+        self._fused_qkv_quantized = False
+        self._fused_qkv_weight = None
+        self.shared_decode_metadata = False
+        self.calls = calls
+
+    def forward_batch_target(self, value, positions, slots, pages, selected, candidates,
+                             main_ready, index_ready, **kwargs):
+        if self.calls is not None:
+            self.calls.append(("attention", value.shape[0], tuple(kwargs["row_valid"].shape)))
+        return value + 1, selected, candidates, main_ready, index_ready
+
+    def forward(self, value, positions, ready_outputs=(), **kwargs):
+        if self.calls is not None:
+            self.calls.append(("serial_attention", value.shape[0], kwargs.get("decode")))
+        return value + 3
+
+
+class _DeterministicMoE(nn.Module):
+    n256_fp8 = True
+    n256_fused = True
+    shared_gate_up_channel = torch.ones(1)
+
+    def __init__(self, calls):
+        super().__init__()
+        self.calls = calls
+
+    def forward(self, value, image_mask, **kwargs):
+        if self.calls is not None:
+            self.calls.append((
+                "moe",
+                value.shape[0],
+                kwargs.get("decode"),
+                kwargs.get("ordinary_decode", False),
+                kwargs.get("prequant"),
+                kwargs.get("shared_prequant"),
+            ))
+        return value + 2
+
+
+class _FakePreparedLayer(PreparedDecoderLayer):
+    def __init__(self, layer, capacity, calls, *, collect_target_state=False, simulate_publish=False):
+        # Deliberately bypass the checkpoint constructor while retaining the
+        # production PreparedDecoderLayer methods under test.
+        nn.Module.__init__(self)
+        self.layer = layer
+        self.calls = calls
+        self.simulate_publish = simulate_publish
+        self.draft = False
+        self.draft_mhc = False
+        self.collect_target_state = collect_target_state
+        self.dspark_mhc_deferred = False
+        self.dspark_peer_post_collapse = False
+        self.dspark_moe_peer_post = False
+        self.dspark_peer_post_norm = False
+        self.mhc_post_collapse = True
+        self.mhc_interlayer_collapse = True
+        self.mhc_interlayer_bf16 = True
+        self.ffn_dual_quant = True
+        self.ffn_bf16_quant = True
+        self.mhc_control_mme = False
+        self.decode_attention_norm_quant = False
+        self.dspark_input_norm = False
+        self.batch_control_reuse = False
+        self.hc_eps = 1e-6
+        self.iterations = 20
+        self.eps = 1e-6
+        self.hc_attn_fn_packed = torch.ones(1)
+        self.hc_ffn_fn_packed = torch.ones(1)
+        self.hc_attn_fn_mme = None
+        self.hc_ffn_fn_mme = None
+        self.hc_attn_fn_fp8 = None
+        self.hc_attn_fn_fp8_channel = None
+        self.hc_ffn_fn_fp8 = None
+        self.hc_ffn_fn_fp8_channel = None
+        self.weights = SimpleNamespace(
+            hc_attn_fn=torch.empty(1),
+            hc_attn_scale=torch.empty(1),
+            hc_attn_base=torch.empty(1),
+            hc_ffn_fn=torch.empty(1),
+            hc_ffn_scale=torch.empty(1),
+            hc_ffn_base=torch.empty(1),
+            attn_norm=SimpleNamespace(weight=torch.empty(1)),
+            ffn_norm=SimpleNamespace(weight=torch.empty(1)),
+        )
+        self.attention = _PackedAttention(capacity, calls)
+        self.moe = _DeterministicMoE(calls)
+        self.all_gather = lambda value, dim: value
+
+    def forward_batch_target(self, *args, **kwargs):
+        if self.calls is not None:
+            self.calls.append((
+                "target_layer",
+                self.layer,
+                kwargs["publish_collapse"],
+                len(kwargs["collapse_handoffs"]),
+            ))
+        result = super().forward_batch_target(*args, **kwargs)
+        if self.simulate_publish and kwargs["publish_collapse"]:
+            residual = result[0]
+            for lane, handoff in enumerate(kwargs["collapse_handoffs"]):
+                start = lane * ROWS_PER_LANE
+                handoff[self.layer + 1] = residual[start:start + ROWS_PER_LANE]
+        return result
+
+
+def _disable_optional_target_branches(monkeypatch):
+    env = program_module.gaudi_envs
+    monkeypatch.setattr(env, "VLLM_HPU_DSV41_MHC_SCHEDULE", True)
+    monkeypatch.setattr(env, "VLLM_HPU_DSV41_DSPARK_MHC_GATE_PACKET", False)
+    monkeypatch.setattr(env, "VLLM_HPU_DSV41_DSPARK_MHC_POST_STATS", False)
+    monkeypatch.setattr(env, "VLLM_HPU_DSV41_DSPARK_PEER_POST_COLLAPSE", False)
+    monkeypatch.setattr(env, "VLLM_HPU_DSV41_DSPARK_MOE_PEER_POST", False)
+    monkeypatch.setattr(env, "VLLM_HPU_DSV41_DSPARK_PEER_POST_NORM", False)
+    monkeypatch.setattr(env, "VLLM_HPU_DSV41_PEER_POST_COLLAPSE", False)
+    monkeypatch.setattr(env, "VLLM_HPU_DSV41_PEER_POST_NORM", False)
+    monkeypatch.setattr(env, "VLLM_HPU_DSV41_DSPARK_SCHEDULED_PEER", False)
+    monkeypatch.setattr(env, "VLLM_HPU_DSV41_DSPARK_LAYER_MAIN_SPLIT", False)
+    monkeypatch.setattr(env, "VLLM_HPU_DSV41_DSPARK_LAYER_MAIN_REUSE", False)
+    monkeypatch.setattr(env, "VLLM_HPU_DSV41_DSPARK_NORM_ROUNDTRIP", False)
+    monkeypatch.setattr(env, "VLLM_HPU_DSV41_DSPARK_INPUT_QUANT_REMAT", False)
+    monkeypatch.setattr(env, "VLLM_HPU_DSV41_DSPARK_WO_HANDOFF", False)
+    monkeypatch.setattr(env, "VLLM_HPU_DSV41_DSPARK_Q_PROLOGUE", False)
+    monkeypatch.setattr(env, "VLLM_HPU_DSV41_DSPARK_C1_DENSE_CHAIN", False)
+    monkeypatch.setattr(env, "VLLM_HPU_DSV41_DSPARK_FP8_QKV_PROLOGUE", False)
+    monkeypatch.setattr(env, "VLLM_HPU_DSV41_DSPARK_FP8_QKV_PROLOGUE_SPLIT", False)
+    monkeypatch.setattr(env, "VLLM_HPU_DSV41_DSPARK_INPUT_FP8", False)
+    monkeypatch.setattr(env, "VLLM_HPU_DSV41_DSPARK_OUTPUT_FP8", False)
+    monkeypatch.setattr(env, "VLLM_HPU_DSV41_DSPARK_SHARED_FP8", False)
+    monkeypatch.setattr(env, "VLLM_HPU_DSV41_SHARED_GATE_UP", False)
+
+
+def _install_deterministic_math(monkeypatch, calls):
+    def hc_pre(residual, previous_pre, *args, **kwargs):
+        if calls is not None:
+            calls.append(("hc_pre", residual.shape[0], kwargs.get("decode")))
+        value = residual.mean(1)
+        return value, previous_pre, value, value
+
+    def hc_post(value, residual, post, comb):
+        if calls is not None:
+            calls.append(("hc_post", value.shape[0]))
+        return residual + value.unsqueeze(1)
+
+    def rms_norm(value, *args, **kwargs):
+        if calls is not None:
+            calls.append(("norm", value.shape[0]))
+        return value
+
+    def dual_quant(value, weight, eps):
+        if calls is not None:
+            calls.append(("quant", value.shape[0]))
+        zero = torch.zeros_like(value)
+        one = torch.ones_like(value)
+        return value, zero, one, zero, one
+
+    def final_collapse(residual, pre_mix, weight, eps):
+        if calls is not None:
+            calls.append(("final_collapse", residual.shape[0]))
+        return residual.mean(1) * 0.5
+
+    def bf16_identity(value):
+        if calls is not None:
+            calls.append(("bf16_identity", value.shape[0]))
+        return value
+
+    def context_state(residual, capacity, *, grouped_prefill):
+        if calls is not None:
+            calls.append(("context_state", residual.shape[0], capacity, grouped_prefill))
+        return residual.mean(1)
+
+    monkeypatch.setattr(program_module, "hc_pre", hc_pre)
+    monkeypatch.setattr(program_module, "hc_post", hc_post)
+    monkeypatch.setattr(program_module, "rms_norm", rms_norm)
+    monkeypatch.setattr(program_module, "decode_ffn_dual_quant", dual_quant)
+    monkeypatch.setattr(program_module, "draft_context_state", context_state)
+    monkeypatch.setattr(target_module, "decode_bf16_identity", bf16_identity)
+    monkeypatch.setattr(target_module, "final_collapse_rms_norm", final_collapse)
+
+
+def _install_target_helper_counters(monkeypatch, calls):
+    for name, label in (
+        ("_target_c6_attention_prefix", "target_prefix"),
+        ("_target_c6_post_attention", "target_post"),
+    ):
+        helper = getattr(PreparedDecoderLayer, name)
+
+        def counted(layer, *args, _helper=helper, _label=label, **kwargs):
+            calls.append((_label, args[0].shape[0]))
+            return _helper(layer, *args, **kwargs)
+
+        monkeypatch.setattr(PreparedDecoderLayer, name, counted)
+
+
+def _make_stage(capacity, calls, *, simulate_publish_layers=()):
+    stage = nn.Module()
+    stage.dspark = True
+    stage.pp_rank = 0
+    stage.tp_rank = 0
+    stage.is_last_stage = True
+    stage.tensor_parallel_size = 8
+    stage.reduce = lambda value: value
+    stage.config = {"text_config": {"rms_norm_eps": 1e-6}}
+    stage.weights = nn.Module()
+    stage.weights.embed = nn.Embedding(32, 4)
+    stage.weights.norm = nn.Module()
+    stage.weights.norm.register_buffer("weight", torch.ones(4))
+    stage.shared = nn.Module()
+    stage.shared.topk = nn.ModuleDict({"0": nn.Module()})
+    stage.shared.sources = nn.ModuleDict({"0": nn.Module()})
+    stage.layers = nn.ModuleList([
+        _FakePreparedLayer(
+            layer,
+            capacity,
+            calls,
+            collect_target_state=(layer == 2),
+            simulate_publish=(layer in simulate_publish_layers),
+        )
+        for layer in range(4)
+    ])
+    return stage
+
+
+def _make_group(capacity, calls, *, simulate_publish_layers=()):
+    stage = _make_stage(capacity, calls, simulate_publish_layers=simulate_publish_layers)
+    return PreparedTargetBatchLayerGroup(
+        stage,
+        0,
+        4,
+        request_lengths=(ROWS_PER_LANE,) * capacity,
+        request_slots=tuple(range(capacity)),
+        text_input=False,
+    )
+
+
+def _inputs(capacity, *, bases, valid_lengths, positions_offset=0):
+    rows = capacity * ROWS_PER_LANE
+    residual = torch.zeros((rows, 4, 4), dtype=torch.bfloat16)
+    positions = torch.full((rows,), -1, dtype=torch.int32)
+    slots = torch.full((rows,), -1, dtype=torch.int32)
+    row_valid = torch.zeros(rows, dtype=torch.bool)
+    for lane, (base, length) in enumerate(zip(bases, valid_lengths, strict=True)):
+        start = lane * ROWS_PER_LANE
+        stop = start + ROWS_PER_LANE
+        residual[start:stop] = float(base)
+        positions[start:start + length] = torch.arange(
+            positions_offset + lane * 100,
+            positions_offset + lane * 100 + length,
+            dtype=torch.int32,
+        )
+        slots[start:start + length] = lane
+        row_valid[start:start + length] = True
+    selected = torch.full((rows, 512), -1, dtype=torch.int32)
+    candidates = torch.full((rows, 2048), -1, dtype=torch.int32)
+    main_ready = torch.zeros(rows, dtype=torch.int32)
+    index_ready = torch.zeros(rows, dtype=torch.int32)
+    return {
+        "residual": residual,
+        "pre_mix": torch.zeros((rows, 4), dtype=torch.float32),
+        "positions": positions,
+        "input_ids": torch.zeros(rows, dtype=torch.long),
+        "engram_rows": (),
+        "slots": slots,
+        "pages": torch.ones((rows, 4), dtype=torch.int32),
+        "row_valid": row_valid,
+        "selections": (selected,),
+        "candidates": candidates,
+        "main_ready": (main_ready,),
+        "index_ready": (index_ready,),
+    }
+
+
+def _run(group, inputs):
+    return group(
+        inputs["residual"],
+        inputs["pre_mix"],
+        inputs["positions"],
+        inputs["input_ids"],
+        inputs["engram_rows"],
+        inputs["slots"],
+        inputs["pages"],
+        inputs["row_valid"],
+        inputs["selections"],
+        inputs["candidates"],
+        inputs["main_ready"],
+        inputs["index_ready"],
+    )
+
+
+def _count(calls, name):
+    return [call for call in calls if call[0] == name]
+
+
+def test_target_c6_graph_break_helpers_are_dynamo_disabled():
+    for name in ("_target_c6_attention_prefix", "_target_c6_post_attention"):
+        assert getattr(getattr(PreparedDecoderLayer, name), "_torchdynamo_disable", False)
+
+
+def test_target_c6_slices_keep_one_packed_attention_and_static_lane_calls(monkeypatch):
+    _disable_optional_target_branches(monkeypatch)
+    calls = []
+    _install_deterministic_math(monkeypatch, calls)
+    _install_target_helper_counters(monkeypatch, calls)
+    capacity = 3
+    group = _make_group(capacity, calls, simulate_publish_layers=(0, 1))
+
+    output, _, aux, _, _, _, _ = _run(
+        group,
+        _inputs(capacity, bases=(10, 20, 30), valid_lengths=(6, 3, 0)),
+    )
+
+    attention = _count(calls, "attention")
+    assert len(attention) == 4
+    assert all(row_count == capacity * ROWS_PER_LANE for _, row_count, _ in attention)
+    assert all(shape == (capacity * ROWS_PER_LANE,) for _, _, shape in attention)
+
+    assert len(_count(calls, "target_layer")) == 4
+    assert [call[2] for call in _count(calls, "target_layer")] == [True, True, True, False]
+    assert all(call[3] == capacity for call in _count(calls, "target_layer"))
+
+    # Only the target path enters the Dynamo-disabled wrappers.
+    assert len(_count(calls, "target_prefix")) == 4 * capacity
+    assert len(_count(calls, "target_post")) == 4 * capacity
+    assert all(call[1] == ROWS_PER_LANE for call in _count(calls, "target_prefix"))
+    assert all(call[1] == ROWS_PER_LANE for call in _count(calls, "target_post"))
+
+    # One prefix and one suffix hc_pre per lane, per layer.
+    assert len(_count(calls, "hc_pre")) == 4 * capacity * 2
+    assert all(call[1] == ROWS_PER_LANE and call[2] is True for call in _count(calls, "hc_pre"))
+    assert len(_count(calls, "norm")) == 4 * capacity
+    assert all(call[1] == ROWS_PER_LANE for call in _count(calls, "norm"))
+    assert len(_count(calls, "quant")) == 4 * capacity
+    assert len(_count(calls, "moe")) == 4 * capacity
+    assert all(call[1] == ROWS_PER_LANE and call[2] is True and call[3] is False
+               for call in _count(calls, "moe"))
+    assert len(_count(calls, "final_collapse")) == capacity
+    assert all(call[1] == ROWS_PER_LANE for call in _count(calls, "final_collapse"))
+
+    # Native publication is simulated on layers 0/1.  Their BF16 identity is
+    # skipped; layer 2 has no handoff and must cross the explicit boundary.
+    assert len(_count(calls, "bf16_identity")) == capacity
+    assert len(_count(calls, "context_state")) == capacity
+    assert aux.shape == (capacity * ROWS_PER_LANE, 4)
+
+    active = _inputs(capacity, bases=(10, 20, 30), valid_lengths=(6, 3, 0))["row_valid"]
+    assert torch.count_nonzero(output[~active]).item() == 0
+    assert torch.count_nonzero(aux[~active]).item() == 0
+
+
+def test_target_c6_slices_do_not_cross_lane_sentinels_or_change_calls_with_active_count(monkeypatch):
+    _disable_optional_target_branches(monkeypatch)
+    calls = []
+    _install_deterministic_math(monkeypatch, calls)
+    capacity = 3
+    group = _make_group(capacity, calls)
+
+    first = _inputs(capacity, bases=(10, 20, 30), valid_lengths=(6, 6, 6))
+    first_output, _, _, _, _, _, _ = _run(group, first)
+    first_counts = [call[0] for call in calls]
+    calls.clear()
+
+    changed_neighbor = _inputs(capacity, bases=(10, 70, 30), valid_lengths=(6, 6, 6))
+    changed_output, _, _, _, _, _, _ = _run(group, changed_neighbor)
+    changed_counts = [call[0] for call in calls]
+
+    lane = slice(0, ROWS_PER_LANE)
+    other_lane = slice(2 * ROWS_PER_LANE, 3 * ROWS_PER_LANE)
+    assert torch.equal(first_output[lane], changed_output[lane])
+    assert torch.equal(first_output[other_lane], changed_output[other_lane])
+    assert not torch.equal(
+        first_output[ROWS_PER_LANE:2 * ROWS_PER_LANE],
+        changed_output[ROWS_PER_LANE:2 * ROWS_PER_LANE],
+    )
+
+    calls.clear()
+    partial = _inputs(capacity, bases=(10, 20, 30), valid_lengths=(6, 0, 0))
+    _run(group, partial)
+    partial_counts = [call[0] for call in calls]
+    assert partial_counts == first_counts == changed_counts
+
+
+def test_target_c6_n2_fallback_quantizes_each_lane_without_shared_prequant(monkeypatch):
+    _disable_optional_target_branches(monkeypatch)
+    calls = []
+    _install_deterministic_math(monkeypatch, calls)
+
+    def ordinary_norm_quant(value, weight, eps):
+        del weight, eps
+        calls.append(("norm_quant", value.shape[0]))
+        scale = torch.ones((value.shape[0], ), dtype=torch.float32)
+        return value, value, scale
+
+    monkeypatch.setattr(
+        torch.ops.custom_op,
+        "custom_deepseek_v41_ffn_norm_quant_gaudi2",
+        ordinary_norm_quant,
+        raising=False,
+    )
+    capacity = 2
+    group = _make_group(capacity, calls)
+    for layer in group.layers:
+        layer.moe.shared_gate_up_channel = None
+        assert layer.ffn_dual_quant is True
+        assert layer._c6_slice_path_error() is None
+
+    _run(group, _inputs(capacity, bases=(10, 20), valid_lengths=(6, 3)))
+
+    norm_quant = _count(calls, "norm_quant")
+    assert len(norm_quant) == 4 * capacity
+    assert all(call[1] == ROWS_PER_LANE for call in norm_quant)
+    assert _count(calls, "quant") == []
+
+    moe = _count(calls, "moe")
+    assert len(moe) == 4 * capacity
+    assert all(call[1] == ROWS_PER_LANE and call[4] is not None and call[5] is None for call in moe)
+
+
+def test_target_c6_n2_fallback_runs_eager_without_dynamo(monkeypatch):
+    _disable_optional_target_branches(monkeypatch)
+    calls = []
+    _install_deterministic_math(monkeypatch, calls)
+
+    def ordinary_norm_quant(value, weight, eps):
+        del weight, eps
+        scale = torch.ones((value.shape[0], ), dtype=torch.float32)
+        return value, value, scale
+
+    monkeypatch.setattr(
+        torch.ops.custom_op,
+        "custom_deepseek_v41_ffn_norm_quant_gaudi2",
+        ordinary_norm_quant,
+        raising=False,
+    )
+    capacity = 2
+    group = _make_group(capacity, calls)
+    for layer in group.layers:
+        layer.moe.shared_gate_up_channel = None
+    inputs = _inputs(capacity, bases=(10, 20), valid_lengths=(6, 2))
+
+    def unexpected_compile(*args, **kwargs):
+        raise AssertionError("C6 slice groups must not enter Dynamo")
+
+    monkeypatch.setattr(target_module.torch, "compile", unexpected_compile)
+    output = _run(group, inputs)[0]
+
+    assert output.shape == (capacity * ROWS_PER_LANE, 4)
+    moe = _count(calls, "moe")
+    assert len(moe) == 4 * capacity
+    assert all(call[1] == ROWS_PER_LANE and call[4] is not None and call[5] is None for call in moe)
+
+
+def test_target_c6_stage_compiles_one_fullgraph_attention_wrapper_per_layer(monkeypatch):
+    _disable_optional_target_branches(monkeypatch)
+    calls = []
+    _install_deterministic_math(monkeypatch, calls)
+    _install_target_helper_counters(monkeypatch, calls)
+    capacity = 2
+    stage = _make_stage(capacity, calls, simulate_publish_layers=(0, 1))
+    stage.batch_state = SimpleNamespace(capacity=capacity)
+    inputs = _inputs(capacity, bases=(10, 20), valid_lengths=(6, 2))
+    slots = tuple(range(capacity))
+    compile_calls = []
+
+    class _CompiledAttentionExecutor:
+        def __init__(self, call):
+            self.call = call
+            self.calls = []
+
+        def __call__(self, *args, **kwargs):
+            self.calls.append((args[0].shape[0], args[9]))
+            return self.call(*args, **kwargs)
+
+    def recording_compile(call, **kwargs):
+        compile_calls.append((call, kwargs))
+        return _CompiledAttentionExecutor(call)
+
+    monkeypatch.setattr(target_module.torch, "compile", recording_compile)
+
+    target_stage = DSparkTargetStage(stage, (ROWS_PER_LANE, ) * capacity, slots, backend="eager")
+    compiled = target_stage.compiled
+    assert compiled is not None
+    assert compiled.slice_target_layers
+    group = compiled.groups[0]
+    assert len(compile_calls) == len(group.attention_calls) == len(stage.layers)
+    assert all(call is expected for (call, _), expected in zip(compile_calls, group.attention_calls, strict=True))
+    assert all(chunk is expected for chunk, expected in zip(compiled.chunks, compiled.groups, strict=True))
+    assert all(kwargs == {"backend": "eager", "fullgraph": True, "dynamic": False}
+               for _, kwargs in compile_calls)
+    assert all(call.request_lengths == (ROWS_PER_LANE, ) * capacity for call in group.attention_calls)
+    assert all(call.request_slots == slots for call in group.attention_calls)
+    assert all(isinstance(wrapper, _CompiledAttentionExecutor) for wrapper in group.attention_wrappers)
+    assert all(not isinstance(call, nn.Module) for call in group.attention_calls)
+    assert all("attention_wrapper" not in key and "attention_call" not in key for key in group.state_dict())
+
+    output, aux = compiled(
+        inputs["residual"],
+        inputs["pre_mix"],
+        inputs["input_ids"],
+        inputs["positions"],
+        inputs["slots"],
+        inputs["pages"],
+        inputs["row_valid"],
+        inputs["engram_rows"],
+    )
+
+    rows = capacity * ROWS_PER_LANE
+    assert output.shape == (rows, 4)
+    assert aux.shape == (rows, 4)
+    active = inputs["row_valid"]
+    assert torch.count_nonzero(output[~active]).item() == 0
+    assert torch.count_nonzero(aux[~active]).item() == 0
+
+    attention = _count(calls, "attention")
+    assert len(attention) == 4
+    assert all(row_count == rows for _, row_count, _ in attention)
+    assert len(compile_calls) == len(group.attention_wrappers)
+    assert all(len(wrapper.calls) == 1 for wrapper in group.attention_wrappers)
+    assert all(call[0] == rows for wrapper in group.attention_wrappers for call in wrapper.calls)
+    assert len(_count(calls, "hc_pre")) == 4 * capacity * 2
+    assert len(_count(calls, "moe")) == 4 * capacity
+    assert all(call[1] == ROWS_PER_LANE for call in _count(calls, "moe"))
+    assert len(_count(calls, "target_prefix")) == 4 * capacity
+    assert len(_count(calls, "target_post")) == 4 * capacity
+
+
+def test_target_c6_stage_sets_dynamo_configs_during_first_attention_wrapper_call(monkeypatch):
+    _disable_optional_target_branches(monkeypatch)
+    calls = []
+    _install_deterministic_math(monkeypatch, calls)
+    capacity = 2
+    stage = _make_stage(capacity, calls)
+    stage.batch_state = SimpleNamespace(capacity=capacity)
+    inputs = _inputs(capacity, bases=(10, 20), valid_lengths=(6, 2))
+    observed_configs = []
+
+    class _CompiledAttentionExecutor:
+        def __init__(self, call):
+            self.call = call
+
+        def __call__(self, *args, **kwargs):
+            # torch.compile performs its lazy first compilation here rather
+            # than when the wrapper is constructed in CompiledTargetBatchStage.
+            observed_configs.append((
+                torch._dynamo.config.recompile_limit,
+                torch._dynamo.config.allow_unspec_int_on_nn_module,
+            ))
+            return self.call(*args, **kwargs)
+
+    monkeypatch.setattr(
+        target_module.torch,
+        "compile",
+        lambda call, **_kwargs: _CompiledAttentionExecutor(call),
+    )
+    compiled = target_module.CompiledTargetBatchStage(
+        stage,
+        (ROWS_PER_LANE, ) * capacity,
+        tuple(range(capacity)),
+        backend="eager",
+    )
+    assert compiled.slice_target_layers
+
+    original_limit = torch._dynamo.config.recompile_limit
+    original_allow_unspec_int = torch._dynamo.config.allow_unspec_int_on_nn_module
+    expected_limit = max(2, 2 * len(stage.layers) + 1)
+    with torch._dynamo.config.patch(
+            recompile_limit=2,
+            allow_unspec_int_on_nn_module=False,
+    ):
+        compiled(
+            inputs["residual"],
+            inputs["pre_mix"],
+            inputs["input_ids"],
+            inputs["positions"],
+            inputs["slots"],
+            inputs["pages"],
+            inputs["row_valid"],
+            inputs["engram_rows"],
+        )
+        assert torch._dynamo.config.recompile_limit == 2
+        assert torch._dynamo.config.allow_unspec_int_on_nn_module is False
+
+    assert torch._dynamo.config.recompile_limit == original_limit
+    assert torch._dynamo.config.allow_unspec_int_on_nn_module is original_allow_unspec_int
+    assert len(observed_configs) == len(stage.layers)
+    assert all(limit >= expected_limit for limit, _allow in observed_configs)
+    assert observed_configs == [(expected_limit, True)] * len(stage.layers)
+
+
+def test_target_c6_stage_restores_dynamo_configs_when_attention_wrapper_raises(monkeypatch):
+    _disable_optional_target_branches(monkeypatch)
+    calls = []
+    _install_deterministic_math(monkeypatch, calls)
+    capacity = 1
+    stage = _make_stage(capacity, calls)
+    stage.batch_state = SimpleNamespace(capacity=capacity)
+    inputs = _inputs(capacity, bases=(10, ), valid_lengths=(6, ))
+    observed_configs = []
+
+    class _FailingAttentionExecutor:
+        def __call__(self, *_args, **_kwargs):
+            observed_configs.append((
+                torch._dynamo.config.recompile_limit,
+                torch._dynamo.config.allow_unspec_int_on_nn_module,
+            ))
+            raise RuntimeError("attention compile failed")
+
+    monkeypatch.setattr(
+        target_module.torch,
+        "compile",
+        lambda _call, **_kwargs: _FailingAttentionExecutor(),
+    )
+    compiled = target_module.CompiledTargetBatchStage(
+        stage,
+        (ROWS_PER_LANE, ) * capacity,
+        tuple(range(capacity)),
+        backend="eager",
+    )
+
+    original_limit = torch._dynamo.config.recompile_limit
+    original_allow_unspec_int = torch._dynamo.config.allow_unspec_int_on_nn_module
+    with torch._dynamo.config.patch(
+            recompile_limit=2,
+            allow_unspec_int_on_nn_module=False,
+    ):
+        with pytest.raises(RuntimeError, match="attention compile failed"):
+            compiled(
+                inputs["residual"],
+                inputs["pre_mix"],
+                inputs["input_ids"],
+                inputs["positions"],
+                inputs["slots"],
+                inputs["pages"],
+                inputs["row_valid"],
+                inputs["engram_rows"],
+            )
+        assert torch._dynamo.config.recompile_limit == 2
+        assert torch._dynamo.config.allow_unspec_int_on_nn_module is False
+
+    assert torch._dynamo.config.recompile_limit == original_limit
+    assert torch._dynamo.config.allow_unspec_int_on_nn_module is original_allow_unspec_int
+    assert observed_configs == [(2 * len(stage.layers) + 1, True)]
+
+
+def test_target_c6_serial_forward_bypasses_target_attention_wrapper(monkeypatch):
+    _disable_optional_target_branches(monkeypatch)
+    calls = []
+    _install_deterministic_math(monkeypatch, calls)
+    group = _make_group(1, calls)
+    layer = group.layers[0]
+    inputs = _inputs(1, bases=(10, ), valid_lengths=(2, ))
+
+    def unexpected_target_attention(*args, **kwargs):
+        raise AssertionError("serial C6 must not enter the packed target attention wrapper")
+
+    group.attention_wrappers = (unexpected_target_attention, )
+    result = layer.forward(
+        inputs["residual"],
+        inputs["pre_mix"],
+        inputs["positions"],
+        torch.zeros(ROWS_PER_LANE, dtype=torch.bool),
+        None,
+        decode=True,
+    )
+
+    assert len(result) == 3
+    assert _count(calls, "serial_attention") == [("serial_attention", ROWS_PER_LANE, True)]
+    assert _count(calls, "attention") == []
+
+
+def test_target_c6_non_slice_stage_keeps_fullgraph_compile_contract(monkeypatch):
+    _disable_optional_target_branches(monkeypatch)
+    capacity = 2
+    stage = _make_stage(capacity, None)
+    for layer in stage.layers:
+        layer._target_c6_slices = False
+    compile_calls = []
+
+    def recording_compile(group, **kwargs):
+        compile_calls.append((group, kwargs))
+        return object()
+
+    monkeypatch.setattr(target_module.torch, "compile", recording_compile)
+
+    compiled = target_module.CompiledTargetBatchStage(
+        stage,
+        (ROWS_PER_LANE, ) * capacity,
+        tuple(range(capacity)),
+        backend="eager",
+    )
+
+    assert not compiled.slice_target_layers
+    assert all(group.attention_calls == () and group.attention_wrappers == () for group in compiled.groups)
+    assert len(compile_calls) == len(compiled.groups)
+    assert all(group is expected for (group, _), expected in zip(compile_calls, compiled.groups, strict=True))
+    assert all(kwargs == {"backend": "eager", "fullgraph": True, "dynamic": False}
+               for _, kwargs in compile_calls)
+
+
+@pytest.mark.parametrize(
+    ("branch", "message"),
+    (
+        ("gate_packet", "mHC gate packet"),
+        ("deferred", "deferred mHC"),
+        ("peer", "DSpark peer/post/collapse"),
+    ),
+)
+def test_target_c6_slices_fail_closed_for_optional_branches(monkeypatch, branch, message):
+    _disable_optional_target_branches(monkeypatch)
+    _install_deterministic_math(monkeypatch, None)
+    group = _make_group(1, None)
+    if branch == "gate_packet":
+        monkeypatch.setattr(
+            program_module.gaudi_envs,
+            "VLLM_HPU_DSV41_DSPARK_MHC_GATE_PACKET",
+            True,
+        )
+    elif branch == "deferred":
+        group.layers[0].dspark_mhc_deferred = True
+    else:
+        group.layers[0].dspark_peer_post_collapse = True
+    with pytest.raises(RuntimeError, match=message):
+        _run(group, _inputs(1, bases=(10,), valid_lengths=(6,)))
+
+
+@pytest.mark.parametrize(
+    ("flag", "message"),
+    (
+        ("VLLM_HPU_DSV41_DSPARK_WO_HANDOFF", "DSpark WO handoff"),
+        ("VLLM_HPU_DSV41_DSPARK_Q_PROLOGUE", "DSpark query prologue"),
+        ("VLLM_HPU_DSV41_DSPARK_C1_DENSE_CHAIN", "DSpark C1 dense chain"),
+        ("VLLM_HPU_DSV41_DSPARK_FP8_QKV_PROLOGUE", "DSpark FP8 QKV prologue"),
+        ("VLLM_HPU_DSV41_DSPARK_FP8_QKV_PROLOGUE_SPLIT", "split DSpark FP8 QKV prologue"),
+        ("VLLM_HPU_DSV41_DSPARK_INPUT_FP8", "DSpark input FP8"),
+        ("VLLM_HPU_DSV41_DSPARK_OUTPUT_FP8", "DSpark output FP8"),
+    ),
+)
+def test_target_c6_slices_fail_closed_for_unsupported_target_chains(monkeypatch, flag, message):
+    _disable_optional_target_branches(monkeypatch)
+    _install_deterministic_math(monkeypatch, None)
+    group = _make_group(1, None)
+    monkeypatch.setattr(program_module.gaudi_envs, flag, True)
+    with pytest.raises(RuntimeError, match=message):
+        _run(group, _inputs(1, bases=(10, ), valid_lengths=(6, )))

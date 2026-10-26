@@ -17,6 +17,7 @@ import torch
 import torch.nn.functional as F
 
 from vllm_gaudi.ops.deepseek_v41_batch_attention import write_state_rows
+from vllm_gaudi.ops.deepseek_v41_capacity import validate_dspark_capacity
 from vllm_gaudi.ops.deepseek_v41_batch_verify import (
     BINDING_SIDECAR_SIZE,
     DEFAULT_BATCH_CAPACITY,
@@ -34,6 +35,7 @@ TARGET_QUERY_BUCKET = 6
 SWA_ROWS = 256
 DRAFT_WINDOW = 128
 DRAFT_ATTENTION_WIDTH = 192
+DRAFT_DENSE_ROW_CHUNK = 40
 
 # Runner-facing call signature:
 #
@@ -45,15 +47,21 @@ DRAFT_ATTENTION_WIDTH = 192
 
 
 def _linear(value: torch.Tensor, owner) -> torch.Tensor:
-    # Preserve the B1 prepared-dense branch when packing B*5 rows.  program.linear
+    # Preserve the B1 prepared-dense branch when packing B*5 rows. program.linear
     # gates that branch at six rows; full five-query request lanes use the same
     # row-independent prepared matrix without changing ordinary serial dispatch.
+    # The 40-row chunks retain the qualified N8 geometry while allowing any N up
+    # to the shared contract bound.
     prepared = getattr(owner, "dspark_dense_kn", None)
     packed_rows = (value.ndim == 2 and value.shape[0] > TARGET_QUERY_BUCKET
-                   and value.shape[0] <= MAX_BATCH_REQUESTS * MAX_DRAFT_TOKENS
                    and value.shape[0] % MAX_DRAFT_TOKENS == 0)
     if prepared is not None and packed_rows:
-        product = torch.mm(value, prepared)
+        rows = value.shape[0]
+        products = tuple(
+            torch.mm(value[start:min(start + DRAFT_DENSE_ROW_CHUNK, rows)], prepared)
+            for start in range(0, rows, DRAFT_DENSE_ROW_CHUNK)
+        )
+        product = products[0] if len(products) == 1 else torch.cat(products, dim=0)
         bias = getattr(owner, "bias", None)
         return product if bias is None else product + bias
     # Import lazily so this owner can be CPU-tested without importing the model
@@ -161,8 +169,7 @@ class DraftBatchState(torch.nn.Module):
 
     def __init__(self, draft, *, capacity: int = DEFAULT_BATCH_CAPACITY, backing_rings=None):
         super().__init__()
-        if type(capacity) is not int or not 1 <= capacity <= MAX_BATCH_REQUESTS:
-            raise ValueError(f"draft batch capacity must be in 1..{MAX_BATCH_REQUESTS}")
+        validate_dspark_capacity(capacity, allow_serial=True, name="draft batch capacity")
         if len(draft.layers) != 3:
             raise ValueError("DSpark batch draft requires exactly three MTP layers")
         if backing_rings is not None and len(backing_rings) != len(draft.layers):
@@ -235,8 +242,7 @@ def draft_attention_rows(
     if positions.ndim != 2 or positions.shape[1] != MAX_DRAFT_TOKENS:
         raise ValueError("draft positions must have shape [B, 5]")
     batch_size = positions.shape[0]
-    if not 1 <= batch_size <= MAX_BATCH_REQUESTS:
-        raise ValueError(f"draft batch size must be in 1..{MAX_BATCH_REQUESTS}")
+    validate_dspark_capacity(batch_size, allow_serial=True, name="draft batch size")
     if slots.shape != (batch_size, ) or active.shape != (batch_size, ) or active.dtype != torch.bool:
         raise ValueError("draft slots/activity must have shapes [B] and [B]")
     if slots.device != positions.device or active.device != positions.device:
@@ -460,8 +466,7 @@ class PackedDraftRound(torch.nn.Module):
         compile_graph: bool = True,
     ):
         super().__init__()
-        if type(batch_capacity) is not int or not 1 <= batch_capacity <= MAX_BATCH_REQUESTS:
-            raise ValueError(f"draft round capacity must be in 1..{MAX_BATCH_REQUESTS}")
+        validate_dspark_capacity(batch_capacity, allow_serial=True, name="draft round capacity")
         if batch_state.capacity != batch_capacity:
             raise ValueError("draft round capacity must match the batch state")
         self.batch_capacity = batch_capacity
@@ -510,8 +515,7 @@ class PackedDraftTransaction(torch.nn.Module):
         compile_graph: bool = True,
     ):
         super().__init__()
-        if type(batch_capacity) is not int or not 1 <= batch_capacity <= MAX_BATCH_REQUESTS:
-            raise ValueError(f"draft transaction capacity must be in 1..{MAX_BATCH_REQUESTS}")
+        validate_dspark_capacity(batch_capacity, allow_serial=True, name="draft transaction capacity")
         if batch_state.capacity != batch_capacity:
             raise ValueError("draft transaction capacity must match the batch state")
         self.draft = draft
@@ -753,8 +757,7 @@ class PackedDraftMarkovSampler(torch.nn.Module):
 
     def __init__(self, draft, *, batch_capacity: int = DEFAULT_BATCH_CAPACITY):
         super().__init__()
-        if type(batch_capacity) is not int or not 1 <= batch_capacity <= MAX_BATCH_REQUESTS:
-            raise ValueError(f"Markov batch capacity must be in 1..{MAX_BATCH_REQUESTS}")
+        validate_dspark_capacity(batch_capacity, allow_serial=True, name="Markov batch capacity")
         self.draft = draft
         self.batch_capacity = batch_capacity
 
@@ -800,8 +803,7 @@ def _host_metadata_values(metadata):
         fields[name] = value
     request_ids = tuple(getattr(metadata, "request_ids", ()))
     batch_size = len(request_ids)
-    if not 1 <= batch_size <= MAX_BATCH_REQUESTS:
-        raise ValueError(f"DSpark batch draft supports 1..{MAX_BATCH_REQUESTS} requests")
+    validate_dspark_capacity(batch_size, allow_serial=True, name="DSpark batch draft")
 
     host = {}
     for name in ("request_slots", "slot_generations", "target_start_positions", "remaining_output_budget"):
@@ -936,8 +938,7 @@ class DSparkBatchDraftStage:
         batch_capacity: int = DEFAULT_BATCH_CAPACITY,
         max_model_len: int | None = None,
     ):
-        if type(batch_capacity) is not int or not 1 <= batch_capacity <= MAX_BATCH_REQUESTS:
-            raise ValueError(f"batch capacity must be in 1..{MAX_BATCH_REQUESTS}")
+        validate_dspark_capacity(batch_capacity, allow_serial=True, name="batch capacity")
         self.draft = draft
         self.batch_capacity = batch_capacity
         self.batch_state = batch_state

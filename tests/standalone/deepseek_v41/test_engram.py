@@ -220,3 +220,11 @@ def test_invalid_request_batch_rolls_back_only_unsubmitted_preparations():
     with pytest.raises(RuntimeError, match="absolute position"):
         EngramHistoryBatch.prepare(histories, (("a", 0, [3], None), ("b", 1, [4], None)), 2)
     assert all(history.pending is None and history.position == 0 for history in histories.values())
+
+
+def test_request_batch_rejects_more_than_shared_dspark_capacity():
+    from vllm_gaudi.ops.deepseek_v41_engram import EngramHistoryBatch
+
+    spans = tuple((f"request-{index}", 0, [3], None) for index in range(65))
+    with pytest.raises(ValueError, match="distinct request owners"):
+        EngramHistoryBatch.prepare({}, spans, capacity=256)

@@ -7,6 +7,11 @@ retained. Optional cancellation runs a survivor alongside the cancelled stream,
 then reuses the cancelled prompt with a new request ID while the survivor is
 still live. HTTP overlap is deliberately reported as HTTP evidence only.
 
+``--mode runtime-smoke`` is a separate liveness gate. It skips serial references
+and token matching, records HTTP/SSE completion, health, metrics, drain,
+overlap, optional single-rank runner-evidence correlation, and whether an A>N
+queue was observed. Runtime success is not formal serving qualification.
+
 A separate actual-packed JSONL trace may correlate one or more active clients to
 one fixed-capacity batch. Correlation uses the explicit payload ``request_id``
 and actual streamed completion response IDs (engine suffixes included); runner
@@ -34,6 +39,12 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 
+from vllm_gaudi.ops.deepseek_v41_capacity import (
+    MAX_DSV41_DSPARK_CAPACITY,
+    MIN_DSV41_DSPARK_CAPACITY,
+    validate_dspark_capacity,
+)
+
 DEFAULT_MODEL = "deepseek-v4.1-flash-dspark"
 DEFAULT_URL = "http://127.0.0.1:8001"
 REFERENCE_REPEATS = 2
@@ -43,13 +54,30 @@ MIN_CANCEL_TOKENS = 7
 DEFAULT_CANCEL_AFTER = 7
 CANCEL_BUDGET_HEADROOM = 8
 DEFAULT_BUDGETS = (8, 16, 24, 32)
-DEFAULT_BATCH_CAPACITY = 2
-MIN_BATCH_CAPACITY = 2
-MAX_BATCH_CAPACITY = 4
+DEFAULT_BATCH_CAPACITY = MIN_DSV41_DSPARK_CAPACITY
+MIN_BATCH_CAPACITY = MIN_DSV41_DSPARK_CAPACITY
+MAX_BATCH_CAPACITY = MAX_DSV41_DSPARK_CAPACITY
 TARGET_ROWS_PER_LANE = 6
 DRAFT_ROWS_PER_LANE = 5
 TRACE_SCHEMA_V2 = "dsv41.dspark.round.v2"
 TRACE_SCHEMA_LEGACY_B2 = "dsv41.dspark.b2_round.v1"
+SUCCESSFUL_QUALIFICATION_STATUSES = frozenset({
+    "runner_evidence_correlated",
+    "http_only_runner_evidence_not_provided",
+})
+QUALIFICATION_MODE = "qualification"
+RUNTIME_SMOKE_MODE = "runtime-smoke"
+MODES = (QUALIFICATION_MODE, RUNTIME_SMOKE_MODE)
+SUCCESSFUL_RUNTIME_STATUSES = frozenset({
+    "runtime_smoke_passed",
+    "runtime_smoke_evidence_correlated",
+})
+RUNTIME_SCOPE = (
+    "Runtime liveness only: HTTP/SSE completion, health, metrics, drain, overlap, and optional "
+    "single-rank runner-evidence correlation plus an optional extra two-lane cancel/reuse lifecycle. "
+    "Semantic exactness, full-capacity cancellation, all-rank digests, physical multi-batch coverage, "
+    "and formal serving qualification are not assessed."
+)
 
 
 def now() -> str:
@@ -97,13 +125,14 @@ def build_requests(cases: int, clients: int, budgets: list[int] | None = None,
                    prompt_lengths: list[int] | None = None) -> list[dict[str, Any]]:
     if not 1 <= cases <= 8:
         raise ValueError("--cases must be in 1..8")
-    if not 1 <= clients <= 12:
-        raise ValueError("--clients must be in 1..12")
-    values = list(budgets or DEFAULT_BUDGETS[:clients])[:clients]
-    if len(values) != clients or len(set(values)) != clients:
-        raise ValueError("provide one distinct output budget per client")
-    if any(type(value) is not int or not 1 <= value <= MAX_OUTPUT_TOKENS for value in values):
+    if not 1 <= clients <= MAX_DSV41_DSPARK_CAPACITY:
+        raise ValueError(f"--clients must be in 1..{MAX_DSV41_DSPARK_CAPACITY}")
+    source_budgets = list(DEFAULT_BUDGETS if budgets is None else budgets)
+    if not source_budgets:
+        raise ValueError("provide at least one output budget")
+    if any(type(value) is not int or not 1 <= value <= MAX_OUTPUT_TOKENS for value in source_budgets):
         raise ValueError(f"client budgets must be integers in 1..{MAX_OUTPUT_TOKENS}")
+    values = [source_budgets[index % len(source_budgets)] for index in range(clients)]
     lengths = [7 + 4 * index for index in range(cases)]
     if prompt_lengths is not None:
         if len(prompt_lengths) != cases:
@@ -336,17 +365,39 @@ def poll_metrics(stop: threading.Event, base_url: str, model: str, timeout: floa
 def wait_idle(base_url: str, model: str, timeout: float, api_key: str | None, directory: Path,
               drain_timeout: float, interval: float) -> dict[str, Any]:
     started, consecutive, count = time.monotonic(), 0, 0
+    observations: list[dict[str, Any]] = []
     while time.monotonic() - started < drain_timeout:
         snap = save_metrics(base_url, model, directory / f"drain-{count:03d}.txt", timeout, api_key)
         count += 1
-        if snap.get("num_requests_running") == 0 and snap.get("num_requests_waiting") == 0:
+        status = snap.get("status")
+        running = snap.get("num_requests_running")
+        waiting = snap.get("num_requests_waiting")
+        metrics_parsed = isinstance(running, (int, float)) and isinstance(waiting, (int, float))
+        valid_sample = bool(status == 200 and metrics_parsed)
+        idle_sample = bool(valid_sample and running == 0 and waiting == 0)
+        observations.append({
+            "status": status, "num_requests_running": running, "num_requests_waiting": waiting,
+            "metrics_parsed": metrics_parsed, "valid_sample": valid_sample, "idle_sample": idle_sample,
+        })
+        if idle_sample:
             consecutive += 1
             if consecutive == 2:
-                return {"idle": True, "elapsed_s": time.monotonic() - started, "snapshots": count}
+                return {
+                    "idle": True, "elapsed_s": time.monotonic() - started, "snapshots": count,
+                    "valid_snapshots": sum(row["valid_sample"] for row in observations),
+                    "last_status": status, "last_running": running, "last_waiting": waiting,
+                    "observations": observations,
+                }
         else:
             consecutive = 0
         time.sleep(interval)
-    return {"idle": False, "elapsed_s": time.monotonic() - started, "snapshots": count}
+    last = observations[-1] if observations else {}
+    return {
+        "idle": False, "elapsed_s": time.monotonic() - started, "snapshots": count,
+        "valid_snapshots": sum(row["valid_sample"] for row in observations),
+        "last_status": last.get("status"), "last_running": last.get("num_requests_running"),
+        "last_waiting": last.get("num_requests_waiting"), "observations": observations,
+    }
 
 
 def evidence_field(row: dict[str, Any], *names: str) -> Any:
@@ -360,9 +411,7 @@ def evidence_field(row: dict[str, Any], *names: str) -> Any:
 
 
 def validate_batch_capacity(value: Any, name: str = "batch capacity") -> int:
-    if type(value) is not int or not MIN_BATCH_CAPACITY <= value <= MAX_BATCH_CAPACITY:
-        raise ValueError(f"{name} must be an integer in {MIN_BATCH_CAPACITY}..{MAX_BATCH_CAPACITY}")
-    return value
+    return validate_dspark_capacity(value, name=name)
 
 
 def request_activity_mask(value: Any, capacity: int) -> tuple[list[int] | None, str | None]:
@@ -445,17 +494,32 @@ def trace_event_flags(row: dict[str, Any]) -> dict[str, bool]:
     return flags
 
 
+def canonical_trace_alias(value: str, request_id: str) -> str | None:
+    """Return the canonical trace owner for exact, legacy ordinal, or engine completion IDs."""
+    canonical = f"cmpl-{request_id}/{request_id}"
+    if value in {
+            request_id,
+            f"cmpl-{request_id}",
+            f"{request_id}/{request_id}",
+            canonical,
+    }:
+        return canonical
+    engine_id = rf"(?:cmpl-)?{re.escape(request_id)}(?:-\d+-[0-9a-fA-F]{{8}}|-\d+)"
+    return canonical if re.fullmatch(engine_id, value) is not None else None
+
+
 def trace_aliases(records: list[dict[str, Any]]) -> dict[str, set[str]]:
     aliases: dict[str, set[str]] = {}
     for record in records:
         request_id = record["request_id"]
-        values = {request_id, f"cmpl-{request_id}"}
+        canonical = f"cmpl-{request_id}/{request_id}"
+        values = {request_id, f"cmpl-{request_id}", canonical, f"{request_id}/{request_id}"}
         for response_id in record.get("response_ids", []):
             values.add(response_id)
             values.add(response_id.removeprefix("cmpl-"))
-        for value in tuple(values):
-            for suffix in range(10):
-                values.add(f"{value}-{suffix}")
+            normalized = canonical_trace_alias(response_id, request_id)
+            if normalized is not None:
+                values.add(normalized)
         aliases[request_id] = values
     return aliases
 
@@ -656,7 +720,10 @@ def normalize_trace_event(row: dict[str, Any], expected_capacity: int,
 
     assignments: dict[int, str] = {}
     for lane, reqid in zip(active_lanes, active_ids, strict=True):
-        matches = [request_id for request_id, candidates in aliases.items() if reqid in candidates]
+        matches = [
+            request_id for request_id, candidates in aliases.items()
+            if reqid in candidates or canonical_trace_alias(reqid, request_id) in candidates
+        ]
         if len(matches) != 1:
             return None, f"reqid {reqid!r} matched {len(matches)} HTTP request IDs"
         assignments[lane] = matches[0]
@@ -732,9 +799,36 @@ def correlate_lifecycle(events: list[dict[str, Any]], lifecycle: dict[str, str])
     return result
 
 
+def capture_evidence_boundary(path: Path | None) -> dict[str, Any]:
+    """Capture the byte/line boundary that later evidence must extend unchanged."""
+    boundary: dict[str, Any] = {
+        "path": None if path is None else str(path), "captured_at": now(),
+        "status": "not_provided", "valid": False, "start_byte": None,
+        "start_line": None, "prefix_sha256": None,
+    }
+    if path is None:
+        return boundary
+    try:
+        raw = path.read_bytes()
+    except OSError as exc:
+        boundary.update({"status": "missing_or_unreadable", "error": f"{type(exc).__name__}: {exc}"})
+        return boundary
+    boundary.update({
+        "status": "captured", "valid": True, "start_byte": len(raw), "start_line": raw.count(b"\n") + 1,
+        "prefix_sha256": digest(raw),
+    })
+    if raw and not raw.endswith(b"\n"):
+        boundary.update({
+            "status": "invalid_partial_line", "valid": False,
+            "error": "existing evidence does not end at a JSONL line boundary",
+        })
+    return boundary
+
+
 def assess_evidence(path: Path | None, records: list[dict[str, Any]],
                     lifecycle: dict[str, str] | None = None,
-                    batch_capacity: int = DEFAULT_BATCH_CAPACITY) -> dict[str, Any]:
+                    batch_capacity: int = DEFAULT_BATCH_CAPACITY, *,
+                    evidence_boundary: dict[str, Any] | None = None) -> dict[str, Any]:
     expected_capacity = validate_batch_capacity(batch_capacity, "configured batch capacity")
     result: dict[str, Any] = {
         "format": "actual-packed-jsonl-v2-or-legacy-b2",
@@ -751,13 +845,57 @@ def assess_evidence(path: Path | None, records: list[dict[str, Any]],
     if path is None:
         return result
     raw_ref: dict[str, Any] = {"path": str(path), "errors": []}
+    start_byte, start_line = 0, 1
+    if evidence_boundary is not None:
+        raw_ref["boundary"] = dict(evidence_boundary)
+        boundary_valid = bool(evidence_boundary.get("valid"))
+        if evidence_boundary.get("status") != "captured" or not boundary_valid:
+            raw_ref["boundary_valid"] = False
+            raw_ref["errors"].append(
+                f"invalid evidence boundary: {evidence_boundary.get('status')} "
+                f"{evidence_boundary.get('error', '')}".rstrip())
+            result["raw_refs"] = [raw_ref]
+            return result
+        start_byte = evidence_boundary.get("start_byte")
+        start_line = evidence_boundary.get("start_line")
+        prefix_sha256 = evidence_boundary.get("prefix_sha256")
+        if (type(start_byte) is not int or start_byte < 0 or type(start_line) is not int or start_line < 1
+                or not isinstance(prefix_sha256, str) or len(prefix_sha256) != 64):
+            raw_ref["boundary_valid"] = False
+            raw_ref["errors"].append("invalid evidence boundary shape")
+            result["raw_refs"] = [raw_ref]
+            return result
     try:
         raw = path.read_bytes()
         raw_ref["sha256"] = digest(raw)
+        scan = raw
+        if evidence_boundary is not None:
+            if len(raw) < start_byte:
+                raw_ref["boundary_valid"] = False
+                raw_ref["errors"].append(
+                    f"evidence truncated below boundary: observed {len(raw)} bytes, expected at least {start_byte}")
+                result["raw_refs"] = [raw_ref]
+                return result
+            prefix = raw[:start_byte]
+            observed_prefix_sha256 = digest(prefix)
+            observed_start_line = prefix.count(b"\n") + 1
+            if observed_prefix_sha256 != prefix_sha256 or observed_start_line != start_line:
+                raw_ref["boundary_valid"] = False
+                raw_ref["errors"].append(
+                    "evidence prefix changed before the runtime boundary: "
+                    f"sha256={observed_prefix_sha256}, start_line={observed_start_line}")
+                result["raw_refs"] = [raw_ref]
+                return result
+            scan = raw[start_byte:]
+            raw_ref.update({
+                "boundary_valid": True, "start_byte": start_byte, "start_line": start_line,
+                "observed_bytes": len(raw), "appended_bytes": len(scan),
+                "prefix_sha256": observed_prefix_sha256, "appended_sha256": digest(scan),
+            })
         aliases = trace_aliases(records)
         rejected = []
         observed_capacities = set()
-        for line_number, line in enumerate(raw.decode("utf-8").splitlines(), 1):
+        for line_number, line in enumerate(scan.decode("utf-8").splitlines(), start_line):
             if not line.strip():
                 continue
             try:
@@ -801,7 +939,271 @@ def assess_evidence(path: Path | None, records: list[dict[str, Any]],
     return result
 
 
+def runtime_queue_evidence(records: list[dict[str, Any]], capacity: int,
+                           snapshots: list[dict[str, Any]], evidence: dict[str, Any] | None = None
+                           ) -> dict[str, Any]:
+    """Describe A>N queue observations without claiming a physical multi-batch."""
+    running = [row.get("num_requests_running") for row in snapshots
+               if row.get("num_requests_running") is not None]
+    waiting = [row.get("num_requests_waiting") for row in snapshots
+               if row.get("num_requests_waiting") is not None]
+    exceeds = len(records) > capacity
+    max_waiting = max(waiting) if waiting else None
+    rounds = sorted({
+        event["batch_round"] for event in (evidence or {}).get("matched_events", ())
+        if isinstance(event, dict) and type(event.get("batch_round")) is int
+    })
+    return {
+        "active_clients": len(records), "batch_capacity": capacity, "a_exceeds_n": exceeds,
+        "observed_max_running": max(running) if running else None,
+        "observed_max_waiting": max_waiting,
+        "queue_observed": (max_waiting is not None and max_waiting > 0) if exceeds else None,
+        "queue_observation_required_for_runtime_pass": False,
+        "correlated_packed_rounds": rounds,
+        "multiple_packed_rounds_observed": len(rounds) > 1,
+        "physical_multi_batch_proven": False,
+        "scope": ("A>N may show waiting>0 as queue evidence, but the device batch remains N. "
+                  "Multiple correlated packed rounds are reported separately and a single trace file "
+                  "does not prove complete multi-wave coverage."),
+    }
+
+
+def _runtime_request_result(record: dict[str, Any]) -> dict[str, Any]:
+    raw_response_ids = record.get("response_ids")
+    response_ids = list(raw_response_ids) if isinstance(raw_response_ids, (list, tuple)) else []
+    response_ids_valid = bool(response_ids) and all(
+        isinstance(value, str) and bool(value.strip()) for value in response_ids)
+    sse_complete = complete(record)
+    return {
+        "request_id": record.get("request_id"), "http_status": record.get("status"),
+        "error": record.get("error"), "done": bool(record.get("done")),
+        "finish_reason": record.get("finish_reason"),
+        "token_count": len(record.get("token_ids") or ()), "max_tokens": record.get("max_tokens"),
+        "response_ids": response_ids, "response_ids_valid": response_ids_valid,
+        "response_id_present": response_ids_valid, "sse_complete": sse_complete,
+        "passed": bool(sse_complete and response_ids_valid),
+        "result_path": record.get("result_path"), "raw_sse_path": record.get("raw_sse_path"),
+    }
+
+
+def runtime_cancel_trace_status(evidence: dict[str, Any], lifecycle: dict[str, str] | None) -> str:
+    """Classify runtime cancel trace correlation without inferring missing generations."""
+    if lifecycle is None or evidence.get("status") == "not_provided":
+        return "not_provided"
+    details = evidence.get("lifecycle") or {}
+    if (evidence.get("status") == "runner_evidence_correlated"
+            and details.get("status") == "runner_lifecycle_correlated"):
+        return "correlated"
+    events = [event for event in evidence.get("matched_events", ()) if isinstance(event, dict)]
+    cancelled, survivor, reuse = (lifecycle[key] for key in ("cancelled", "survivor", "reuse"))
+    cancel_pair = any({cancelled, survivor}.issubset(event.get("request_ids", ())) for event in events)
+    reuse_pair = any({reuse, survivor}.issubset(event.get("request_ids", ())) for event in events)
+    if (cancel_pair and reuse_pair and details.get("slot_generation_advanced") is None
+            and details.get("survivor_slot_generation_consistent") is None):
+        return "inconclusive"
+    return "not_correlated"
+
+
+def _runtime_cancel_probe(config: dict[str, Any], requests: list[dict[str, Any]], api_key: str | None,
+                          directory: Path) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, str]]:
+    """Run one extra two-lane cancel/reuse lifecycle after the main runtime overlap."""
+    cancelled_request, survivor_request, reuse_request = cancellation_requests(requests)
+    cancel_after = int(config.get("cancel_after", DEFAULT_CANCEL_AFTER))
+    barrier = threading.Barrier(2)
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        cancelled_future = pool.submit(
+            run_request, config["url"], config["model"], cancelled_request, directory / "cancelled",
+            config["timeout"], api_key, "runtime-cancel-overlap", barrier, cancel_after)
+        survivor_future = pool.submit(
+            run_request, config["url"], config["model"], survivor_request, directory / "survivor",
+            config["timeout"], api_key, "runtime-survivor-overlap", barrier)
+        cancelled = cancelled_future.result()
+        survivor_live_at_cancel = not survivor_future.done()
+        reuse_live_at_submit = not survivor_future.done()
+        reuse_future = pool.submit(
+            run_request, config["url"], config["model"], reuse_request, directory / "reuse",
+            config["timeout"], api_key, "runtime-reuse-overlap")
+        survivor, reuse = survivor_future.result(), reuse_future.result()
+
+    cancelled_result = _runtime_request_result(cancelled)
+    survivor_result = _runtime_request_result(survivor)
+    reuse_result = _runtime_request_result(reuse)
+    cancel_overlap = overlap([cancelled, survivor])
+    reuse_overlap = overlap([survivor, reuse])
+    cancelled_http_ok = bool(
+        cancelled.get("status") == 200 and cancelled_result["response_ids_valid"]
+        and cancelled.get("client_cancelled") is True and cancelled.get("done") is False
+        and len(cancelled.get("token_ids") or ()) >= cancel_after and cancelled.get("error") is None)
+    cancel_reuse_ok = bool(
+        cancelled_http_ok and survivor_result["passed"] and reuse_result["passed"]
+        and survivor_live_at_cancel and reuse_live_at_submit
+        and cancel_overlap["client_overlap"] and reuse_overlap["client_overlap"])
+    lifecycle = {"cancelled": cancelled_request["id"], "survivor": survivor_request["id"],
+                 "reuse": reuse_request["id"]}
+    result = {
+        "scope": ("extra two-lane lifecycle after the main runtime overlap; not full-capacity "
+                  "cancellation and no serial/token-prefix matching"),
+        "cancel_after": cancel_after, "cancel_reuse_ok": cancel_reuse_ok,
+        "cancelled_http_200": cancelled.get("status") == 200,
+        "cancelled_response_id_valid": cancelled_result["response_ids_valid"],
+        "cancelled_after_tokens": len(cancelled.get("token_ids") or ()),
+        "cancelled_client_cancelled": cancelled.get("client_cancelled") is True,
+        "cancelled_not_done": cancelled.get("done") is False,
+        "cancelled_error_free": cancelled.get("error") is None,
+        "survivor_live_at_cancel": survivor_live_at_cancel,
+        "reuse_live_at_submit": reuse_live_at_submit,
+        "survivor_complete": complete(survivor),
+        "survivor_response_id_valid": survivor_result["response_ids_valid"],
+        "reuse_complete": complete(reuse),
+        "reuse_response_id_valid": reuse_result["response_ids_valid"],
+        "http_overlap": {"cancel_survivor": cancel_overlap, "reuse_survivor": reuse_overlap},
+        "records": {"cancelled": cancelled_result, "survivor": survivor_result, "reuse": reuse_result},
+    }
+    return result, [cancelled, survivor, reuse], lifecycle
+
+
+def _execute_runtime_smoke(config: dict[str, Any], capacity: int,
+                           requests: list[dict[str, Any]]) -> dict[str, Any]:
+    """Run liveness smoke without serial references or semantic token matching."""
+    output = config["output"].resolve()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.mkdir(exist_ok=False)
+    api_key = config["api_key_file"].read_text().strip() if config.get("api_key_file") else None
+    report: dict[str, Any] = {
+        "schema": "dsv41.dspark.runtime_smoke_report.v1", "mode": RUNTIME_SMOKE_MODE,
+        "started_at": now(), "service": {"url": config["url"], "model": config["model"]},
+        "cases": config["cases"], "clients": config["clients"], "batch_capacity": capacity,
+        "prompt_lengths": [len(request["prompt_token_ids"]) for request in requests],
+        "request_matrix": [{**request, **hashes(config["model"], request)} for request in requests],
+        "health": {}, "metrics": {}, "overlap": {}, "drain": {}, "queue_evidence": {},
+        "runner_evidence": {}, "runner_evidence_boundary": {}, "requests": [], "cancellation": None,
+        "serial": {"status": "not_run"},
+    }
+    summary: dict[str, Any] = {
+        "schema": "dsv41.dspark.runtime_smoke_summary.v1", "mode": RUNTIME_SMOKE_MODE,
+        "started_at": report["started_at"], "status": "runtime_smoke_failed",
+        "runtime_status": "failed", "runtime_qualified": False,
+        "batch_capacity": capacity, "http_active_clients": len(requests),
+        "active_clients_within_capacity": len(requests) <= capacity,
+        "http_qualified": False, "formal_qualification": False,
+        "runtime_success_is_formal_qualification": False,
+        "semantic_exact_checked": False, "all_responses_match": None, "references_stable": None,
+        "serial": {"status": "not_run"}, "qualification_scope": RUNTIME_SCOPE,
+        "runtime_checks": {}, "queue_evidence": {}, "requests": [], "cancellation": None,
+        "inspection_required": True,
+    }
+    try:
+        health_before = save_health(config["url"], output / "health-before.json", config["timeout"], api_key)
+        evidence_path = config.get("runner_evidence")
+        evidence_boundary = capture_evidence_boundary(evidence_path)
+        runtime_root = output / "runtime"
+        metrics_before = save_metrics(config["url"], config["model"], runtime_root / "metrics-before.txt",
+                                      config["timeout"], api_key)
+        stop, during = threading.Event(), []
+        poller = threading.Thread(target=poll_metrics, args=(
+            stop, config["url"], config["model"], config["timeout"], api_key, runtime_root,
+            config["metrics_interval"], during), daemon=True)
+        poller.start()
+        cancellation = None
+        lifecycle_records: list[dict[str, Any]] = []
+        lifecycle = None
+        try:
+            barrier = threading.Barrier(len(requests))
+            with ThreadPoolExecutor(max_workers=len(requests)) as pool:
+                futures = [pool.submit(run_request, config["url"], config["model"], request,
+                                       runtime_root / request["id"], config["timeout"], api_key,
+                                       "runtime-smoke", barrier) for request in requests]
+                records = [future.result() for future in futures]
+            if config["cancel_probe"]:
+                cancellation, lifecycle_records, lifecycle = _runtime_cancel_probe(
+                    config, requests, api_key, runtime_root / "cancellation")
+        finally:
+            stop.set()
+            poller.join(timeout=config["timeout"])
+        metrics_after = save_metrics(config["url"], config["model"], runtime_root / "metrics-after.txt",
+                                     config["timeout"], api_key)
+        health_after = save_health(config["url"], output / "health-after.json", config["timeout"], api_key)
+        drain = wait_idle(config["url"], config["model"], config["timeout"], api_key, runtime_root,
+                          config["drain_timeout"], config["metrics_interval"])
+        evidence = assess_evidence(evidence_path, records + lifecycle_records, lifecycle, batch_capacity=capacity,
+                                   evidence_boundary=evidence_boundary)
+        cancel_trace_status = (runtime_cancel_trace_status(evidence, lifecycle)
+                               if cancellation is not None else None)
+        if cancellation is not None:
+            cancellation.update({
+                "trace_status": cancel_trace_status,
+                "trace_scope": ("single-rank lifecycle correlation only; slot/generation evidence is "
+                                "reported as inconclusive when unavailable"),
+            })
+        overlap_result = overlap(records)
+        request_results = [_runtime_request_result(record) for record in records]
+        metrics_readable = bool(
+            metrics_before.get("status") == 200 and metrics_after.get("status") == 200
+            and any(snapshot.get("status") == 200 for snapshot in during)
+        )
+        checks = {
+            "health_before_ok": health_before.get("status") == 200,
+            "health_after_ok": health_after.get("status") == 200,
+            "all_sse_complete": all(result["sse_complete"] for result in request_results),
+            "all_response_ids_present": all(result["response_id_present"] for result in request_results),
+            "client_overlap_ok": len(records) <= 1 or overlap_result["client_overlap"],
+            "metrics_readable": metrics_readable,
+            "drained_idle": drain["idle"],
+            "runner_evidence_ok": evidence["status"] in ("not_provided", "runner_evidence_correlated"),
+        }
+        if cancellation is not None:
+            checks["cancel_reuse_ok"] = cancellation["cancel_reuse_ok"]
+            if evidence_path is not None:
+                checks["runner_evidence_lifecycle_ok"] = cancel_trace_status == "correlated"
+        runtime_qualified = all(checks.values())
+        if runtime_qualified and evidence["status"] == "runner_evidence_correlated":
+            status = "runtime_smoke_evidence_correlated"
+        elif runtime_qualified:
+            status = "runtime_smoke_passed"
+        else:
+            status = "runtime_smoke_failed"
+        queue_evidence = runtime_queue_evidence(records, capacity, during, evidence)
+        report.update({
+            "health": {"before": health_before, "after": health_after},
+            "metrics": {
+                "before": str(runtime_root / "metrics-before.txt"),
+                "after": str(runtime_root / "metrics-after.txt"),
+                "during_snapshots": len(during), "metrics_readable": metrics_readable,
+                "observed_max_running": queue_evidence["observed_max_running"],
+                "observed_max_waiting": queue_evidence["observed_max_waiting"],
+                "note": "Service-wide asynchronous metrics; not device-batch proof.",
+            },
+            "overlap": {"overlap": overlap_result, "directory": str(runtime_root)},
+            "drain": drain, "queue_evidence": queue_evidence,
+            "runner_evidence": evidence, "runner_evidence_boundary": evidence_boundary,
+            "requests": request_results, "cancellation": cancellation,
+        })
+        summary.update({
+            "status": status, "runtime_status": "passed" if runtime_qualified else "failed",
+            "runtime_qualified": runtime_qualified, "runtime_checks": checks,
+            "health": {"before": health_before.get("status"), "after": health_after.get("status")},
+            "metrics": report["metrics"], "overlap": overlap_result,
+            "queue_evidence": queue_evidence, "runner_evidence": evidence,
+            "runner_evidence_boundary": evidence_boundary,
+            "requests": request_results, "cancellation": cancellation,
+        })
+    except Exception as exc:
+        report["error"] = f"{type(exc).__name__}: {exc}"
+        summary.update({"error": report["error"], "runtime_status": "failed", "runtime_qualified": False})
+    summary.update({
+        "report_path": str(output / "report.json"), "summary_path": str(output / "summary.json"),
+    })
+    report["summary"] = summary
+    report["finished_at"] = now()
+    write_json(output / "summary.json", summary)
+    write_json(output / "report.json", report)
+    return summary
+
+
 def execute(config: dict[str, Any]) -> dict[str, Any]:
+    mode = config.get("mode", QUALIFICATION_MODE)
+    if mode not in MODES:
+        raise ValueError(f"mode must be one of {MODES}")
     capacity = validate_batch_capacity(config.get("batch_capacity", DEFAULT_BATCH_CAPACITY))
     if config["cancel_probe"] and config["clients"] < 2:
         raise ValueError("cancellation probe requires at least two clients")
@@ -813,6 +1215,8 @@ def execute(config: dict[str, Any]) -> dict[str, Any]:
             requests[0]["max_tokens"] < cancel_after + CANCEL_BUDGET_HEADROOM
             or requests[1]["max_tokens"] < requests[0]["max_tokens"] + CANCEL_BUDGET_HEADROOM):
         raise ValueError("cancel probe needs budget headroom; use --budgets 16 24 for --cancel-after 7")
+    if mode == RUNTIME_SMOKE_MODE:
+        return _execute_runtime_smoke(config, capacity, requests)
     output = config["output"].resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
     output.mkdir(exist_ok=False)
@@ -1016,16 +1420,22 @@ def execute(config: dict[str, Any]) -> dict[str, Any]:
 
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    result.add_argument(
+        "--mode", choices=MODES, default=QUALIFICATION_MODE,
+        help="qualification keeps serial exact gates; runtime-smoke skips serial references and checks liveness only")
     result.add_argument("--url", default=DEFAULT_URL)
     result.add_argument("--model", default=DEFAULT_MODEL)
     result.add_argument("--output", type=Path, required=True, help="new unique artifact directory")
     result.add_argument("--cases", type=int, default=2, help="distinct prompt cases (default: 2)")
     result.add_argument("--clients", type=int, default=3,
-                        help="simultaneous clients, including A=1 partial activity (default: 3)")
+                        help=f"simultaneous clients up to {MAX_DSV41_DSPARK_CAPACITY} "
+                             "(default: 3)")
     result.add_argument("--batch-capacity", type=int, default=DEFAULT_BATCH_CAPACITY,
                         help=f"fixed device batch capacity N in {MIN_BATCH_CAPACITY}..{MAX_BATCH_CAPACITY} "
                              f"(default: {DEFAULT_BATCH_CAPACITY})")
-    result.add_argument("--budgets", type=int, nargs="+", help="one distinct budget per client; default 8,16,24,32")
+    result.add_argument("--budgets", type=int, nargs="+",
+                        help="per-client output budgets, cycled when shorter than --clients; "
+                             "default cycle 8,16,24,32")
     result.add_argument(
         "--prompt-lengths", type=int, nargs="+",
         help=f"one token-ID prompt length per case, bounded to 1..{MAX_PROMPT_TOKENS}; e.g. 259 511")
@@ -1060,7 +1470,7 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit("--prompt-lengths requires exactly --cases values")
     try:
         summary = execute({
-            "url": args.url, "model": args.model, "output": args.output, "cases": args.cases,
+            "mode": args.mode, "url": args.url, "model": args.model, "output": args.output, "cases": args.cases,
             "clients": args.clients, "batch_capacity": args.batch_capacity, "budgets": args.budgets,
             "prompt_lengths": args.prompt_lengths,
             "runner_evidence": args.runner_evidence,
@@ -1069,15 +1479,28 @@ def main(argv: list[str] | None = None) -> int:
             "api_key_file": args.api_key_file,
         })
     except Exception as exc:
-        print(f"qualification failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+        label = "runtime smoke setup failed" if args.mode == RUNTIME_SMOKE_MODE else "qualification failed"
+        print(f"{label}: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 2
+    if args.mode == RUNTIME_SMOKE_MODE:
+        print(json.dumps({key: summary.get(key) for key in (
+            "status", "runtime_status", "runtime_qualified", "formal_qualification",
+            "runtime_success_is_formal_qualification", "semantic_exact_checked", "http_qualified",
+            "all_responses_match", "batch_capacity", "http_active_clients", "runtime_checks", "overlap",
+            "queue_evidence", "cancellation", "runner_evidence", "runner_evidence_boundary",
+            "qualification_scope")},
+            indent=2, ensure_ascii=False))
+        if (summary.get("status") in SUCCESSFUL_RUNTIME_STATUSES
+                and summary.get("runtime_qualified") is True):
+            return 0
+        return 1
     print(json.dumps({key: summary.get(key) for key in (
         "status", "http_qualified", "batch_capacity", "http_active_clients", "all_responses_match", "overlap",
         "runner_evidence")},
         indent=2, ensure_ascii=False))
-    if not summary.get("http_qualified"):
+    if summary.get("status") not in SUCCESSFUL_QUALIFICATION_STATUSES or not summary.get("http_qualified"):
         return 1
-    return 1 if summary.get("status") == "http_only_runner_evidence_not_correlated" else 0
+    return 0
 
 
 if __name__ == "__main__":

@@ -81,7 +81,7 @@ def _runner(config):
     return runner
 
 
-@pytest.mark.parametrize("max_num_seqs", (2, 4))
+@pytest.mark.parametrize("max_num_seqs", (2, 3, 6, 16, 64))
 def test_platform_batch_admission_allows_greedy_and_rejects_non_greedy(monkeypatch, max_num_seqs):
     monkeypatch.setenv("VLLM_HPU_DSV41_DSPARK", "1")
     monkeypatch.setenv("VLLM_HPU_DSV41_DEVICE_VERIFY", "1")
@@ -97,7 +97,7 @@ def test_platform_batch_admission_allows_greedy_and_rejects_non_greedy(monkeypat
         HpuPlatform.validate_request(None, SamplingParams(temperature=1, max_tokens=8))
 
 
-@pytest.mark.parametrize("max_num_seqs", (2, 3, 4))
+@pytest.mark.parametrize("max_num_seqs", (2, 3, 6, 8, 16, 64))
 def test_worker_batch_admission_matches_platform(monkeypatch, max_num_seqs):
     monkeypatch.setenv("VLLM_HPU_DSV41_DSPARK", "1")
     monkeypatch.setenv("VLLM_HPU_DSV41_DEVICE_VERIFY", "1")
@@ -125,7 +125,7 @@ def test_b1_sampled_admission_keeps_existing_device_verify_behavior(monkeypatch)
         _runner(config)._validate_sampling(sampled)
 
 
-@pytest.mark.parametrize("max_num_seqs", (2, 3, 4))
+@pytest.mark.parametrize("max_num_seqs", (2, 3, 6, 16, 64))
 def test_profile_reset_from_batch_to_b1_clears_platform_gate(monkeypatch, max_num_seqs):
     monkeypatch.setenv("VLLM_HPU_DSV41_DSPARK", "1")
     monkeypatch.setenv("VLLM_HPU_DSV41_DEVICE_VERIFY", "1")
@@ -148,7 +148,7 @@ def test_non_v41_or_dspark_off_is_not_temperature_restricted(monkeypatch, model_
     _runner(_config(model_type=model_type, max_num_seqs=1))._validate_sampling(sampled)
 
 
-@pytest.mark.parametrize("max_num_seqs", (2, 4))
+@pytest.mark.parametrize("max_num_seqs", (2, 6, 64))
 def test_batch_admission_still_rejects_unsupported_penalties(monkeypatch, max_num_seqs):
     monkeypatch.setenv("VLLM_HPU_DSV41_DSPARK", "1")
     _record_platform_profile(_config(max_num_seqs=max_num_seqs))

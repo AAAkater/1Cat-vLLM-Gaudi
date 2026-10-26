@@ -13,7 +13,9 @@ import operator
 
 import torch
 
-_MAX_BATCH_SIZE = 8
+from vllm_gaudi.ops.deepseek_v41_capacity import MAX_DSV41_DSPARK_CAPACITY, validate_dspark_capacity
+
+_MAX_BATCH_SIZE = MAX_DSV41_DSPARK_CAPACITY
 _MAX_DRAFT_TOKENS = 5
 _TARGET_QUERY_BUCKET = 6
 _DRAFT_PAD = -1
@@ -399,7 +401,7 @@ class DSparkBatchMetadata:
         round_generation=0,
         active=None,
     ) -> "DSparkBatchMetadata":
-        """Build packed B1..B8 metadata without engine or HPU dependencies.
+        """Build packed B1..B64 metadata without engine or HPU dependencies.
 
         All metadata inputs must be Python sequences or CPU host tensors;
         ``device`` only selects where the returned tensors are constructed.
@@ -427,8 +429,7 @@ class DSparkBatchMetadata:
         except TypeError as error:
             raise TypeError("requests must be a sequence") from error
         batch_size = len(request_ids)
-        if not 1 <= batch_size <= _MAX_BATCH_SIZE:
-            raise ValueError(f"batch size must be in 1..{_MAX_BATCH_SIZE}")
+        validate_dspark_capacity(batch_size, allow_serial=True, name="batch size")
 
         explicit_active = active is not None
         if explicit_active:
@@ -622,8 +623,7 @@ def _fixed_metadata_layout(metadata: DSparkBatchMetadata):
         raise TypeError("metadata must be a DSparkBatchMetadata instance")
 
     batch_size = len(metadata.request_ids)
-    if not 1 <= batch_size <= _MAX_BATCH_SIZE:
-        raise ValueError(f"metadata batch size must be in 1..{_MAX_BATCH_SIZE}")
+    validate_dspark_capacity(batch_size, allow_serial=True, name="metadata batch size")
     active = _request_active_values(metadata, batch_size)
 
     starts = _integer_values(metadata.target_query_start_loc, "target_query_start_loc")

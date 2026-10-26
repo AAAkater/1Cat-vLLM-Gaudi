@@ -1152,27 +1152,46 @@ def test_target_greedy_ids_bind_real_prepared_stage_and_exchange_only_pairs(monk
     assert "_global_argmax" not in PreparedStage.__dict__
 
     torch.manual_seed(17)
+    rows_per_lane = 6
+    lane_count = 2
     hidden = torch.randn(12, 6)
     full_weight = torch.randn(8, 6)
-    full_logits = hidden.float() @ full_weight.T
-    oracle = full_logits.argmax(dim=-1)
     shard_width = full_weight.shape[0] // 2
+
+    # The reference must launch the same serial C6 math once per request lane;
+    # a single 12-row projection is precisely the behaviour under repair.
+    lane_logits = []
+    lane_oracles = []
     expected_pairs = []
-    for rank in range(2):
-        local = full_logits[:, rank * shard_width:(rank + 1) * shard_width]
-        values, indices = local.max(dim=-1)
-        expected_pairs.append(torch.stack(
-            (values.float(), (indices + rank * shard_width).float()), dim=-1))
+    for lane in range(lane_count):
+        start = lane * rows_per_lane
+        logits = hidden[start:start + rows_per_lane].float() @ full_weight.T
+        lane_logits.append(logits)
+        lane_oracles.append(logits.argmax(dim=-1))
+        lane_pairs = []
+        for rank in range(2):
+            local = logits[:, rank * shard_width:(rank + 1) * shard_width]
+            values, indices = local.max(dim=-1)
+            lane_pairs.append(torch.stack(
+                (values.float(), (indices + rank * shard_width).float()), dim=-1))
+        expected_pairs.append(lane_pairs)
+    oracle = torch.cat(lane_oracles, dim=0)
 
     observed = []
+    observed_heads = []
+    observed_gathers = []
     for rank in range(2):
+        head_calls = []
+        gather_calls = []
+
         def all_gather(pair, dim, *, _rank=rank):
+            lane = len(gather_calls)
             assert dim == -1
-            assert pair.shape == (12, 2)
+            assert pair.shape == (rows_per_lane, 2)
             assert pair.dtype == torch.float32
-            torch.testing.assert_close(pair, expected_pairs[_rank])
-            observed.append(tuple(pair.shape))
-            return torch.cat(expected_pairs, dim=-1)
+            torch.testing.assert_close(pair, expected_pairs[lane][_rank])
+            gather_calls.append(tuple(pair.shape))
+            return torch.cat(expected_pairs[lane], dim=-1)
 
         stage = PreparedStage.__new__(PreparedStage)
         torch.nn.Module.__init__(stage)
@@ -1185,13 +1204,77 @@ def test_target_greedy_ids_bind_real_prepared_stage_and_exchange_only_pairs(monk
         stage.bf16_head = False
         stage.tp_rank = rank
         stage.all_gather = all_gather
+        real_head_projection = stage._head_projection
 
-        assert torch.equal(_target_greedy_ids(stage, hidden), oracle)
+        def head_projection(value, *, _rank=rank, _head_projection=real_head_projection):
+            lane = len(head_calls)
+            start = lane * rows_per_lane
+            torch.testing.assert_close(value, hidden[start:start + rows_per_lane])
+            projected = _head_projection(value)
+            torch.testing.assert_close(
+                projected,
+                lane_logits[lane][:, _rank * shard_width:(_rank + 1) * shard_width],
+            )
+            head_calls.append(tuple(value.shape))
+            return projected
 
-    assert observed == [(12, 2), (12, 2)]
+        stage._head_projection = head_projection
+
+        actual = _target_greedy_ids(stage, hidden)
+        assert actual.shape == (lane_count * rows_per_lane, )
+        for lane, expected in enumerate(lane_oracles):
+            start = lane * rows_per_lane
+            assert torch.equal(actual[start:start + rows_per_lane], expected)
+        observed.append(tuple(actual.shape))
+        observed_heads.append(head_calls)
+        observed_gathers.append(gather_calls)
+
+    assert observed == [(12, ), (12, )]
+    assert observed_heads == [[(6, 6), (6, 6)], [(6, 6), (6, 6)]]
+    assert observed_gathers == [[(6, 2), (6, 2)], [(6, 2), (6, 2)]]
 
 
-def test_packed_target_stages_create_one_fixed_capacity_key(monkeypatch):
+def test_target_greedy_ids_keep_cross_lane_sentinel_local():
+    rows_per_lane = 6
+    hidden = torch.tensor(
+        [[100.0, -100.0]]
+        + [[0.0, 1.0]] * (rows_per_lane - 1)
+        + [[-100.0, 100.0]] * rows_per_lane,
+        dtype=torch.float32,
+    )
+    head_calls = []
+    gather_calls = []
+
+    def head_projection(value):
+        head_calls.append(value.clone())
+        return value
+
+    def all_gather(pair, dim):
+        assert dim == -1
+        gather_calls.append(tuple(pair.shape))
+        return pair
+
+    program = SimpleNamespace(
+        _head_projection=head_projection,
+        tp_rank=0,
+        all_gather=all_gather,
+    )
+    actual = _target_greedy_ids(program, hidden)
+
+    assert actual.tolist() == [0] + [1] * (2 * rows_per_lane - 1)
+    assert len(head_calls) == 2
+    assert torch.equal(head_calls[0], hidden[:rows_per_lane])
+    assert torch.equal(head_calls[1], hidden[rows_per_lane:])
+    assert gather_calls == [(rows_per_lane, 2), (rows_per_lane, 2)]
+
+
+def test_target_greedy_ids_reject_non_c6_hidden_rows():
+    with pytest.raises(ValueError, match="positive multiple of 6"):
+        _target_greedy_ids(SimpleNamespace(), torch.empty(7, 6))
+
+
+@pytest.mark.parametrize("capacity", (3, 6, 8, 11, 16, 64))
+def test_packed_target_stages_create_one_capacity_sized_key(monkeypatch, capacity):
     import vllm_gaudi.models.deepseek_v41_batch_target_program as target_program
 
     created = []
@@ -1207,24 +1290,26 @@ def test_packed_target_stages_create_one_fixed_capacity_key(monkeypatch):
 
     monkeypatch.setattr(target_program, "DSparkTargetStage", FakeTargetStage)
     program = SimpleNamespace(config={"text_config": {"hidden_size": 16}})
-    state = SimpleNamespace(capacity=4)
-    stages = DSparkPackedTargetStages(program, state, device="cpu", batch_capacity=4)
+    state = SimpleNamespace(capacity=capacity)
+    stages = DSparkPackedTargetStages(program, state, device="cpu", batch_capacity=capacity)
+    stage_key = tuple(range(capacity))
+    rows = capacity * 6
 
     assert len(created) == 1
-    assert stages.stage_key == (0, 1, 2, 3)
-    assert stages.stages == {(0, 1, 2, 3): stages.stage}
-    assert created[0].request_lengths == (6, 6, 6, 6)
-    assert created[0].request_slots == (0, 1, 2, 3)
-    assert tuple(stages.hidden_seed.shape) == (24, 4, 16)
-    assert tuple(stages.pre_mix_seed.shape) == (24, 4)
+    assert stages.stage_key == stage_key
+    assert stages.stages == {stage_key: stages.stage}
+    assert created[0].request_lengths == (6, ) * capacity
+    assert created[0].request_slots == stage_key
+    assert tuple(stages.hidden_seed.shape) == (rows, 4, 16)
+    assert tuple(stages.pre_mix_seed.shape) == (rows, 4)
 
-    with pytest.raises(ValueError, match="staging capacity 23 is smaller than fixed target rows 24"):
+    with pytest.raises(ValueError, match=f"staging capacity {rows - 1} is smaller than fixed target rows {rows}"):
         DSparkPackedTargetStages(
             program,
             state,
             device="cpu",
-            engram_host=SimpleNamespace(max_tokens=23),
-            batch_capacity=4,
+            engram_host=SimpleNamespace(max_tokens=rows - 1),
+            batch_capacity=capacity,
         )
 
 
@@ -1237,8 +1322,8 @@ def _dspark_b2_config(*, max_num_seqs=2, tp=8, pp=1, prefix=False, async_schedul
     )
 
 
-@pytest.mark.parametrize("max_num_seqs", (2, 3, 4))
-def test_concurrency_profile_allows_two_through_four_requests(monkeypatch, max_num_seqs):
+@pytest.mark.parametrize("max_num_seqs", (2, 3, 6, 8, 16, 64))
+def test_concurrency_profile_allows_contract_capacity(monkeypatch, max_num_seqs):
     from vllm_gaudi.entrypoints.deepseek_v41 import _DSPARK_TP8_DEFAULTS
 
     monkeypatch.setenv("VLLM_HPU_DSV41_DSPARK", "1")
@@ -1252,7 +1337,7 @@ def test_concurrency_profile_allows_two_through_four_requests(monkeypatch, max_n
 @pytest.mark.parametrize(
     "overrides",
     (
-        {"max_num_seqs": 5},
+        {"max_num_seqs": 65},
         {"prefix": True},
         {"async_scheduling": True},
         {"tp": 4},
@@ -1363,8 +1448,8 @@ def test_dspark_request_state_uses_the_bounded_capacity_range(monkeypatch):
     model = object.__new__(HpuDeepseekV41ForCausalLM)
     model.native = True
     model.program = SimpleNamespace(dspark=True)
-    for capacity in (1, 2, 4):
+    for capacity in (1, 2, 3, 6, 16, 64):
         model.initialize_request_state(capacity)
         assert model.batch_state == (model.program, capacity)
-    with pytest.raises(ValueError, match="1\\.\\.4"):
-        model.initialize_request_state(5)
+    with pytest.raises(ValueError, match="1\\.\\.64"):
+        model.initialize_request_state(65)

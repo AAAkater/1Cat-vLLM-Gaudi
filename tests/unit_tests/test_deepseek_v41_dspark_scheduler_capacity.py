@@ -218,7 +218,8 @@ class _Trace:
 
 @pytest.mark.parametrize(
     ("capacity", "lanes"),
-    ((1, (0, )), (2, (1, )), (4, (1, 3))),
+    ((1, (0, )), (2, (1, )), (4, (1, 3)), (11, (0, 5, 10)), (12, (0, 6, 11)),
+     (16, (1, 7, 15))),
 )
 def test_real_scheduler_maps_reversed_requests_to_fixed_physical_lanes(tmp_path, capacity, lanes):
     scheduler = _scheduler(tmp_path, capacity)

@@ -16,11 +16,11 @@ from typing import Any
 import torch
 
 from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
+from vllm_gaudi.ops.deepseek_v41_capacity import validate_dspark_capacity
 from vllm_gaudi.ops.deepseek_v41_batch_speculation import DSparkBatchMetadata
 from vllm_gaudi.ops.deepseek_v41_verify import vocab_parallel_argmax
 
 
-_MAX_BATCH_CAPACITY = 8
 _MAX_DRAFT_TOKENS = 5
 _TARGET_QUERY_BUCKET = 6
 _SCHEDULER_PAGE_TOKENS = 128
@@ -46,9 +46,7 @@ def _host_integer(value: Any, name: str) -> int:
 
 
 def _batch_capacity(value: Any, name: str = "batch capacity") -> int:
-    if type(value) is not int or not 1 <= value <= _MAX_BATCH_CAPACITY:
-        raise ValueError(f"{name} must be an integer in 1..{_MAX_BATCH_CAPACITY}")
-    return value
+    return validate_dspark_capacity(value, allow_serial=True, name=name)
 
 
 def _fixed_page_table_width(max_model_len: int) -> int:
@@ -181,12 +179,25 @@ def _next_draft_rows(value: Any, batch_size: int, name: str) -> list[list[int]]:
 
 
 def _target_greedy_ids(program, hidden: torch.Tensor) -> torch.Tensor:
-    """Select target ids through the real PreparedStage vocab-parallel API."""
-    return vocab_parallel_argmax(
-        program._head_projection(hidden),
-        program.tp_rank,
-        program.all_gather,
-    )
+    """Select target ids with request-local C6 head projections."""
+    if hidden.ndim != 2:
+        raise ValueError("target hidden states must be a two-dimensional tensor")
+    rows = hidden.shape[0]
+    if rows == 0 or rows % _TARGET_QUERY_BUCKET != 0:
+        raise ValueError(
+            f"target hidden rows must be a positive multiple of {_TARGET_QUERY_BUCKET}, got {rows}")
+
+    capacity = rows // _TARGET_QUERY_BUCKET
+    lane_ids = []
+    for lane in range(capacity):
+        start = lane * _TARGET_QUERY_BUCKET
+        lane_hidden = hidden[start:start + _TARGET_QUERY_BUCKET]
+        lane_ids.append(vocab_parallel_argmax(
+            program._head_projection(lane_hidden),
+            program.tp_rank,
+            program.all_gather,
+        ))
+    return torch.cat(lane_ids, dim=0)
 
 
 @dataclass(frozen=True)

@@ -8,6 +8,7 @@ import pytest
 import torch
 from torch import nn
 
+from vllm_gaudi.models import deepseek_v41_batch_target_program as target_program
 from vllm_gaudi.models.deepseek_v41_batch_target_program import CompiledTargetBatchStage, DSparkTargetStage
 from vllm_gaudi.ops import deepseek_v41_batch_attention as batch_attention
 from vllm_gaudi.ops import deepseek_v41_batch_target as target_module
@@ -65,7 +66,13 @@ def _batch(capacity, lengths, active, starts, slots, *, explicit_capacity=True):
     [
         (1, (1, ), (31, )),
         (2, (1, 6), (63, 127)),
+        (3, (1, 2, 6), (63, 127, 255)),
         (4, (1, 2, 5, 6), (255, 256, 511, 512)),
+        (6, (1, 2, 3, 4, 5, 6), tuple(32 * lane for lane in range(6))),
+        (8, (1, 2, 3, 4, 5, 6, 1, 2), tuple(32 * lane for lane in range(8))),
+        (11, (1, 2, 3, 4, 5, 6, 1, 2, 3, 4, 5), tuple(32 * lane for lane in range(11))),
+        (16, tuple(1 + lane % 6 for lane in range(16)), tuple(32 * lane for lane in range(16))),
+        (64, tuple(1 + lane % 6 for lane in range(64)), tuple(32 * lane for lane in range(64))),
     ],
 )
 def test_all_active_capacity_uses_fixed_six_rows_per_lane(capacity, lengths, starts):
@@ -85,13 +92,19 @@ def test_all_active_capacity_uses_fixed_six_rows_per_lane(capacity, lengths, sta
     assert batch.host_request_slots == slots
 
 
-@pytest.mark.parametrize("capacity", [1, 4])
+@pytest.mark.parametrize("capacity", [1, 4, 11, 16, 64])
 def test_capacity_can_be_inferred_from_fixed_metadata(capacity):
     lengths = (1, ) * capacity
     batch = _batch(capacity, lengths, (True, ) * capacity, tuple(range(10, 10 + capacity)),
                    tuple(range(capacity)), explicit_capacity=False)
     assert batch.batch_capacity == capacity
     assert batch.host_request_slots == tuple(range(capacity))
+
+
+def test_target_row_contract_stops_at_shared_capacity_bound():
+    assert target_rows_for_capacity(64) == 6 * 64
+    with pytest.raises(ValueError, match="1..64"):
+        target_rows_for_capacity(65)
 
 
 def test_from_metadata_integrates_explicit_active_metadata_capacity_bucket():
@@ -247,17 +260,21 @@ def test_target_state_capacity_must_match_stage_capacity():
         initialize_target_batch_state(program, 4)
 
 
-def test_target_stage_derives_state_capacity_from_fixed_slots_and_rejects_mismatch():
-    stage, _calls = _fake_stage(4)
-    stage.batch_state = SimpleNamespace(capacity=4)
-    batch = _batch(4, (1, 0, 2, 0), (True, False, True, False),
-                   (301, 0, 511, 0), (0, -1, 2, -1))
+@pytest.mark.parametrize("capacity", (3, 6, 8, 11, 16, 64))
+def test_target_stage_derives_state_capacity_from_fixed_slots_and_rejects_mismatch(capacity):
+    stage, _calls = _fake_stage(capacity)
+    stage.batch_state = SimpleNamespace(capacity=capacity)
+    active = tuple(index % 2 == 0 for index in range(capacity))
+    lengths = tuple(1 if enabled else 0 for enabled in active)
+    starts = tuple(301 + index if enabled else 0 for index, enabled in enumerate(active))
+    slots = tuple(index if enabled else -1 for index, enabled in enumerate(active))
+    batch = _batch(capacity, lengths, active, starts, slots)
 
     compiled = DSparkTargetStage.from_batch(stage, batch, backend="eager")
-    assert compiled.batch_capacity == 4
-    assert compiled.rows == 24
-    assert compiled.state.capacity == 4
-    assert compiled.stage_interface().request_offsets == (0, 6, 12, 18, 24)
+    assert compiled.batch_capacity == capacity
+    assert compiled.rows == 6 * capacity
+    assert compiled.state.capacity == capacity
+    assert compiled.stage_interface().request_offsets == tuple(range(0, 6 * capacity + 1, 6))
 
     stage.batch_state = SimpleNamespace(capacity=2)
     with pytest.raises(ValueError, match="capacity differs"):
@@ -379,6 +396,48 @@ def test_compiled_program_temporarily_raises_recompile_limit_for_unique_group_ma
         assert torch._dynamo.config.recompile_limit == original_limit
     finally:
         torch._dynamo.reset()
+
+
+def test_compiled_program_keeps_chunk_based_config_for_non_slice(monkeypatch):
+    capacity = 1
+    batch = _batch(capacity, (1, ), (True, ), (31, ), (0, ))
+    stage, _calls = _fake_stage(capacity)
+    observed_configs = []
+
+    class _CompiledGroup:
+        def __init__(self, group):
+            self.group = group
+
+        def __call__(self, *args, **kwargs):
+            observed_configs.append((
+                torch._dynamo.config.recompile_limit,
+                torch._dynamo.config.allow_unspec_int_on_nn_module,
+            ))
+            return self.group(*args, **kwargs)
+
+    monkeypatch.setattr(target_program.torch, "compile", lambda group, **_kwargs: _CompiledGroup(group))
+    compiled = CompiledTargetBatchStage(stage, batch.request_lengths, batch.host_request_slots, backend="eager")
+    rows = target_rows_for_capacity(capacity)
+    hidden = torch.zeros((rows, 4, 8), dtype=torch.bfloat16)
+    pre_mix = torch.zeros((rows, 4), dtype=torch.float32)
+
+    assert not compiled.slice_target_layers
+    original_limit = torch._dynamo.config.recompile_limit
+    original_allow_unspec_int = torch._dynamo.config.allow_unspec_int_on_nn_module
+    with torch._dynamo.config.patch(
+            recompile_limit=2,
+            allow_unspec_int_on_nn_module=False,
+    ):
+        output, aux = compiled(hidden, pre_mix, batch.input_ids, batch.positions, batch.row_slots, batch.row_pages,
+                               batch.row_valid)
+        assert torch._dynamo.config.recompile_limit == 2
+        assert torch._dynamo.config.allow_unspec_int_on_nn_module is False
+
+    assert torch._dynamo.config.recompile_limit == original_limit
+    assert torch._dynamo.config.allow_unspec_int_on_nn_module is original_allow_unspec_int
+    assert observed_configs == [(max(2, 2 * len(compiled.chunks) + 1), False)]
+    assert output.shape == (rows, 8)
+    assert aux.shape == (rows, 24)
 
 
 @pytest.mark.parametrize(
@@ -548,12 +607,14 @@ class _ForwardHarness:
         assert request_batch
         return value
 
-    def _rope(self, value, _positions, *, request_batch):
+    def _rope(self, value, _positions, *, request_batch, inverse=False):
+        del inverse
         assert request_batch
         return value
 
-    def _finish_output(self, output, _positions, _ready_outputs, *, request_batch):
+    def _finish_output(self, output, _positions, _ready_outputs, *, request_batch, decode):
         assert request_batch
+        assert decode
         return output
 
 
@@ -610,3 +671,302 @@ def test_forward_target_n4_uses_safe_rope_positions_and_no_write_inactive_rows(m
     assert torch.equal(writes[0][6:12], torch.full((6, ), -1, dtype=torch.int32))
     assert torch.equal(writes[0][18:24], torch.full((6, ), -1, dtype=torch.int32))
     assert torch.count_nonzero(result[0][~row_valid]).item() == 0
+
+
+def test_n11_query_norm_projection_tiles_native_rows(monkeypatch):
+    calls = []
+
+    def projection(value, norm, weight, scale, positions, table, eps):
+        del norm, weight, scale, table, eps
+        assert value.shape[0] == positions.numel() <= 64
+        calls.append(value.shape[0])
+        return value[:, :512]
+
+    monkeypatch.setattr(
+        torch.ops.custom_op,
+        "custom_deepseek_v41_q_norm_projection_rope_gaudi2",
+        projection,
+        raising=False,
+    )
+    harness = SimpleNamespace(
+        weights=SimpleNamespace(
+            wq_b=SimpleNamespace(weight=torch.empty((8, 1280)), channel_scale=torch.empty((1, 8))),
+            q_norm=SimpleNamespace(weight=torch.empty(1280)),
+        ),
+        heads=1,
+        eps=1e-6,
+        _rotary_native_table=lambda: torch.empty((1, 64)),
+    )
+    rows = 11 * 6
+    value = torch.zeros((rows, 1280), dtype=torch.bfloat16)
+    positions = torch.arange(rows, dtype=torch.int32)
+
+    result = paged_module.PagedCSA2Attention.project_query_input(harness, value, positions)
+
+    assert calls == [64, 2]
+    assert result.shape == (rows, 1, 512)
+
+
+def test_n11_native_rope_tiles_request_rows(monkeypatch):
+    calls = []
+
+    def rope(value, positions, table):
+        del table
+        assert value.shape[0] == positions.numel() <= 64
+        calls.append(value.shape[0])
+        return value
+
+    monkeypatch.setattr(
+        torch.ops.custom_op,
+        "custom_deepseek_v41_rope_bf16_gaudi2",
+        rope,
+        raising=False,
+    )
+    harness = SimpleNamespace(
+        native_rope=True,
+        _rotary_native_table=lambda: torch.empty((1, 64)),
+    )
+    rows = 11 * 6
+    value = torch.zeros((rows, 512), dtype=torch.bfloat16)
+    positions = torch.arange(rows, dtype=torch.int32)
+
+    result = paged_module.PagedCSA2Attention._rope(
+        harness, value, positions, request_batch=True)
+
+    assert calls == [64, 2]
+    assert torch.equal(result, value)
+
+
+def test_n2_target_finishes_each_lane_as_one_small_native_reduce(monkeypatch):
+    capacity = 2
+    rows = capacity * 6
+    harness = _ForwardHarness(capacity)
+    harness.groups = 1
+    harness.heads = 10
+    harness.woa_fp8 = False
+    harness.woa_output_roundtrip = False
+    monkeypatch.setattr(paged_module.gaudi_envs, "VLLM_HPU_DSV41_DSPARK_WO_HANDOFF", False)
+
+    mla_calls = []
+    reductions = []
+
+    def fake_write(cache, values, row_ids):
+        del cache, values
+        return torch.zeros(row_ids.shape, dtype=torch.int32)
+
+    def fake_mla(query, *args, **kwargs):
+        del args, kwargs
+        mla_calls.append(tuple(query.shape))
+        return torch.ones((query.shape[0], harness.heads, 512), dtype=torch.bfloat16)
+
+    def fake_reduce(partial, ready_outputs=(), **kwargs):
+        del kwargs
+        reductions.append(
+            (
+                tuple(partial.shape),
+                partial.numel(),
+                tuple(int(ready[0, 0]) for ready in ready_outputs),
+            )
+        )
+        return partial.reshape(partial.shape[0], -1)
+
+    monkeypatch.setattr(batch_attention, "write_state_rows", fake_write)
+    monkeypatch.setattr(batch_attention, "batch_packed_mla", fake_mla)
+    monkeypatch.setattr(paged_module, "rms_norm", lambda value, *_args, **_kwargs: value)
+    monkeypatch.setattr(paged_module, "pack_swa", lambda value: value)
+
+    for method in ("_finish_output", "_finish_projected_output", "_reduce_output"):
+        setattr(harness, method, getattr(paged_module.PagedCSA2Attention, method).__get__(harness, type(harness)))
+    harness.project_output = lambda value: value
+    harness.project_output_consumer = lambda value: value
+    harness.reduce = fake_reduce
+
+    positions = torch.arange(100, 100 + rows, dtype=torch.int32)
+    slots = torch.repeat_interleave(torch.arange(capacity, dtype=torch.int32), 6)
+    row_valid = torch.ones((rows, ), dtype=torch.bool)
+    value = torch.randn((rows, 512), dtype=torch.bfloat16)
+    pages = torch.arange(1, rows * 4 + 1, dtype=torch.int32).reshape(rows, 4)
+    selected = torch.full((rows, 512), -1, dtype=torch.int32)
+    candidates = torch.full((rows, 2048), -1, dtype=torch.int32)
+    done = torch.zeros((rows, ), dtype=torch.int32)
+    ready_outputs = (
+        torch.arange(rows * 2, dtype=torch.float32).reshape(rows, 2),
+        -torch.arange(rows * 3, dtype=torch.float32).reshape(rows, 3),
+    )
+
+    result = paged_module.PagedCSA2Attention.forward_batch_target(
+        harness,
+        value,
+        positions,
+        slots,
+        pages,
+        selected,
+        candidates,
+        done,
+        done,
+        row_valid=row_valid,
+        request_lengths=(6, ) * capacity,
+        request_slots=(0, 1),
+        ready_outputs=ready_outputs,
+    )
+
+    assert mla_calls == [(rows, 512)]
+    assert [shape for shape, _numel, _ready in reductions] == [(6, 1, 5120), (6, 1, 5120)]
+    assert [numel for _shape, numel, _ready in reductions] == [30720, 30720]
+    assert [ready for _shape, _numel, ready in reductions] == [(0, 0), (12, -18)]
+    assert result[0].shape == (rows, 5120)
+
+
+def _run_n11_index_tiling(monkeypatch, branch):
+    from vllm_gaudi.ops import deepseek_v41_full_index_mme as full_index_module
+    from vllm_gaudi.ops import deepseek_v41_indexer as indexer_module
+    from vllm_gaudi.ops import deepseek_v41_reindex_compact as compact_module
+    from vllm_gaudi.ops import deepseek_v41_reindex_mme as reindex_module
+
+    capacity = 11
+    rows = capacity * 6
+    harness = _ForwardHarness(capacity)
+    harness.ratio = 1
+    harness.owns_index = True
+    harness.owns_kv = False
+    harness.layer = 1 if branch in ("reindex", "bounded") else 0
+    harness.candidate_source = 0
+    harness.cache = SimpleNamespace(
+        index=torch.zeros((128, 68), dtype=torch.uint8),
+        main=torch.zeros((1, 288), dtype=torch.uint8),
+    )
+    harness.index_heads = 4
+    harness.length = 65536
+    harness.batch_full_index_mme = branch == "full"
+    harness.batch_full_index_mme_prefix_tokens = 4096
+    harness.batch_reindex_mme = branch in ("reindex", "bounded")
+    harness.bounded_reindex = branch == "bounded"
+    harness.batch_index_tiled_keys = False
+
+    index_calls = []
+    read_completions = []
+
+    def fake_read(cache, row_ids, completion):
+        assert row_ids.numel() == completion.numel() <= 60
+        read_completions.append(completion.clone())
+        return cache
+
+    def record_call(name, query, weights, pages, positions, candidates, key_ready=None):
+        assert query.shape[0] == weights.shape[0] == pages.shape[0] == positions.numel()
+        assert query.shape[0] == candidates.shape[0] <= 64
+        if key_ready is not None:
+            assert key_ready.numel() == query.shape[0]
+        index_calls.append(
+            {
+                "branch": name,
+                "query": query[:, 0, 0].to(torch.int64).tolist(),
+                "weights": weights[:, 0].to(torch.int64).tolist(),
+                "pages": pages[:, 0].to(torch.int64).tolist(),
+                "positions": positions.tolist(),
+                "candidates": candidates[:, 0].to(torch.int64).tolist(),
+                "key_ready": None if key_ready is None else key_ready.tolist(),
+            }
+        )
+
+    def selected_rows(positions):
+        return positions[:, None].expand(-1, 512).clone()
+
+    def selected_blocks(positions):
+        return positions[:, None].expand(-1, 2048).clone()
+
+    def fake_full(query, weights, cache, pages, positions, candidates, **kwargs):
+        del cache
+        record_call("full", query, weights, pages, positions, candidates, kwargs["key_ready"])
+        blocks = selected_blocks(positions) if kwargs["publish_candidates"] else None
+        return selected_rows(positions), blocks
+
+    def fake_reindex(query, weights, cache, pages, positions, candidates, **kwargs):
+        del cache, kwargs
+        record_call("reindex", query, weights, pages, positions, candidates)
+        return selected_rows(positions)
+
+    def fake_bounded(query, weights, cache, pages, positions, candidates, **kwargs):
+        del cache, kwargs
+        record_call("bounded", query, weights, pages, positions, candidates)
+        return selected_rows(positions)
+
+    def fake_runtime(query, weights, cache, pages, positions, candidates, **kwargs):
+        del cache
+        record_call("runtime", query, weights, pages, positions, candidates)
+        blocks = selected_blocks(positions) if kwargs["publish_candidates"] else None
+        return selected_rows(positions), blocks
+
+    monkeypatch.setattr(full_index_module, "full_index_mme_select", fake_full)
+    monkeypatch.setattr(reindex_module, "reindex_mme_select", fake_reindex)
+    monkeypatch.setattr(reindex_module, "bounded_reindex_mme_select", fake_bounded)
+    monkeypatch.setattr(compact_module, "bounded_reindex_bucket", lambda _rows: True)
+    monkeypatch.setattr(indexer_module, "runtime_index_select", fake_runtime)
+    monkeypatch.setattr(batch_attention, "read_state_rows", fake_read)
+    monkeypatch.setattr(
+        batch_attention,
+        "write_state_rows",
+        lambda _cache, _values, row_ids: torch.zeros(row_ids.shape, dtype=torch.int32),
+    )
+    monkeypatch.setattr(
+        batch_attention,
+        "batch_packed_mla",
+        lambda query, *_args, **_kwargs: torch.ones((query.shape[0], 1), dtype=torch.bfloat16),
+    )
+    monkeypatch.setattr(paged_module, "rms_norm", lambda value, *_args, **_kwargs: value)
+    monkeypatch.setattr(paged_module, "pack_swa", lambda value: value)
+
+    marker = torch.arange(rows, dtype=torch.float32)
+    harness._prepare_index_queries = lambda _value, _qr, _positions, **_kwargs: (
+        marker.reshape(rows, 1, 1).expand(rows, 4, 128).clone(),
+        marker.reshape(rows, 1).expand(rows, 4).clone(),
+    )
+
+    positions = torch.arange(rows, dtype=torch.int32)
+    slots = torch.repeat_interleave(torch.arange(capacity, dtype=torch.int32), 6)
+    row_valid = torch.ones((rows, ), dtype=torch.bool)
+    pages = torch.arange(rows, dtype=torch.int32)[:, None].expand(rows, 4).clone()
+    selected = torch.full((rows, 512), -1, dtype=torch.int32)
+    candidates = torch.arange(rows, dtype=torch.int32)[:, None].expand(rows, 2048).clone()
+    index_done = (torch.arange(rows, dtype=torch.int32) + 100).contiguous()
+    value = torch.zeros((rows, 512), dtype=torch.bfloat16)
+
+    result = paged_module.PagedCSA2Attention.forward_batch_target(
+        harness,
+        value,
+        positions,
+        slots,
+        pages,
+        selected,
+        candidates,
+        index_done,
+        index_done,
+        row_valid=row_valid,
+        request_lengths=(6, ) * capacity,
+        request_slots=tuple(range(capacity)),
+    )
+
+    expected_rows = [list(range(60)), list(range(60, 66))]
+    assert [len(call["positions"]) for call in index_calls] == [60, 6]
+    assert [len(completion) for completion in read_completions] == [60, 6]
+    assert [completion.tolist() for completion in read_completions] == [
+        list(range(100, 160)),
+        list(range(160, 166)),
+    ]
+    assert [call["branch"] for call in index_calls] == [branch, branch]
+    for key in ("query", "weights", "pages", "positions", "candidates"):
+        assert [call[key] for call in index_calls] == expected_rows
+    if branch == "full":
+        assert [call["key_ready"] for call in index_calls] == [
+            list(range(100, 160)),
+            list(range(160, 166)),
+        ]
+    else:
+        assert all(call["key_ready"] is None for call in index_calls)
+    assert result[1][:, 0].tolist() == list(range(rows))
+    if branch in ("full", "runtime"):
+        assert result[2][:, 0].tolist() == list(range(rows))
+
+
+@pytest.mark.parametrize("branch", ("full", "reindex", "bounded", "runtime"))
+def test_n11_index_selection_tiles_native_rows_and_preserves_order(monkeypatch, branch):
+    _run_n11_index_tiling(monkeypatch, branch)

@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
-"""CPU contracts for draft-side fixed request capacities N=1, 2 and 4."""
+"""CPU contracts for draft-side fixed request capacities through N=64."""
 from types import SimpleNamespace
 
 import pytest
 import torch
 import torch.nn.functional as F
 
+from vllm_gaudi.ops import deepseek_v41_batch_attention as batch_attention
 from vllm_gaudi.ops import deepseek_v41_batch_draft as draft_batch
 from vllm_gaudi.ops.deepseek_v41_batch_verify import validate_batch_records
 
@@ -13,7 +14,12 @@ from vllm_gaudi.ops.deepseek_v41_batch_verify import validate_batch_records
 _CAPACITY_CASES = (
     (1, (True, )),
     (2, (True, False)),
+    (3, (True, False, True)),
     (4, (True, False, True, False)),
+    (6, (True, False, True, False, True, False)),
+    (8, (True, False, True, False, True, False, True, False)),
+    (16, tuple(index % 2 == 0 for index in range(16))),
+    (64, tuple(index % 2 == 0 for index in range(64))),
 )
 
 
@@ -25,7 +31,7 @@ def _metadata(capacity, active, *, target_counts=None, include_request_active=Tr
     slots = [index if enabled else -1 for index, enabled in enumerate(active)]
     generations = [index + 1 if enabled else 0 for index, enabled in enumerate(active)]
     budgets = [64 if enabled else 0 for enabled in active]
-    starts = [10 + 20 * index if enabled else 0 for index, enabled in enumerate(active)]
+    starts = [10 + 2 * index if enabled else 0 for index, enabled in enumerate(active)]
     drafts = [
         list(range(start, start + length - 1)) if enabled and length > 1 else []
         for start, length, enabled in zip(starts, lengths, active, strict=True)
@@ -52,7 +58,7 @@ def _metadata(capacity, active, *, target_counts=None, include_request_active=Tr
 def _target(capacity, active):
     rows = []
     for index, enabled in enumerate(active):
-        start = 10 + 20 * index
+        start = 10 + 2 * index
         rows.append(torch.arange(start, start + 6) if enabled else torch.zeros(6, dtype=torch.int64))
     token_ids = torch.stack(rows)
     return SimpleNamespace(
@@ -146,7 +152,8 @@ def test_context_commit_is_capacity_shaped_and_inactive_lanes_do_not_write(monke
     for index, enabled in enumerate(active):
         slot_ring = bank.slot_rings(index)[0]
         if enabled:
-            assert torch.equal(slot_ring[10 + 20 * index:12 + 20 * index], states[index, :2])
+            start = int(metadata.target_start_positions[index])
+            assert torch.equal(slot_ring[start:start + 2], states[index, :2])
         else:
             assert torch.count_nonzero(slot_ring) == 0
 
@@ -223,7 +230,7 @@ def test_markov_is_five_sequential_steps_over_all_capacity_lanes(capacity, activ
 
     draft = MarkovDraft()
     sampler = draft_batch.PackedDraftMarkovSampler(draft, batch_capacity=capacity)
-    anchors = torch.tensor([3, 2, 1, 0][:capacity], dtype=torch.int64)
+    anchors = torch.arange(capacity - 1, -1, -1, dtype=torch.int64).remainder(4)
     hidden = torch.arange(capacity * 5 * 4, dtype=torch.float32).reshape(capacity, 5, 4)
     logits = torch.zeros((capacity, 5, 4), dtype=torch.float32)
     active = torch.tensor(activity)
@@ -313,12 +320,71 @@ def test_transaction_uses_capacity_shaped_contracts(monkeypatch, capacity, activ
     assert round_calls[0][4] is context_done
 
 
-@pytest.mark.parametrize("prepared_rows", [10, 20])
-def test_prepared_dense_branch_accepts_n2_and_n4_packed_rows(prepared_rows):
+@pytest.mark.parametrize("prepared_rows", [15, 30, 40, 55, 80, 320])
+def test_prepared_dense_branch_tiles_every_supported_packed_row_count(prepared_rows):
     prepared = torch.eye(4, dtype=torch.float32)
     value = torch.arange(prepared_rows * 4, dtype=torch.float32).reshape(prepared_rows, 4)
     owner = SimpleNamespace(dspark_dense_kn=prepared)
     assert torch.equal(draft_batch._linear(value, owner), value)
+
+
+def test_n11_state_row_wrappers_tile_six_n_rows_at_native_boundary(monkeypatch):
+    write_calls, read_calls = [], []
+
+    def write(cache, values, rows):
+        del cache
+        assert values.shape[0] == rows.numel() <= 64
+        write_calls.append(rows.numel())
+        return rows.clone()
+
+    def read(cache, rows, completion):
+        del cache
+        assert rows.shape == completion.shape and rows.numel() <= 64
+        read_calls.append(rows.numel())
+        return rows.reshape(-1, 1).repeat(1, 2)
+
+    monkeypatch.setattr(torch.ops.custom_op, "custom_deepseek_v41_state_rows_write_gaudi2", write, raising=False)
+    monkeypatch.setattr(torch.ops.custom_op, "custom_deepseek_v41_state_rows_read_gaudi2", read, raising=False)
+    rows = torch.arange(11 * 6, dtype=torch.int32)
+    values = torch.arange(11 * 6 * 2, dtype=torch.float32).reshape(11 * 6, 2)
+
+    done = batch_attention.write_state_rows(torch.zeros((128, 2)), values, rows)
+    decoded = batch_attention.read_state_rows(torch.zeros((128, 2)), rows, done)
+
+    assert write_calls == read_calls == [64, 2]
+    assert torch.equal(done, rows)
+    assert torch.equal(decoded, rows.reshape(-1, 1).repeat(1, 2))
+
+
+def test_n11_packed_mla_tiles_66_query_rows(monkeypatch):
+    calls = []
+
+    def mla(query, swa, main, rows, indices, sink, scale, lengths):
+        del swa, main, rows, indices, sink, scale, lengths
+        assert query.shape[0] <= 8
+        calls.append(query.shape[0])
+        return query.clone()
+
+    monkeypatch.setattr(torch.ops.custom_op, "custom_deepseek_v41_batch_paged_mla_mme_gaudi2", mla, raising=False)
+    rows = 11 * 6
+    query = torch.zeros((rows, 1, 512), dtype=torch.bfloat16)
+    output = batch_attention.batch_packed_mla(
+        query,
+        torch.zeros((256, 528), dtype=torch.uint8),
+        torch.zeros((1, 288), dtype=torch.uint8),
+        torch.zeros((rows, 512), dtype=torch.int32),
+        torch.ones((rows, 1), dtype=torch.int32),
+        torch.zeros(rows, dtype=torch.int32),
+        torch.zeros(rows, dtype=torch.int32),
+        torch.zeros(1),
+        torch.tensor([1.0]),
+        torch.zeros(rows, dtype=torch.int32),
+        torch.zeros(rows, dtype=torch.int32),
+        ratio=0,
+    )
+
+    assert calls == [8] * 8 + [2]
+    assert torch.equal(output, query)
 
 
 def test_missing_or_empty_request_active_is_legacy_all_active():
@@ -335,7 +401,7 @@ def test_missing_or_empty_request_active_is_legacy_all_active():
 
 def test_capacity_constants_and_explicit_mismatches_fail_before_ticket(monkeypatch):
     assert draft_batch.DEFAULT_BATCH_CAPACITY == 2
-    assert draft_batch.MAX_BATCH_REQUESTS == 8
+    assert draft_batch.MAX_BATCH_REQUESTS == 64
     with pytest.raises(ValueError, match="must match the batch state"):
         draft_batch.PackedDraftTransaction(
             SimpleNamespace(), SimpleNamespace(capacity=2), batch_capacity=4, compile_graph=False)
