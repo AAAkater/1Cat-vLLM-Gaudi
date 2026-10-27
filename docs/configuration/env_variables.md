@@ -20,6 +20,27 @@ implementation; this option alone does not qualify every prefill geometry or
 active-length performance. The option defaults to `false` pending serving
 validation.
 
+`VLLM_HPU_DSV41_BUG004_PROFILE=1` enables the opt-in BUG-004 packed-round
+diagnostic. It writes one JSONL record per completed round to
+`$DSV41_RUN_EVIDENCE/bug004-rounds.rank<rank>.jsonl`; the evidence directory is
+required. `VLLM_HPU_DSV41_BUG004_PROFILE_TRIGGER` is an optional absolute file
+path that enables the same diagnostic while the file exists. The trigger is
+checked when each DSpark batch round begins, so creating or removing it changes
+the next round without restarting the service. Both controls default off, and
+the environment switch remains compatible when no trigger is configured.
+
+`VLLM_HPU_DSV41_BUG004_HPU_TRACE=1` additionally exports one CPU+HPU Chrome
+timeline for the first profile-enabled diagnostic round on rank 0. It is
+default off and requires `VLLM_HPU_DSV41_BUG004_PROFILE` or its trigger to be
+enabled. In the trigger-controlled path it starts only after the trigger is
+created for the first diagnostic round, so it does not run during warmup. The
+trace is written to `$DSV41_RUN_EVIDENCE/bug004-hpu-rank0.trace.json`; rank 1
+and later rounds do not export. This uses `torch.profiler.ProfilerActivity.HPU`
+through the local Habana activity profiler and does not set `HABANA_PROFILE`
+globally. Start or export failures are recorded in the round JSON
+`hpu_trace.status` without failing the model request. The existing CPU profiler
+fields remain available.
+
 `VLLM_HPU_NATIVE_DECODE_GRAPH` selects the research native replay path for the
 Gaudi2 Qwen3.8 TP2 C1 decoder. Warmup retains eight compiled decoder groups,
 fixed tensor bindings, recipe memory, and HCL command templates. Stable decode

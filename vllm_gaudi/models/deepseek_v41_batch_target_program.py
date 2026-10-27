@@ -29,6 +29,29 @@ from vllm_gaudi.ops.deepseek_v41_batch_target import (
     target_rows_for_capacity,
 )
 
+# Kept in sync with the optional batch-MLA helper's fixed complete-tile
+# buckets.  N32 is the only target layout with a complete 192-row tile tail;
+# 24 tiles is equivalent to the full-row path.
+_TARGET_MLA_TILE_PLAN_BUCKETS = (1, 2, 4, 8, 16, 24)
+_AUTO_TARGET_MLA_TILE_PLAN = object()
+
+
+def _build_target_mla_tile_plan(active_lanes, *, capacity: int, rows: int, device):
+    """Build the N32 sparse tile plan once for a target round.
+
+    ``None`` is the full-row path.  Only N32 with a strict subset of active
+    lanes uses the compact path, and a plan covering all 24 tiles is equivalent
+    to that full path.
+    """
+    if rows != 192 or len(active_lanes) == capacity:
+        return None
+    from vllm_gaudi.ops.deepseek_v41_batch_attention import batch_packed_mla_tile_plan
+
+    plan = batch_packed_mla_tile_plan(active_lanes, total_rows=rows, device=device)
+    if plan.numel() == _TARGET_MLA_TILE_PLAN_BUCKETS[-1]:
+        return None
+    return plan
+
 
 def _validated_active_lanes(active_lanes, capacity: int) -> tuple[int, ...]:
     """Validate host lane ownership without reading a device mask."""
@@ -74,6 +97,7 @@ class _TargetAttentionCall:
         index_done,
         row_valid,
         ready_outputs,
+        tile_indices=None,
     ):
         return self.attention.forward_batch_target(
             value,
@@ -88,7 +112,85 @@ class _TargetAttentionCall:
             request_lengths=self.request_lengths,
             request_slots=self.request_slots,
             ready_outputs=ready_outputs,
+            defer_output_finish=True,
+            tile_indices=tile_indices,
         )
+
+
+class _TargetOutputFinishCall:
+    """Plain callable binding one target layer's C6 output-finish sequence."""
+
+    def __init__(self, attention):
+        self.attention = attention
+
+    def __call__(self, output, positions, active, ready_outputs):
+        return self.attention.finish_output_target(output, positions, active, ready_outputs)
+
+
+class _TargetAttentionFinishAdapter:
+    """Finish only host-active lanes after one full packed attention call.
+
+    This adapter is intentionally eager.  The raw attention wrapper and the
+    per-lane output-finish wrapper are the compiled boundaries; the adapter
+    supplies the host active-lane order without putting that tuple into either
+    compiled callable.
+    """
+
+    def __init__(self, raw_attention, finish_output, active_lanes, tile_indices=None):
+        self.raw_attention = raw_attention
+        self.finish_output = finish_output
+        self.active_lanes = tuple(active_lanes)
+        self.tile_indices = tile_indices
+
+    def __call__(
+        self,
+        value,
+        positions,
+        slots,
+        pages,
+        selected,
+        candidates,
+        main_done,
+        index_done,
+        row_valid,
+        ready_outputs,
+    ):
+        raw_output, selected, candidates, main_done, index_done = self.raw_attention(
+            value,
+            positions,
+            slots,
+            pages,
+            selected,
+            candidates,
+            main_done,
+            index_done,
+            row_valid,
+            ready_outputs,
+            tile_indices=self.tile_indices,
+        )
+        if raw_output.shape[0] % TARGET_ROWS_PER_REQUEST:
+            raise ValueError("packed target attention returned a non-lane-aligned result")
+        if not self.active_lanes:
+            raise ValueError("target attention finish requires at least one active lane")
+        capacity = raw_output.shape[0] // TARGET_ROWS_PER_REQUEST
+        active = row_valid.to(torch.bool) & (slots >= 0)
+        safe_positions = positions.clamp_min(0)
+        finished = [None] * capacity
+        for lane in self.active_lanes:
+            start = lane * TARGET_ROWS_PER_REQUEST
+            stop = start + TARGET_ROWS_PER_REQUEST
+            lane_ready_outputs = tuple(ready[start:stop] for ready in ready_outputs)
+            finished[lane] = self.finish_output(
+                raw_output[start:stop],
+                safe_positions[start:stop],
+                active[start:stop],
+                lane_ready_outputs,
+            )
+        zero = torch.zeros_like(finished[self.active_lanes[0]])
+        for lane in range(capacity):
+            if finished[lane] is None:
+                finished[lane] = zero
+        return torch.cat(finished, dim=0), selected, candidates, main_done, index_done
 
 
 class PreparedTargetBatchLayerGroup(nn.Module):
@@ -132,7 +234,10 @@ class PreparedTargetBatchLayerGroup(nn.Module):
         ) if self.slice_target_layers else ())
         # Direct group users exercise the same callable path eagerly.  The
         # production stage replaces these with fullgraph wrappers below.
+        self.output_finish_calls = (tuple(_TargetOutputFinishCall(layer.attention) for layer in self.layers)
+                                    if self.slice_target_layers else ())
         self.attention_wrappers = self.attention_calls
+        self.output_finish_wrappers = self.output_finish_calls
         self.attention_wrappers_compiled = False
         self.input = PreparedInput(stage.weights.embed, stage.tp_rank, stage.reduce) if text_input else None
         self.final = bool(getattr(stage, "is_last_stage", stage.pp_rank == 1)) and stop == len(stage.layers)
@@ -157,8 +262,23 @@ class PreparedTargetBatchLayerGroup(nn.Module):
             torch.compile(wrapper, backend=backend, fullgraph=True, dynamic=False)
             for wrapper in self.attention_calls
         )
+        self.output_finish_wrappers = tuple(
+            torch.compile(wrapper, backend=backend, fullgraph=True, dynamic=False)
+            for wrapper in self.output_finish_calls
+        )
         self.attention_wrappers_compiled = True
         return self.attention_wrappers
+
+    def _target_mla_tile_indices(self, active_lanes, device):
+        """Auto-plan one N32-only tile plan for a standalone group call."""
+        if not self.slice_target_layers:
+            return None
+        return _build_target_mla_tile_plan(
+            active_lanes,
+            capacity=self.batch_capacity,
+            rows=self.rows,
+            device=device,
+        )
 
     def forward(
         self,
@@ -176,12 +296,18 @@ class PreparedTargetBatchLayerGroup(nn.Module):
         index_ready,
         *,
         active_lanes=None,
+        tile_indices=_AUTO_TARGET_MLA_TILE_PLAN,
     ):
         if residual.shape[0] != self.rows or positions.numel() != self.rows:
             raise ValueError(f"DSpark target layer group requires exactly {self.rows} rows")
         lane_indices = (_validated_active_lanes(active_lanes, self.batch_capacity)
                         if self.slice_target_layers else tuple(range(self.batch_capacity)))
         active_lane_set = set(lane_indices)
+        if tile_indices is _AUTO_TARGET_MLA_TILE_PLAN:
+            # Standalone group callers retain the convenient auto-plan path.
+            # The production stage supplies either one shared tensor or an
+            # explicit None, so it never re-enters this branch per group.
+            tile_indices = self._target_mla_tile_indices(lane_indices, positions.device)
         if self.input is not None:
             residual, pre_mix = self.input(input_ids)
         image_mask = (input_ids == 129264) | (input_ids == 129265)
@@ -225,9 +351,15 @@ class PreparedTargetBatchLayerGroup(nn.Module):
                 self.request_slots,
             )
             if self.slice_target_layers:
+                target_attention = _TargetAttentionFinishAdapter(
+                    self.attention_wrappers[layer_index],
+                    self.output_finish_wrappers[layer_index],
+                    lane_indices,
+                    tile_indices=tile_indices,
+                )
                 result = layer.forward_batch_target(
                     *target_args,
-                    target_attention=self.attention_wrappers[layer_index],
+                    target_attention=target_attention,
                     collapse_handoffs=collapse_handoffs,
                     publish_collapse=publish_collapse,
                     active_lanes=lane_indices,
@@ -316,6 +448,16 @@ class CompiledTargetBatchStage:
             self.chunks = tuple(
                 torch.compile(group, backend=backend, fullgraph=True, dynamic=False) for group in self.groups)
 
+    def _target_mla_tile_indices(self, active_lanes, device):
+        if not self.slice_target_layers:
+            return None
+        return _build_target_mla_tile_plan(
+            active_lanes,
+            capacity=self.batch_capacity,
+            rows=self.rows,
+            device=device,
+        )
+
     def __call__(
         self,
         hidden,
@@ -330,6 +472,14 @@ class CompiledTargetBatchStage:
     ):
         if hidden.shape[0] != self.rows or positions.numel() != self.rows:
             raise ValueError(f"DSpark target batch requires fixed {self.rows}-row inputs")
+        if self.slice_target_layers:
+            lane_indices = _validated_active_lanes(active_lanes, self.batch_capacity)
+            # This is the sole tile-plan H2D for the round.  Every layer in
+            # every group receives the same runtime tensor (or explicit None).
+            tile_indices = self._target_mla_tile_indices(lane_indices, positions.device)
+        else:
+            lane_indices = active_lanes
+            tile_indices = None
         selections = tuple(
             torch.full((self.rows, 512), -1, dtype=torch.int32, device=positions.device)
             for _ in self.stage.shared.topk
@@ -343,8 +493,12 @@ class CompiledTargetBatchStage:
         if self.slice_target_layers:
             # The compiled attention wrappers lazily compile on their first
             # invocation.  They share one callable code object, so the budget
-            # must cover every target layer rather than every eager chunk.
-            recompile_limit = max(torch._dynamo.config.recompile_limit, 2 * len(self.stage.layers) + 1)
+            # must cover every target layer and every optional MLA tile-plan
+            # bucket.  None is the full-row variant; the fixed sparse tile
+            # shapes are 1/2/4/8/16 tiles.
+            variant_budget = (len(_TARGET_MLA_TILE_PLAN_BUCKETS) + 1) * (
+                2 * len(self.stage.layers) + 1)
+            recompile_limit = max(torch._dynamo.config.recompile_limit, variant_budget)
         else:
             recompile_limit = max(torch._dynamo.config.recompile_limit, 2 * len(self.chunks) + 1)
         config_patch = {"recompile_limit": recompile_limit}
@@ -370,7 +524,7 @@ class CompiledTargetBatchStage:
                     index_ready,
                 )
                 if self.slice_target_layers:
-                    result = chunk(*chunk_args, active_lanes=active_lanes)
+                    result = chunk(*chunk_args, active_lanes=lane_indices, tile_indices=tile_indices)
                 else:
                     result = chunk(*chunk_args)
                 hidden, pre_mix, aux, selections, candidates, main_ready, index_ready = result

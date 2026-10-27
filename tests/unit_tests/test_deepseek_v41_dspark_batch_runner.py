@@ -806,6 +806,54 @@ def _one_active_metadata(capacity=2, *, active_lane=1, target_length=5):
     )
 
 
+def test_target_forward_batch_passes_host_active_lanes_to_vocab_head(monkeypatch):
+    import vllm_gaudi.v1.worker.deepseek_v41_dspark_batch_runner as adapter
+
+    metadata = _one_active_metadata(active_lane=1)
+    hidden = torch.zeros((12, 2), dtype=torch.bfloat16)
+
+    class TargetStage:
+        def snapshot(self, batch):
+            assert batch.host_active_lanes == (1, )
+            return None
+
+        def __call__(self, hidden_seed, pre_mix_seed, batch, engram_rows):
+            del hidden_seed, pre_mix_seed, batch, engram_rows
+            return hidden, {}
+
+    runner = object.__new__(DSparkPackedTargetStages)
+    runner.program = object()
+    runner.batch_capacity = 2
+    runner.stage_key = (0, 1)
+    runner.stage = TargetStage()
+    runner.device = torch.device("cpu")
+    runner.engram_host = None
+    runner.hidden_seed = torch.zeros((12, 4, 2), dtype=torch.bfloat16)
+    runner.pre_mix_seed = torch.zeros((12, 4), dtype=torch.float32)
+    observed = []
+
+    def target_greedy_ids(program, observed_hidden, host_active_lanes=None):
+        observed.append((program, observed_hidden, host_active_lanes))
+        return torch.zeros((12, ), dtype=torch.int64)
+
+    monkeypatch.setattr(adapter, "_target_greedy_ids", target_greedy_ids)
+    input_ids = torch.zeros((2, 6), dtype=torch.int64)
+    target = runner.forward_batch(
+        metadata,
+        input_ids,
+        torch.zeros((2, 6), dtype=torch.int32),
+        torch.ones((2, 6), dtype=torch.bool),
+        torch.ones((2, 1), dtype=torch.int32),
+    )
+
+    assert len(observed) == 1
+    program, observed_hidden, host_active_lanes = observed[0]
+    assert program is runner.program
+    assert observed_hidden is hidden
+    assert host_active_lanes == (1, )
+    assert target.token_ids.shape == (12, )
+
+
 class _RollbackTicket:
     def __init__(self):
         self.restore_calls = []
@@ -1192,7 +1240,9 @@ def test_malformed_inactive_publication_leaves_active_request_unchanged():
     assert request.output == [50]
 
 
-def test_target_greedy_ids_bind_real_prepared_stage_and_exchange_only_pairs(monkeypatch):
+@pytest.mark.parametrize("host_active_lanes", (None, (0, 1)))
+def test_target_greedy_ids_all_active_bind_real_prepared_stage_and_exchange_only_pairs(
+        monkeypatch, host_active_lanes):
     import vllm_gaudi.models.deepseek_v41_program as program_module
 
     monkeypatch.setattr(program_module.gaudi_envs, "VLLM_HPU_DSV41_DSPARK_VOCAB_HEAD_FP8", False)
@@ -1269,7 +1319,7 @@ def test_target_greedy_ids_bind_real_prepared_stage_and_exchange_only_pairs(monk
 
         stage._head_projection = head_projection
 
-        actual = _target_greedy_ids(stage, hidden)
+        actual = _target_greedy_ids(stage, hidden, host_active_lanes)
         assert actual.shape == (lane_count * rows_per_lane, )
         for lane, expected in enumerate(lane_oracles):
             start = lane * rows_per_lane
@@ -1281,6 +1331,85 @@ def test_target_greedy_ids_bind_real_prepared_stage_and_exchange_only_pairs(monk
     assert observed == [(12, ), (12, )]
     assert observed_heads == [[(6, 6), (6, 6)], [(6, 6), (6, 6)]]
     assert observed_gathers == [[(6, 2), (6, 2)], [(6, 2), (6, 2)]]
+
+
+def test_target_greedy_ids_projects_only_noncontiguous_active_lanes():
+    rows_per_lane = 6
+    capacity = 32
+    hidden = torch.full((capacity * rows_per_lane, 2), float("nan"))
+    for lane in (0, 31):
+        start = lane * rows_per_lane
+        hidden[start:start + rows_per_lane] = 0
+        hidden[start:start + rows_per_lane, 0] = lane + 2
+
+    projected_lanes = []
+    gather_calls = []
+
+    def head_projection(value):
+        assert torch.isfinite(value).all()
+        token = int(value[0, 0].item())
+        projected_lanes.append(token - 2)
+        logits = torch.zeros((rows_per_lane, 64), dtype=torch.float32)
+        logits[:, token] = 1
+        return logits
+
+    def all_gather(pair, dim):
+        assert dim == -1
+        gather_calls.append(tuple(pair.shape))
+        return pair
+
+    program = SimpleNamespace(
+        _head_projection=head_projection,
+        tp_rank=0,
+        all_gather=all_gather,
+    )
+    actual = _target_greedy_ids(program, hidden, (0, 31))
+    expected = torch.zeros((capacity * rows_per_lane, ), dtype=torch.int64)
+    expected[:rows_per_lane] = 2
+    expected[31 * rows_per_lane:] = 33
+
+    assert projected_lanes == [0, 31]
+    assert gather_calls == [(rows_per_lane, 2), (rows_per_lane, 2)]
+    assert actual.shape == (capacity * rows_per_lane, )
+    assert torch.equal(actual, expected)
+
+
+def test_target_greedy_ids_single_tail_lane_skips_poisoned_inactive_rows():
+    rows_per_lane = 6
+    capacity = 32
+    hidden = torch.full((capacity * rows_per_lane, 2), float("nan"))
+    tail_start = 31 * rows_per_lane
+    hidden[tail_start:] = 0
+
+    head_calls = []
+    gather_calls = []
+
+    def head_projection(value):
+        assert value.shape == (rows_per_lane, 2)
+        assert torch.isfinite(value).all()
+        head_calls.append(tuple(value.shape))
+        logits = torch.zeros((rows_per_lane, 8), dtype=torch.float32)
+        logits[:, 7] = 1
+        return logits
+
+    def all_gather(pair, dim):
+        assert dim == -1
+        gather_calls.append(tuple(pair.shape))
+        return pair
+
+    program = SimpleNamespace(
+        _head_projection=head_projection,
+        tp_rank=0,
+        all_gather=all_gather,
+    )
+    actual = _target_greedy_ids(program, hidden, (31, ))
+    expected = torch.zeros((capacity * rows_per_lane, ), dtype=torch.int64)
+    expected[tail_start:] = 7
+
+    assert head_calls == [(rows_per_lane, 2)]
+    assert gather_calls == [(rows_per_lane, 2)]
+    assert actual.shape == (capacity * rows_per_lane, )
+    assert torch.equal(actual, expected)
 
 
 def test_target_greedy_ids_keep_cross_lane_sentinel_local():
@@ -1317,9 +1446,41 @@ def test_target_greedy_ids_keep_cross_lane_sentinel_local():
     assert gather_calls == [(rows_per_lane, 2), (rows_per_lane, 2)]
 
 
-def test_target_greedy_ids_reject_non_c6_hidden_rows():
+@pytest.mark.parametrize("rows", (0, 7))
+def test_target_greedy_ids_reject_non_c6_hidden_rows(rows):
     with pytest.raises(ValueError, match="positive multiple of 6"):
-        _target_greedy_ids(SimpleNamespace(), torch.empty(7, 6))
+        _target_greedy_ids(SimpleNamespace(), torch.empty(rows, 6))
+
+
+def test_target_greedy_ids_reject_non_2d_hidden():
+    with pytest.raises(ValueError, match="two-dimensional"):
+        _target_greedy_ids(SimpleNamespace(), torch.empty(12))
+
+
+@pytest.mark.parametrize(
+    ("host_active_lanes", "error_type", "message"),
+    (
+        ([0], TypeError, "tuple or None"),
+        ((), ValueError, "at least one lane"),
+        ((0, True), TypeError, "only integers"),
+        ((1, 0), ValueError, "strictly increasing"),
+        ((0, 0), ValueError, "strictly increasing"),
+        ((-1, ), ValueError, r"\[0, 2\)"),
+        ((2, ), ValueError, r"\[0, 2\)"),
+    ),
+)
+def test_target_greedy_ids_reject_invalid_active_lanes_before_collective(host_active_lanes, error_type, message):
+    calls = []
+    program = SimpleNamespace(
+        _head_projection=lambda value: calls.append(("projection", tuple(value.shape))),
+        tp_rank=0,
+        all_gather=lambda pair, dim: calls.append(("collective", tuple(pair.shape), dim)),
+    )
+
+    with pytest.raises(error_type, match=message):
+        _target_greedy_ids(program, torch.zeros((12, 1)), host_active_lanes)
+
+    assert calls == []
 
 
 @pytest.mark.parametrize("capacity", (3, 6, 8, 11, 16, 64))

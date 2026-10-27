@@ -4,6 +4,7 @@
 Default-off.  Each named segment has a host timestamp and current-stream HPU
 event pair; one final synchronize drains the round before intervals are read.
 A CPU profiler window supplies dispatcher counts by record_function parentage.
+An optional rank0 CPU+HPU Chrome trace covers only the first diagnostic round.
 """
 from __future__ import annotations
 
@@ -11,18 +12,80 @@ from collections import Counter
 import json
 import os
 from pathlib import Path
+import threading
 import time
 from typing import Any, Callable
 
 import torch
 
 ENV = "VLLM_HPU_DSV41_BUG004_PROFILE"
+HPU_TRACE_ENV = "VLLM_HPU_DSV41_BUG004_HPU_TRACE"
+HPU_TRACE_FILE = "bug004-hpu-rank0.trace.json"
 SCHEMA = "dsv41.bug004.profile.v3"
 PREFIX = "vllm_gaudi.dsv41.bug004.segment"
+_HPU_TRACE_LOCK = threading.Lock()
+_HPU_TRACE_CLAIMED = False
 
 
 def enabled() -> bool:
-    return os.environ.get(ENV, "0").lower() in ("1", "true", "yes", "on")
+    if os.environ.get(ENV, "0").lower() in ("1", "true", "yes", "on"):
+        return True
+    trigger = os.environ.get("VLLM_HPU_DSV41_BUG004_PROFILE_TRIGGER")
+    return bool(trigger and Path(trigger).is_file())
+
+
+def hpu_trace_enabled() -> bool:
+    """Return true only when the profile gate and the HPU trace switch are both on."""
+    return os.environ.get(HPU_TRACE_ENV, "0").lower() in ("1", "true", "yes", "on") and enabled()
+
+
+def _is_hpu(device: Any) -> bool:
+    return device is not None and torch.device(device).type == "hpu"
+
+
+def _hpu_trace_plan(rank: int, directory: str | Path) -> dict:
+    """Claim the one process-local rank0 trace without enabling any global profiler."""
+    path = Path(directory) / HPU_TRACE_FILE
+    try:
+        if int(rank) != 0:
+            return {"enabled": False, "status": "disabled", "reason": "rank is not 0", "path": str(path)}
+        if os.environ.get(HPU_TRACE_ENV, "0").lower() not in ("1", "true", "yes", "on"):
+            return {
+                "enabled": False,
+                "status": "disabled",
+                "reason": f"{HPU_TRACE_ENV} is not enabled",
+                "path": str(path),
+            }
+        if not enabled():
+            return {
+                "enabled": False,
+                "status": "disabled",
+                "reason": "BUG004 profile gate is not enabled",
+                "path": str(path),
+            }
+        global _HPU_TRACE_CLAIMED
+        with _HPU_TRACE_LOCK:
+            if _HPU_TRACE_CLAIMED:
+                return {"enabled": False, "status": "disabled", "reason": "one-round HPU trace cap already claimed",
+                        "path": str(path)}
+            _HPU_TRACE_CLAIMED = True
+        return {"enabled": True, "status": "starting", "reason": None, "path": str(path)}
+    except Exception as error:
+        return {"enabled": False, "status": "failed", "reason": f"{type(error).__name__}: {error}", "path": str(path)}
+
+
+def _profiler_activities(*, with_hpu: bool) -> list:
+    activity = torch.profiler.ProfilerActivity
+    if not with_hpu:
+        return [activity.CPU]
+    hpu = getattr(activity, "HPU", None)
+    if hpu is None:
+        raise RuntimeError("torch.profiler.ProfilerActivity.HPU is unavailable")
+    return [activity.CPU, hpu]
+
+
+def _activity_names(activities: list) -> list[str]:
+    return [str(getattr(activity, "name", activity)) for activity in activities]
 
 
 def _event(device: Any):
@@ -65,28 +128,75 @@ def _cache_metric() -> dict:
 
 
 class _Profiler:
-    def __init__(self, device: Any):
+    def __init__(self, device: Any, *, trace_plan: dict | None = None):
         self.prof = None
         self.reason = None
-        self.enabled = device is not None and torch.device(device).type == "hpu"
+        self.enabled = _is_hpu(device)
+        self.trace_plan = trace_plan or {
+            "enabled": False,
+            "status": "disabled",
+            "reason": "no HPU trace plan",
+            "path": None,
+        }
+        self.trace_status = self.trace_plan.get("status", "disabled")
+        self.trace_reason = self.trace_plan.get("reason")
+        self.trace_activities = None
+        self.trace_bytes = None
         self._scopes = []
         if self.enabled:
             self._start()
         else:
             self.reason = "device is not HPU"
+            if self.trace_plan.get("enabled"):
+                self.trace_status = "failed"
+                self.trace_reason = "device is not HPU"
+
+    def _start_profiler(self, activities: list) -> None:
+        self.prof = torch.profiler.profile(
+            activities=activities,
+            record_shapes=False,
+            with_stack=False,
+        )
+        self.prof.start()
 
     def _start(self):
+        if self.trace_plan.get("enabled"):
+            try:
+                activities = _profiler_activities(with_hpu=True)
+                self.trace_activities = _activity_names(activities)
+                self._start_profiler(activities)
+                self.trace_status = "running"
+                self.trace_reason = None
+                return
+            except Exception as error:
+                self.trace_status = "failed"
+                self.trace_reason = f"HPU trace start failed: {type(error).__name__}: {error}"
+                self.prof = None
+                # Preserve the original CPU-only observer if the HPU activity is unavailable.
+                try:
+                    self._start_profiler(_profiler_activities(with_hpu=False))
+                    self.reason = None
+                except Exception as fallback_error:
+                    self.prof = None
+                    self.reason = f"{type(fallback_error).__name__}: {fallback_error}"
+                return
         try:
-            self.prof = torch.profiler.profile(
-                activities=[torch.profiler.ProfilerActivity.CPU],
-                record_shapes=False,
-                with_stack=False,
-            )
-            self.prof.start()
+            self._start_profiler(_profiler_activities(with_hpu=False))
             self.reason = None
         except Exception as error:
             self.prof = None
             self.reason = f"{type(error).__name__}: {error}"
+
+    def _trace_result(self) -> dict:
+        return {
+            "enabled": bool(self.trace_plan.get("enabled")),
+            "status": self.trace_status,
+            "path": self.trace_plan.get("path"),
+            "reason": self.trace_reason,
+            "activities": self.trace_activities,
+            "format": "chrome_trace",
+            "bytes": self.trace_bytes,
+        }
 
     def enter(self, label: str) -> None:
         if self.enabled and self.prof is not None:
@@ -102,12 +212,29 @@ class _Profiler:
 
     def result(self) -> dict:
         if self.prof is None:
-            return {"available": False, "reason": self.reason}
+            return {"available": False, "reason": self.reason, "trace": self._trace_result()}
         try:
             self.prof.stop()
+            if self.trace_status == "running":
+                try:
+                    trace_path = Path(self.trace_plan["path"])
+                    self.prof.export_chrome_trace(str(trace_path))
+                    self.trace_bytes = trace_path.stat().st_size if trace_path.is_file() else None
+                    self.trace_status = "complete"
+                    self.trace_reason = None
+                except Exception as error:
+                    self.trace_status = "failed"
+                    self.trace_reason = f"HPU trace export failed: {type(error).__name__}: {error}"
             events = list(self.prof.events())
         except Exception as error:
-            return {"available": False, "reason": f"profiler finish failed: {type(error).__name__}: {error}"}
+            if self.trace_status == "running":
+                self.trace_status = "failed"
+                self.trace_reason = f"profiler finish failed: {type(error).__name__}: {error}"
+            return {
+                "available": False,
+                "reason": f"profiler finish failed: {type(error).__name__}: {error}",
+                "trace": self._trace_result(),
+            }
         rows = []
         seen = set()
         for event in events:
@@ -132,6 +259,7 @@ class _Profiler:
             "scope": "CPU profiler events under each segment record_function; top-level parent events only",
             "segments": rows,
             "event_count": len(events),
+            "trace": self._trace_result(),
         }
 
 
@@ -149,7 +277,7 @@ class RoundProfile:
             self.path.write_text("")
         self.cache_metric = cache_metric
         self.cache_before = cache_metric()
-        self._profiler = _Profiler(self.device)
+        self._profiler = _Profiler(self.device, trace_plan=_hpu_trace_plan(self.rank, self.directory))
         self.started_ns = time.perf_counter_ns()
         self.segments: list[_Segment] = []
         self._profiler_segments: list[dict] = []
@@ -202,6 +330,7 @@ class RoundProfile:
         _sync(self.device)
         sync_ended = time.perf_counter_ns()
         profiler = self._profiler.result()
+        hpu_trace = profiler.get("trace", {})
         self._closed = True
         profiler_rows = list(profiler.get("segments", [])) if profiler.get("available") else []
         profiler_index = 0
@@ -247,6 +376,7 @@ class RoundProfile:
             "control_op_counts": self.control_op_counts,
             "cache": {"before": self.cache_before, "after": cache_after, "delta": cache_delta},
             "profiler": profiler,
+            "hpu_trace": hpu_trace,
             "clock": "CLOCK_MONOTONIC host; current-stream HPU event offsets",
             "measurement": "one final synchronization; dispatcher counts are host-side profiler events",
         }
@@ -262,6 +392,7 @@ class _Segment:
         self.device = device
         self.name = name
         self.record = record
+        self.record.enter(f"{PREFIX}.{name}")
         self.host_start_ns = time.perf_counter_ns()
         self.host_end_ns = None
         self.start_event = _event(device)
@@ -290,4 +421,14 @@ def begin_round(*, rank: int, tp_rank: int, pp_rank: int, device: Any,
     return RoundProfile(root, rank=rank, tp_rank=tp_rank, pp_rank=pp_rank, device=device)
 
 
-__all__ = ["ENV", "PREFIX", "SCHEMA", "RoundProfile", "begin_round", "enabled"]
+__all__ = [
+    "ENV",
+    "HPU_TRACE_ENV",
+    "HPU_TRACE_FILE",
+    "PREFIX",
+    "SCHEMA",
+    "RoundProfile",
+    "begin_round",
+    "enabled",
+    "hpu_trace_enabled",
+]

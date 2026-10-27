@@ -8,10 +8,12 @@ import torch
 from vllm.sampling_params import SamplingParams
 
 from vllm_gaudi.ops.deepseek_v41_batch import RequestSlots
+from vllm_gaudi.ops.deepseek_v41_batch_attention import batch_packed_mla_tile_plan
 from vllm_gaudi.v1.worker.deepseek_v41_dspark_batch_runner import (
     DSparkBatchRunner,
     DSparkDraftBatch,
     DSparkTargetBatch,
+    warmup_scenarios,
 )
 from vllm_gaudi.v1.worker.deepseek_v41_runner import RequestState, V41ModelRunner
 
@@ -167,6 +169,133 @@ def _batch_runner(capacity, *, fail=False):
     return runner, target, draft, state, engram
 
 
+def _scenario_tile_bucket(capacity, lengths_by_lane):
+    active_lanes = tuple(sorted(lengths_by_lane))
+    plan = batch_packed_mla_tile_plan(active_lanes, total_rows=capacity * 6)
+    return plan.numel()
+
+
+@pytest.mark.parametrize("capacity", (1, 2, 4, 8, 16, 24, 31, 64))
+def test_warmup_scenarios_keep_legacy_patterns_for_non_n32(capacity):
+    scenarios = warmup_scenarios(capacity)
+    gap_lane = capacity - 1
+
+    assert tuple(name for name, _lengths in scenarios) == ("full_mixed_c1_c6", "partial_gap", "reuse_c1")
+    assert scenarios[0][1] == {lane: (6 if lane % 2 == 0 else 1) for lane in range(capacity)}
+    assert scenarios[1][1] == {gap_lane: 6}
+    assert scenarios[2][1] == {gap_lane: 1}
+
+
+def test_n32_warmup_scenarios_cover_each_tile_bucket_with_bounded_rounds():
+    scenarios = warmup_scenarios(32)
+    by_name = dict(scenarios)
+
+    assert len(scenarios) == 7
+    assert len(by_name) == len(scenarios)
+    assert tuple(by_name) == (
+        "full_mixed_c1_c6",
+        "partial_gap",
+        "reuse_c1",
+        "tile_bucket_2",
+        "tile_bucket_4",
+        "tile_bucket_8",
+        "tile_bucket_16",
+    )
+    assert by_name["partial_gap"] == {31: 6}
+    assert by_name["reuse_c1"] == {31: 1}
+    assert by_name["tile_bucket_2"] == {1: 6}
+    assert by_name["tile_bucket_4"] == {1: 6, 5: 6}
+    assert by_name["tile_bucket_8"] == {1: 6, 2: 6, 5: 6}
+    assert by_name["tile_bucket_16"] == {0: 6, 2: 6, 5: 6, 9: 6, 13: 6}
+
+    buckets = {name: _scenario_tile_bucket(32, lengths) for name, lengths in scenarios}
+    assert set(buckets.values()) == {1, 2, 4, 8, 16, 24}
+    assert [buckets[name] for name in ("tile_bucket_2", "tile_bucket_4", "tile_bucket_8", "tile_bucket_16")] == [
+        2,
+        4,
+        8,
+        16,
+    ]
+    assert [len(by_name[name]) for name in ("tile_bucket_2", "tile_bucket_4", "tile_bucket_8", "tile_bucket_16")] == [
+        1,
+        2,
+        3,
+        5,
+    ]
+
+    # The scenario matrix is host-only and rank-independent.
+    assert all(warmup_scenarios(32) == scenarios for _ in range(8))
+
+
+def test_n32_warmup_generation_continuity_ignores_unrelated_slot_histories():
+    capacity = 32
+    scenarios = warmup_scenarios(capacity)
+    runner, _target, _draft, state, _engram = _batch_runner(capacity)
+    # Make every physical slot carry a different prior generation.  The
+    # original check compared the last active lane of every scenario and
+    # would fail when the first three (tail lane 31) are followed by lane 1.
+    runner.slots.generations = [lane * 7 for lane in range(capacity)]
+    validated, validate = [], runner.slots.validate_batch_identities
+    runner.slots.validate_batch_identities = lambda slots, generations, active: (
+        validated.append((slots, generations, active)) or validate(slots, generations, active))
+
+    runner.warmup(pool_blocks=capacity + 1, max_model_len=8192, request_factory=_request_factory)
+
+    assert [validated[index][1][-1] for index in range(3)] == [218, 219, 220]
+    assert validated[3][0] == (1, )
+    assert validated[3][1] == (11, )
+    assert runner.round_generation == len(scenarios)
+    assert runner.slots.owners == {} and state.page_versions == {}
+
+
+def test_n32_warmup_covers_tile_scenarios_and_cleans_all_state():
+    capacity = 32
+    scenarios = warmup_scenarios(capacity)
+    runner, target, draft, state, engram = _batch_runner(capacity)
+    validated, validate = [], runner.slots.validate_batch_identities
+    runner.slots.validate_batch_identities = lambda slots, generations, active: (
+        validated.append((slots, generations, active)) or validate(slots, generations, active))
+
+    runner.warmup(pool_blocks=capacity + 1, max_model_len=8192, request_factory=_request_factory)
+
+    active_lanes = [tuple(sorted(lengths_by_lane)) for _name, lengths_by_lane in scenarios]
+    activity = [
+        tuple(lane in lengths_by_lane for lane in range(capacity))
+        for _name, lengths_by_lane in scenarios
+    ]
+    assert target.orders == active_lanes
+    assert target.activity == activity
+    assert target.finished == draft.calls == len(scenarios)
+    assert target.aborted == 0
+    assert (runner.round_generation, draft.verify_ring.generation) == (len(scenarios), len(scenarios))
+
+    for round_index, lanes in enumerate(active_lanes):
+        observed_slots, observed_generations, observed_active = validated[round_index]
+        assert observed_slots == lanes
+        assert observed_generations == (round_index + 1, ) * len(lanes)
+        assert observed_active == (True, ) * len(lanes)
+
+    page_columns = (8192 + 127) // 128
+    expected_page_rows = []
+    for _name, lengths_by_lane in scenarios:
+        dummy_page = min(lengths_by_lane) + 1
+        expected_page_rows.append(tuple(
+            (((lane + 1) if lane in lengths_by_lane else dummy_page), ) * page_columns
+            for lane in range(capacity)
+        ))
+    assert target.page_rows == expected_page_rows
+    assert state.pages.count_nonzero() == state.page_host.count_nonzero() == 0
+    assert state.page_versions == {} and state.restore_count == 1
+    assert state.pending is state.single_owner is state.prefill_owner is None
+    assert sorted(draft.batch_state.cleared) == sorted(list(range(capacity)) * len(scenarios))
+    assert all(sorted(layer.cleared) == sorted(list(range(capacity)) * len(scenarios))
+               for layer in state.layers.values())
+    assert runner.slots.owners == {} and runner.pending is False
+    assert runner.single_draft_owner is None and runner.draft_bank_generations == {}
+    assert len(engram.activated) == len(engram.released) == capacity * len(scenarios)
+    assert {request_id for request_id, reset in engram.activated if reset} == set(engram.released)
+
+
 @pytest.mark.parametrize("capacity", (1, 2, 4))
 def test_batch_warmup_covers_bounded_lanes_and_preserves_generation_continuity(capacity):
     runner, target, draft, state, engram = _batch_runner(capacity)
@@ -223,7 +352,7 @@ def test_batch_warmup_covers_bounded_lanes_and_preserves_generation_continuity(c
     assert live.round_generation == 4 and live.round_generation > draft.verify_ring.generation
 
 
-@pytest.mark.parametrize("capacity", (2, 4))
+@pytest.mark.parametrize("capacity", (2, 4, 32))
 def test_batch_warmup_cleans_every_owner_when_execution_fails(capacity):
     runner, target, draft, state, engram = _batch_runner(capacity, fail=True)
 
@@ -238,7 +367,7 @@ def test_batch_warmup_cleans_every_owner_when_execution_fails(capacity):
     assert all(sorted(layer.cleared) == list(range(capacity)) for layer in state.layers.values())
 
 
-@pytest.mark.parametrize("capacity", (1, 2, 4))
+@pytest.mark.parametrize("capacity", (1, 2, 4, 32))
 def test_batch_warmup_rejects_the_last_scheduler_page_as_unsafe_dummy(capacity):
     runner, target, draft, state, engram = _batch_runner(capacity)
 

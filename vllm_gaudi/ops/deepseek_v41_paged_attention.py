@@ -1738,6 +1738,27 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
         output = self.project_output(output)
         return self._finish_projected_output(output, ready_outputs, decode=decode, deferred_output=deferred_output)
 
+    def finish_output_target(self, output, positions, active, ready_outputs=()):
+        """Finish one active C6 lane without changing the legacy row mask.
+
+        Target packed attention defers this step to a per-layer compiled
+        boundary.  Each call is the same six-row ``_finish_output`` sequence
+        used by the original packed target loop, followed by the original
+        row-valid mask.
+        """
+        if output.shape[0] != NATIVE_WORK_TOKENS or positions.numel() != NATIVE_WORK_TOKENS:
+            raise ValueError("target output finish requires exactly six rows")
+        if active.shape != (NATIVE_WORK_TOKENS, ) or active.dtype != torch.bool:
+            raise ValueError("target output finish requires six boolean row owners")
+        result = self._finish_output(
+            output,
+            positions.clamp_min(0),
+            ready_outputs,
+            request_batch=True,
+            decode=True,
+        )
+        return torch.where(active[:, None], result, torch.zeros_like(result))
+
     def _finish_projected_output(self, output, ready_outputs=(), *, decode=False, deferred_output=False):
         """Consume an already inverse-rotated and wo_a-projected row."""
         partial = self.project_output_consumer(output)
@@ -2982,8 +3003,18 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
         request_lengths,
         request_slots,
         ready_outputs=(),
+        defer_output_finish=False,
+        tile_indices=None,
     ):
-        """Packed C1/C6 target attention with per-lane state and page ownership."""
+        """Packed C1/C6 target attention with per-lane state and page ownership.
+
+        ``defer_output_finish`` is a static target-only boundary.  When true,
+        the full packed MLA result is returned before the per-lane C6 output
+        projection/reduction so the target program can finish only active
+        lanes.  ``tile_indices`` is optional runtime tile-plan data for the
+        N32 complete-tile path; None retains the original full-row MLA path.
+        The default false/None path is unchanged for direct callers.
+        """
         from vllm_gaudi.ops.deepseek_v41_batch_attention import (
             batch_packed_mla,
             read_state_rows,
@@ -3148,7 +3179,10 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
             fused_gather=packed_gather,
             sram_gather=packed_gather and self.batch_packed_mla_sram,
             vector_gather=packed_gather and self.batch_packed_mla_vector,
+            tile_indices=tile_indices,
         )
+        if defer_output_finish:
+            return output, selected, blocks, main_done, index_done
         finished_outputs = []
         for lane in range(capacity):
             start = lane * 6

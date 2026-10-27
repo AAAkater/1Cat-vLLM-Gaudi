@@ -663,9 +663,12 @@ def test_prepared_decoder_target_method_forwards_fixed_args_and_aux(monkeypatch,
         batch_mhc_fusion=False,
         batch_ffn_fusion=False,
         moe=FakeMoE(),
+        _c6_scoped_recipe_cache=None,
     )
     for method in (
         "_c6_slice_path_error",
+        "_c6_scoped_prefix_math",
+        "_c6_scoped_post_pre_moe_math",
         "_forward_c6_attention_prefix",
         "_forward_c6_post_attention",
         "_target_c6_attention_prefix",

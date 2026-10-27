@@ -24,6 +24,7 @@ from vllm_gaudi.ops.deepseek_v41_verify import vocab_parallel_argmax
 _MAX_DRAFT_TOKENS = 5
 _TARGET_QUERY_BUCKET = 6
 _SCHEDULER_PAGE_TOKENS = 128
+_DSPARK_TILE_WARMUP_CAPACITY = 32
 _TRACE_SCHEMA = "dsv41.dspark.round.v2"
 
 logger = logging.getLogger(__name__)
@@ -54,6 +55,51 @@ def _fixed_page_table_width(max_model_len: int) -> int:
     if type(max_model_len) is not int or max_model_len < 1:
         raise ValueError("max_model_len must be a positive integer")
     return (max_model_len + _SCHEDULER_PAGE_TOKENS - 1) // _SCHEDULER_PAGE_TOKENS
+
+
+def warmup_scenarios(capacity: int) -> tuple[tuple[str, dict[int, int]], ...]:
+    """Return bounded host-lane patterns exercised before serving.
+
+    The original three patterns remain the complete contract for capacities
+    other than the N32 packed-MLA profile.  N32 additionally needs one sparse
+    round for every packed-MLA tile-plan bucket.  The added lane sets use the
+    minimum active lanes that reach each bucket; ``reuse_c1`` intentionally
+    repeats bucket one to retain the physical-slot generation/reuse check.
+    """
+    if type(capacity) is not int or capacity < 1:
+        raise ValueError("DSpark warmup capacity must be a positive integer")
+
+    full_lengths = {lane: (_TARGET_QUERY_BUCKET if lane % 2 == 0 else 1) for lane in range(capacity)}
+    gap_lane = capacity - 1
+    scenarios = (
+        ("full_mixed_c1_c6", full_lengths),
+        ("partial_gap", {gap_lane: _TARGET_QUERY_BUCKET}),
+        ("reuse_c1", {gap_lane: 1}),
+    )
+    if capacity != _DSPARK_TILE_WARMUP_CAPACITY:
+        return scenarios
+
+    # Exact tile coverage at N32 (24 original eight-row tiles):
+    # lane 1 -> {0,1}; lanes 1,5 -> {0,1,3,4};
+    # lanes 1,2,5 -> {0..4}; lanes 0,2,5,9,13 -> 9 tiles.
+    # Those select buckets 2, 4, 8 and 16 respectively.  full_mixed selects
+    # bucket 24, while partial_gap/reuse_c1 select bucket 1.
+    return scenarios + (
+        ("tile_bucket_2", {1: _TARGET_QUERY_BUCKET}),
+        ("tile_bucket_4", {1: _TARGET_QUERY_BUCKET, 5: _TARGET_QUERY_BUCKET}),
+        ("tile_bucket_8", {
+            1: _TARGET_QUERY_BUCKET,
+            2: _TARGET_QUERY_BUCKET,
+            5: _TARGET_QUERY_BUCKET,
+        }),
+        ("tile_bucket_16", {
+            0: _TARGET_QUERY_BUCKET,
+            2: _TARGET_QUERY_BUCKET,
+            5: _TARGET_QUERY_BUCKET,
+            9: _TARGET_QUERY_BUCKET,
+            13: _TARGET_QUERY_BUCKET,
+        }),
+    )
 
 
 def _component_capacity(value: Any) -> int | None:
@@ -178,7 +224,9 @@ def _next_draft_rows(value: Any, batch_size: int, name: str) -> list[list[int]]:
     return result
 
 
-def _target_greedy_ids(program, hidden: torch.Tensor) -> torch.Tensor:
+def _target_greedy_ids(program,
+                       hidden: torch.Tensor,
+                       host_active_lanes: tuple[int, ...] | None = None) -> torch.Tensor:
     """Select target ids with request-local C6 head projections."""
     if hidden.ndim != 2:
         raise ValueError("target hidden states must be a two-dimensional tensor")
@@ -188,16 +236,36 @@ def _target_greedy_ids(program, hidden: torch.Tensor) -> torch.Tensor:
             f"target hidden rows must be a positive multiple of {_TARGET_QUERY_BUCKET}, got {rows}")
 
     capacity = rows // _TARGET_QUERY_BUCKET
-    lane_ids = []
-    for lane in range(capacity):
+    if host_active_lanes is None:
+        active_lanes = tuple(range(capacity))
+    else:
+        if not isinstance(host_active_lanes, tuple):
+            raise TypeError("host_active_lanes must be a tuple or None")
+        if not host_active_lanes:
+            raise ValueError("host_active_lanes must contain at least one lane")
+        previous_lane = -1
+        for lane in host_active_lanes:
+            if isinstance(lane, bool) or not isinstance(lane, int):
+                raise TypeError("host_active_lanes must contain only integers")
+            if lane < 0 or lane >= capacity:
+                raise ValueError(
+                    f"host_active_lanes entries must be in [0, {capacity}), got {lane}")
+            if lane <= previous_lane:
+                raise ValueError("host_active_lanes must be strictly increasing and unique")
+            previous_lane = lane
+        active_lanes = host_active_lanes
+
+    target_ids = torch.zeros((rows, ), dtype=torch.int64, device=hidden.device)
+    for lane in active_lanes:
         start = lane * _TARGET_QUERY_BUCKET
         lane_hidden = hidden[start:start + _TARGET_QUERY_BUCKET]
-        lane_ids.append(vocab_parallel_argmax(
+        lane_ids = vocab_parallel_argmax(
             program._head_projection(lane_hidden),
             program.tp_rank,
             program.all_gather,
-        ))
-    return torch.cat(lane_ids, dim=0)
+        )
+        target_ids[start:start + _TARGET_QUERY_BUCKET] = lane_ids
+    return target_ids
 
 
 @dataclass(frozen=True)
@@ -563,7 +631,7 @@ class DSparkPackedTargetStages:
             hidden, aux = stage(self.hidden_seed, self.pre_mix_seed, batch, engram_rows)
             if profile is not None:
                 profile.mark("target.head_projection")
-            target_ids = _target_greedy_ids(self.program, hidden)
+            target_ids = _target_greedy_ids(self.program, hidden, batch.host_active_lanes)
             payload = {
                 "hidden": hidden,
                 "aux": aux,
@@ -883,13 +951,7 @@ class DSparkBatchRunner:
         started_round = self.round_generation
         observed: list[dict[str, Any]] = []
         try:
-            full_lengths = {lane: (6 if lane % 2 == 0 else 1) for lane in range(self.batch_capacity)}
-            gap_lane = self.batch_capacity - 1
-            scenarios = (
-                ("full_mixed_c1_c6", full_lengths),
-                ("partial_gap", {gap_lane: 6}),
-                ("reuse_c1", {gap_lane: 1}),
-            )
+            scenarios = warmup_scenarios(self.batch_capacity)
             for round_index, (name, lengths_by_lane) in enumerate(scenarios):
                 observed.append(
                     self._warmup_round(
@@ -928,7 +990,14 @@ class DSparkBatchRunner:
                 raise RuntimeError("DSpark warmup did not exercise a full fixed-capacity lane set")
             if self.batch_capacity > 1 and observed[1]["active_lanes"] == stage_key:
                 raise RuntimeError("DSpark warmup did not exercise a partial physical lane gap")
-            generations = [item["slot_generations"][-1] for item in observed]
+            # The first three scenarios deliberately reuse the same tail lane.
+            # New N32 tile scenarios activate different lanes, so comparing
+            # their final entries would compare unrelated slot histories.
+            reuse_lane = self.batch_capacity - 1
+            reuse_observations = observed[:3]
+            if any(item["active_lanes"][-1] != reuse_lane for item in reuse_observations):
+                raise RuntimeError("DSpark warmup reuse scenarios do not share the canonical tail lane")
+            generations = [item["slot_generations"][-1] for item in reuse_observations]
             if not all(second > first for first, second in zip(generations[:-1], generations[1:], strict=True)):
                 raise RuntimeError("DSpark warmup did not advance a reused physical slot generation")
             if self.pending or self.slots.owners or getattr(state, "pending", None) is not None:
