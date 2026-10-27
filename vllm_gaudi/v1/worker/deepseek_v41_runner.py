@@ -1166,12 +1166,59 @@ class V41ModelRunner:
         if type(native_single) is not bool:
             raise TypeError("dsv41_dspark_compact_native_single must be a boolean")
         self.dspark_compact_native_single = native_single
+        use_active_metadata = additional.get("dsv41_dspark_active_metadata", True)
+        if type(use_active_metadata) is not bool:
+            raise TypeError("use_active_metadata must be a boolean")
         configure_buckets = getattr(target_stage, "configure_execution_buckets", None)
         if callable(configure_buckets):
             configure_buckets(
                 additional.get("dsv41_dspark_target_buckets", True),
                 buckets=additional.get("dsv41_dspark_target_warmup_buckets", (1, 2, 4, 8, 16, 32, 64)),
             )
+        configure_queries = getattr(target_stage, "configure_query_buckets", None)
+        if callable(configure_queries):
+            configure_queries(
+                additional.get("dsv41_dspark_target_query_buckets", False),
+                buckets=additional.get("dsv41_dspark_target_query_warmup_buckets", (1, 8, 32, 128)))
+        ragged_compressor = additional.get("dsv41_dspark_target_ragged_compressor", False)
+        if type(ragged_compressor) is not bool:
+            raise TypeError("dsv41_dspark_target_ragged_compressor must be a boolean")
+        configure_ragged = getattr(target_stage, "configure_ragged_compressor", None)
+        if callable(configure_ragged):
+            configure_ragged(ragged_compressor)
+        elif ragged_compressor:
+            raise RuntimeError("dsv41_dspark_target_ragged_compressor requires packed DSpark target stages")
+        configure_finish = getattr(target_stage, "configure_device_finish", None)
+        if callable(configure_finish):
+            configure_finish(additional.get("dsv41_dspark_device_target_finish", False))
+        configure_owner_layout = getattr(target_stage, "configure_device_owner_layout", None)
+        if callable(configure_owner_layout):
+            configure_owner_layout(additional.get("dsv41_dspark_device_owner_layout", False))
+        configure_fused_restore = getattr(target_stage, "configure_fused_target_restore", None)
+        if callable(configure_fused_restore):
+            configure_fused_restore(additional.get("dsv41_dspark_fused_target_restore", False))
+        draft_buckets = additional.get("dsv41_dspark_draft_buckets", True)
+        if type(draft_buckets) is not bool:
+            raise TypeError("dsv41_dspark_draft_buckets must be a boolean")
+        if not use_active_metadata:
+            # Compact draft buckets depend on the active-lane mapping.  Keep
+            # the fixed full-capacity draft transaction when that mapping is
+            # explicitly disabled for rollback.
+            draft_buckets = False
+        configure_draft_buckets = getattr(draft_stage, "configure_execution_buckets", None)
+        if callable(configure_draft_buckets):
+            configure_draft_buckets(
+                draft_buckets,
+                buckets=additional.get("dsv41_dspark_draft_warmup_buckets", (1, 2, 4, 8, 16, 32, 64)),
+            )
+        draft_packed_inputs = additional.get("dsv41_dspark_draft_packed_inputs", False)
+        if type(draft_packed_inputs) is not bool:
+            raise TypeError("dsv41_dspark_draft_packed_inputs must be a boolean")
+        configure_packed_inputs = getattr(draft_stage, "configure_packed_inputs", None)
+        if callable(configure_packed_inputs):
+            configure_packed_inputs(draft_packed_inputs)
+        elif draft_packed_inputs:
+            raise RuntimeError("dsv41_dspark_draft_packed_inputs requires the packed DSpark draft stage")
         state = getattr(self.model, "batch_state", None)
         slots = getattr(state, "slots", None)
         if (getattr(state, "capacity", None) != capacity or getattr(slots, "capacity", None) != capacity):
@@ -1188,8 +1235,7 @@ class V41ModelRunner:
             trace=DSparkBatchTrace(rank=rank, tp_rank=self.model.tp_rank, pp_rank=self.model.pp_rank),
             slots=slots,
             batch_capacity=capacity,
-            use_active_metadata=(getattr(getattr(self, "vllm_config", None), "additional_config", {}) or {}).get(
-                "dsv41_dspark_active_metadata", True),
+            use_active_metadata=use_active_metadata,
         )
         self.dspark_batch_capacity = capacity
 

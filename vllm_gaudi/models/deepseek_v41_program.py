@@ -1426,6 +1426,187 @@ def decode_mhc_publish_collapse(value, residual, post, comb, pre_mix):
         value.contiguous(), residual.contiguous(), post.contiguous(), comb.contiguous(), pre_mix.contiguous())
 
 
+def attention_input_rows(layer, residual, pre_mix, collapsed_attention=None):
+    """Eager mHC attention input and attention norm for any number of rows.
+
+    This is the row-local part of the C6 prefix: it reads no lane state,
+    Engram rows, collapse handoff or scoped recipe.  The C6 prefix calls it
+    with exactly six rows, so its default arithmetic is unchanged.  Other
+    row counts are mathematically row independent, but on HPU ``hc_pre``
+    and the attention norm dispatch native kernels by row count (for
+    example the ``2 <= tokens <= 6`` mHC control paths and C1 reduction
+    trees), so a compact caller must qualify its numerics separately.
+    """
+    w = layer.weights
+    input_prequant = None
+    input_roundtrip = None
+    value, new_pre, post, comb = hc_pre(
+        residual,
+        pre_mix,
+        w.hc_attn_fn,
+        w.hc_attn_scale,
+        w.hc_attn_base,
+        layer.eps,
+        layer.hc_eps,
+        layer.iterations,
+        packed_fn=layer.hc_attn_fn_packed if not layer.draft or layer.draft_mhc else None,
+        decode=True,
+        collapsed_input=collapsed_attention,
+        batch_control_reuse=layer.batch_control_reuse,
+        control_mme_weight=layer.hc_attn_fn_mme if layer.mhc_control_mme else None,
+        control_epilogue=layer.draft_mhc,
+        control_fp8_weight=((layer.hc_attn_fn_fp8, layer.hc_attn_fn_fp8_channel)
+                            if layer.hc_attn_fn_fp8 is not None else None),
+    )
+    if (gaudi_envs.VLLM_HPU_DSV41_DSPARK_NORM_ROUNDTRIP and value.dtype == torch.bfloat16
+            and layer.attention._fused_qkv_quantized and layer.attention._fused_qkv_weight is not None
+            and layer.attention._fused_qkv_weight.dtype == torch.bfloat16
+            and "fused_qkv_channel" not in layer.attention._buffers
+            and "dspark_hw_qkv" not in layer.attention._buffers):
+        value, input_roundtrip = torch.ops.custom_op.custom_deepseek_v41_norm_roundtrip_bf16_gaudi2(
+            value.contiguous(), w.attn_norm.weight, layer.eps)
+    elif (layer.decode_attention_norm_quant and value.dtype == torch.bfloat16
+          and "fused_qkv_channel" in layer.attention._buffers):
+        norm_quant = torch.ops.custom_op.custom_deepseek_v41_attention_norm_quant_gaudi2
+        if gaudi_envs.VLLM_HPU_DSV41_DSPARK_INPUT_QUANT_REMAT:
+            norm_quant = torch.ops.custom_op.custom_deepseek_v41_attention_norm_quant_gaudi2_remat
+        value, quantized, activation_scale = norm_quant(
+            value.contiguous(), w.attn_norm.weight, layer.eps)
+        input_prequant = quantized, activation_scale
+    else:
+        value = rms_norm(value, w.attn_norm.weight, layer.eps,
+                         native_decode=layer.dspark_input_norm)
+    if collapsed_attention is not None and input_prequant is None:
+        value = value.to(residual.dtype)
+    return value, new_pre, post, comb, input_prequant, input_roundtrip
+
+
+def ffn_input_rows(layer, value, residual, new_pre, post, comb):
+    """Eager attention mHC post, FFN mHC input and FFN norm/quant for any rows.
+
+    Returns ``(residual, normalized, quantized, activation_scale,
+    shared_prequant, pre_mix, post, comb)``.  This is the eager half of the
+    C6 suffix without the six-row scoped recipe.  Every output row depends
+    only on its own input row; HPU kernel selection still depends on the
+    row count (``2 <= tokens <= 6`` mHC control, the one-row BF16 FFN
+    quant), so only the C6 caller is numerically qualified.
+    """
+    w = layer.weights
+    collapsed_ffn = None
+    if layer.mhc_post_collapse and value.device.type == "hpu":
+        residual, collapsed_ffn = decode_mhc_post_collapse(value, residual, post, comb, new_pre)
+    else:
+        residual = hc_post(value, residual, post, comb)
+
+    value, pre_mix, post, comb = hc_pre(
+        residual,
+        new_pre,
+        w.hc_ffn_fn,
+        w.hc_ffn_scale,
+        w.hc_ffn_base,
+        layer.eps,
+        layer.hc_eps,
+        layer.iterations,
+        packed_fn=layer.hc_ffn_fn_packed if not layer.draft or layer.draft_mhc else None,
+        decode=True,
+        collapsed_input=collapsed_ffn,
+        batch_control_reuse=layer.batch_control_reuse,
+        control_mme_weight=layer.hc_ffn_fn_mme if layer.mhc_control_mme else None,
+        control_epilogue=layer.draft_mhc,
+        control_fp8_weight=((layer.hc_ffn_fn_fp8, layer.hc_ffn_fn_fp8_channel)
+                            if layer.hc_ffn_fn_fp8 is not None else None),
+    )
+    if layer.ffn_dual_quant and getattr(layer.moe, "shared_gate_up_channel", None) is not None:
+        if layer.ffn_bf16_quant and value.shape[0] == 1:
+            normalized, quantized, activation_scale, shared_q, shared_scale = (
+                torch.ops.custom_op.custom_deepseek_v41_ffn_norm_dual_bf16_quant_gaudi2(
+                    value.contiguous(), w.ffn_norm.weight, layer.eps))
+        else:
+            normalized, quantized, activation_scale, shared_q, shared_scale = decode_ffn_dual_quant(
+                value, w.ffn_norm.weight, layer.eps)
+        shared_prequant = shared_q, shared_scale
+    else:
+        normalized, quantized, activation_scale = (
+            torch.ops.custom_op.custom_deepseek_v41_ffn_norm_quant_gaudi2(
+                value.contiguous(), w.ffn_norm.weight, layer.eps))
+        shared_prequant = None
+    return residual, normalized, quantized, activation_scale, shared_prequant, pre_mix, post, comb
+
+
+def ffn_output_rows(
+    layer,
+    residual,
+    normalized,
+    quantized,
+    activation_scale,
+    shared_prequant,
+    pre_mix,
+    post,
+    comb,
+    image_mask,
+    *,
+    schedule,
+    fp8_decode,
+    collapse_handoff=None,
+    publish_collapse=False,
+):
+    """Run MoE and the FFN mHC post/collapse on already prepared rows.
+
+    ``collapse_handoff`` is the caller-owned lane dictionary; it is only
+    written when ``publish_collapse`` selects the HPU inter-layer collapse.
+    """
+    value = layer.moe(
+        normalized,
+        image_mask,
+        ready_outputs=(post, comb) if schedule else (),
+        fp8_decode=fp8_decode,
+        decode=True,
+        prequant=(quantized, activation_scale),
+        shared_prequant=shared_prequant,
+        deferred_output=False,
+    )
+    if (publish_collapse and collapse_handoff is not None and layer.mhc_interlayer_collapse
+            and value.device.type == "hpu"):
+        residual, collapsed = decode_mhc_publish_collapse(value, residual, post, comb, pre_mix)
+        collapse_handoff[layer.layer + 1] = collapsed
+    else:
+        residual = hc_post(value, residual, post, comb)
+    return residual, pre_mix
+
+
+def post_attention_rows(
+    layer,
+    value,
+    residual,
+    new_pre,
+    post,
+    comb,
+    image_mask,
+    *,
+    schedule,
+    fp8_decode,
+    collapse_handoff=None,
+    publish_collapse=False,
+):
+    """Row-count generic eager post-attention entry (no scoped recipe).
+
+    For six rows this is exactly the eager C6 suffix.  It accepts any row
+    count >= 1, e.g. compact target query rows, and has no lane-local state
+    except the optional caller-owned ``collapse_handoff``.
+    """
+    if value.ndim < 2 or value.shape[0] < 1 or residual.shape[0] != value.shape[0]:
+        raise ValueError("row post-attention requires matching nonempty value and residual rows")
+    return ffn_output_rows(
+        layer,
+        *ffn_input_rows(layer, value, residual, new_pre, post, comb),
+        image_mask,
+        schedule=schedule,
+        fp8_decode=fp8_decode,
+        collapse_handoff=collapse_handoff,
+        publish_collapse=publish_collapse,
+    )
+
+
 class PreparedDecoderLayer(nn.Module):
     _target_c6_slices = True
 
@@ -1808,44 +1989,8 @@ class PreparedDecoderLayer(nn.Module):
             value, new_pre, post, comb, quantized, activation_scale = scoped
             input_prequant = None if quantized is None else (quantized, activation_scale)
         else:
-            value, new_pre, post, comb = hc_pre(
-                residual,
-                pre_mix,
-                w.hc_attn_fn,
-                w.hc_attn_scale,
-                w.hc_attn_base,
-                self.eps,
-                self.hc_eps,
-                self.iterations,
-                packed_fn=self.hc_attn_fn_packed if not self.draft or self.draft_mhc else None,
-                decode=True,
-                collapsed_input=collapsed_attention,
-                batch_control_reuse=self.batch_control_reuse,
-                control_mme_weight=self.hc_attn_fn_mme if self.mhc_control_mme else None,
-                control_epilogue=self.draft_mhc,
-                control_fp8_weight=((self.hc_attn_fn_fp8, self.hc_attn_fn_fp8_channel)
-                                    if self.hc_attn_fn_fp8 is not None else None),
-            )
-            if (gaudi_envs.VLLM_HPU_DSV41_DSPARK_NORM_ROUNDTRIP and value.dtype == torch.bfloat16
-                    and self.attention._fused_qkv_quantized and self.attention._fused_qkv_weight is not None
-                    and self.attention._fused_qkv_weight.dtype == torch.bfloat16
-                    and "fused_qkv_channel" not in self.attention._buffers
-                    and "dspark_hw_qkv" not in self.attention._buffers):
-                value, input_roundtrip = torch.ops.custom_op.custom_deepseek_v41_norm_roundtrip_bf16_gaudi2(
-                    value.contiguous(), w.attn_norm.weight, self.eps)
-            elif (self.decode_attention_norm_quant and value.dtype == torch.bfloat16
-                  and "fused_qkv_channel" in self.attention._buffers):
-                norm_quant = torch.ops.custom_op.custom_deepseek_v41_attention_norm_quant_gaudi2
-                if gaudi_envs.VLLM_HPU_DSV41_DSPARK_INPUT_QUANT_REMAT:
-                    norm_quant = torch.ops.custom_op.custom_deepseek_v41_attention_norm_quant_gaudi2_remat
-                value, quantized, activation_scale = norm_quant(
-                    value.contiguous(), w.attn_norm.weight, self.eps)
-                input_prequant = quantized, activation_scale
-            else:
-                value = rms_norm(value, w.attn_norm.weight, self.eps,
-                                 native_decode=self.dspark_input_norm)
-            if collapsed_attention is not None and input_prequant is None:
-                value = value.to(residual.dtype)
+            value, new_pre, post, comb, input_prequant, input_roundtrip = attention_input_rows(
+                self, residual, pre_mix, collapsed_attention)
         schedule = gaudi_envs.VLLM_HPU_DSV41_MHC_SCHEDULE and not self.draft
         return value, new_pre, post, comb, target_state, input_prequant, input_roundtrip, schedule
 
@@ -1874,7 +2019,6 @@ class PreparedDecoderLayer(nn.Module):
         """Run the serial C6 post-attention mHC/FFN norm/MoE/collapse arithmetic."""
         if value.shape[0] != 6 or residual.shape[0] != 6:
             raise ValueError("shared C6 attention suffix requires exactly six rows")
-        w = self.weights
         scoped = (self._c6_scoped_post_pre_moe_math(value, residual, new_pre, post, comb, fp8_decode=fp8_decode)
                   if use_scoped_recipe else None)
         if scoped is not None:
@@ -1891,61 +2035,24 @@ class PreparedDecoderLayer(nn.Module):
             ) = scoped
             shared_prequant = None if shared_q is None else (shared_q, shared_scale)
         else:
-            collapsed_ffn = None
-            if self.mhc_post_collapse and value.device.type == "hpu":
-                residual, collapsed_ffn = decode_mhc_post_collapse(value, residual, post, comb, new_pre)
-            else:
-                residual = hc_post(value, residual, post, comb)
-
-            value, pre_mix, post, comb = hc_pre(
-                residual,
-                new_pre,
-                w.hc_ffn_fn,
-                w.hc_ffn_scale,
-                w.hc_ffn_base,
-                self.eps,
-                self.hc_eps,
-                self.iterations,
-                packed_fn=self.hc_ffn_fn_packed if not self.draft or self.draft_mhc else None,
-                decode=True,
-                collapsed_input=collapsed_ffn,
-                batch_control_reuse=self.batch_control_reuse,
-                control_mme_weight=self.hc_ffn_fn_mme if self.mhc_control_mme else None,
-                control_epilogue=self.draft_mhc,
-                control_fp8_weight=((self.hc_ffn_fn_fp8, self.hc_ffn_fn_fp8_channel)
-                                    if self.hc_ffn_fn_fp8 is not None else None),
-            )
-            if self.ffn_dual_quant and getattr(self.moe, "shared_gate_up_channel", None) is not None:
-                if self.ffn_bf16_quant and value.shape[0] == 1:
-                    normalized, quantized, activation_scale, shared_q, shared_scale = (
-                        torch.ops.custom_op.custom_deepseek_v41_ffn_norm_dual_bf16_quant_gaudi2(
-                            value.contiguous(), w.ffn_norm.weight, self.eps))
-                else:
-                    normalized, quantized, activation_scale, shared_q, shared_scale = decode_ffn_dual_quant(
-                        value, w.ffn_norm.weight, self.eps)
-                shared_prequant = shared_q, shared_scale
-            else:
-                normalized, quantized, activation_scale = (
-                    torch.ops.custom_op.custom_deepseek_v41_ffn_norm_quant_gaudi2(
-                        value.contiguous(), w.ffn_norm.weight, self.eps))
-                shared_prequant = None
-        value = self.moe(
+            (residual, normalized, quantized, activation_scale, shared_prequant, pre_mix, post,
+             comb) = ffn_input_rows(self, value, residual, new_pre, post, comb)
+        return ffn_output_rows(
+            self,
+            residual,
             normalized,
+            quantized,
+            activation_scale,
+            shared_prequant,
+            pre_mix,
+            post,
+            comb,
             image_mask,
-            ready_outputs=(post, comb) if schedule else (),
+            schedule=schedule,
             fp8_decode=fp8_decode,
-            decode=True,
-            prequant=(quantized, activation_scale),
-            shared_prequant=shared_prequant,
-            deferred_output=False,
+            collapse_handoff=collapse_handoff,
+            publish_collapse=publish_collapse,
         )
-        if (publish_collapse and collapse_handoff is not None and self.mhc_interlayer_collapse
-                and value.device.type == "hpu"):
-            residual, collapsed = decode_mhc_publish_collapse(value, residual, post, comb, pre_mix)
-            collapse_handoff[self.layer + 1] = collapsed
-        else:
-            residual = hc_post(value, residual, post, comb)
-        return residual, pre_mix
 
     @torch._dynamo.disable
     def _target_c6_post_attention(self, *args, **kwargs):

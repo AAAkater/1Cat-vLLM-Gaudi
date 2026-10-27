@@ -22,16 +22,33 @@ def records_for(requests):
     return [{"request_id": request["id"], "response_ids": [f"cmpl-{request['id']}-0"]} for request in requests]
 
 
-def trace_row(capacity, active_lanes, req_ids=None, *, fixed_arrays=True, events=None):
+def trace_row(
+    capacity,
+    active_lanes,
+    req_ids=None,
+    *,
+    fixed_arrays=True,
+    events=None,
+    logical_slots=None,
+    target_capacity=None,
+    draft_capacity=None,
+    target_source_lanes=None,
+    target_slots=None,
+    target_graph_key=None,
+    draft_source_lanes=None,
+    draft_slots=None,
+    draft_graph_key=None,
+):
     if req_ids is None:
         req_ids = [f"request-{lane}" for lane in active_lanes]
+    logical_slots = {} if logical_slots is None else logical_slots
     slots = [-1] * capacity
     generations = [0] * capacity
     commits = [0] * capacity
     queries = [0] * capacity
     outputs = [0] * capacity
     for offset, lane in enumerate(active_lanes):
-        slots[lane] = lane
+        slots[lane] = logical_slots.get(lane, lane)
         generations[lane] = 3 + lane
         commits[lane] = 1
         queries[lane] = 1
@@ -42,6 +59,8 @@ def trace_row(capacity, active_lanes, req_ids=None, *, fixed_arrays=True, events
         commits = [commits[lane] for lane in active_lanes]
         queries = [queries[lane] for lane in active_lanes]
         outputs = [outputs[lane] for lane in active_lanes]
+    target_bucket = capacity if target_capacity is None else target_capacity
+    draft_bucket = capacity if draft_capacity is None else draft_capacity
     row = {
         "schema": "dsv41.dspark.round.v2",
         "batch_round": 9,
@@ -51,13 +70,24 @@ def trace_row(capacity, active_lanes, req_ids=None, *, fixed_arrays=True, events
         "request_slots": slots,
         "slot_generations": generations,
         "logical_target_queries": queries,
-        "actual_packed_target_rows": capacity * 6,
-        "actual_packed_draft_rows": capacity * 5,
+        "actual_packed_target_rows": target_bucket * 6,
+        "actual_packed_draft_rows": draft_bucket * 5,
         "committed_counts": commits,
         "output_counts": outputs,
         "completion_event_observed": True,
         "final_event_observed": True,
     }
+    execution_fields = {
+        "target_execution_capacity": target_capacity,
+        "draft_execution_capacity": draft_capacity,
+        "target_source_lanes": target_source_lanes,
+        "target_execution_slots": target_slots,
+        "target_graph_key": target_graph_key,
+        "draft_source_lanes": draft_source_lanes,
+        "draft_execution_slots": draft_slots,
+        "draft_graph_key": draft_graph_key,
+    }
+    row.update({name: value for name, value in execution_fields.items() if value is not None})
     if events is not None:
         for name in ("completion_event_observed", "final_event_observed"):
             row.pop(name)
@@ -121,6 +151,8 @@ class CapacityQualifierTests(unittest.TestCase):
         self.assertEqual(event["active_lanes"], [0, 1, 2, 3])
         self.assertEqual(event["target_rows"], 24)
         self.assertEqual(event["draft_rows"], 20)
+        self.assertEqual(event["target_execution_capacity"], 4)
+        self.assertEqual(event["draft_execution_capacity"], 4)
         self.assertEqual(event["slots"], [0, 1, 2, 3])
         self.assertEqual(event["gens"], [3, 4, 5, 6])
         self.assertEqual(event["reqids"], reqids)
@@ -143,6 +175,10 @@ class CapacityQualifierTests(unittest.TestCase):
         self.assertEqual(event["reqids"], [request["id"]])
         self.assertEqual(event["target_rows"], 24)
         self.assertEqual(event["draft_rows"], 20)
+        self.assertEqual(event["target_execution_capacity"], 4)
+        self.assertEqual(event["draft_execution_capacity"], 4)
+        self.assertIsNone(event["target_source_lanes"])
+        self.assertIsNone(event["draft_source_lanes"])
         self.assertEqual(event["request_evidence"][request["id"]]["slot"], 2)
 
     def test_v2_trace_rows_and_lane_arrays_scale_through_n64(self):
@@ -159,6 +195,198 @@ class CapacityQualifierTests(unittest.TestCase):
                 self.assertEqual(event["target_rows"], capacity * 6)
                 self.assertEqual(event["draft_rows"], capacity * 5)
                 self.assertEqual(event["active_lanes"], [capacity - 1])
+
+    def test_custom_n_independent_target_and_draft_execution_buckets(self):
+        requests = qualifier.build_requests(2, 3, None)
+        reqids = [None] * 11
+        for lane, request in zip((2, 7, 9), requests, strict=True):
+            reqids[lane] = request["id"]
+        logical_slots = {2: 9, 7: 3, 9: 0}
+        target_source_lanes = [2, 7, 9, 0]
+        target_slots = [9, 3, 0, -1]
+        draft_source_lanes = [2, 7, 9, 0, 1, 3, 4, 5]
+        draft_slots = [9, 3, 0, -1, -1, -1, -1, -1]
+        row = trace_row(
+            11,
+            [2, 7, 9],
+            reqids,
+            logical_slots=logical_slots,
+            target_capacity=4,
+            draft_capacity=8,
+            target_source_lanes=target_source_lanes,
+            target_slots=target_slots,
+            target_graph_key=[11, 4],
+            draft_source_lanes=draft_source_lanes,
+            draft_slots=draft_slots,
+            draft_graph_key=[11, 8],
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            result = qualifier.assess_evidence(
+                write_trace(Path(temporary), [row]), records_for(requests), batch_capacity=11)
+        self.assertEqual(result["status"], "runner_evidence_correlated")
+        self.assertEqual(result["max_active_count"], 3)
+        event = result["matched_events"][0]
+        self.assertEqual(event["target_execution_capacity"], 4)
+        self.assertEqual(event["draft_execution_capacity"], 8)
+        self.assertEqual(event["target_execution_rows"], 24)
+        self.assertEqual(event["draft_execution_rows"], 40)
+        self.assertEqual(event["target_source_lanes"], target_source_lanes)
+        self.assertEqual(event["draft_source_lanes"], draft_source_lanes)
+        self.assertEqual(event["target_execution_slots"], target_slots)
+        self.assertEqual(event["draft_execution_slots"], draft_slots)
+        self.assertEqual(event["target_graph_key"], [11, 4])
+        self.assertEqual(event["draft_graph_key"], [11, 8])
+        for request, slot in zip(requests, (9, 3, 0), strict=True):
+            self.assertEqual(event["request_evidence"][request["id"]]["slot"], slot)
+
+    def test_execution_capacity_fields_without_mappings_are_optional(self):
+        requests = qualifier.build_requests(2, 2, None)
+        row = trace_row(6, [1, 4], [request["id"] for request in requests],
+                        target_capacity=4, draft_capacity=2)
+        with tempfile.TemporaryDirectory() as temporary:
+            result = qualifier.assess_evidence(
+                write_trace(Path(temporary), [row]), records_for(requests), batch_capacity=6)
+        self.assertEqual(result["status"], "runner_evidence_correlated")
+        event = result["matched_events"][0]
+        self.assertEqual(event["target_execution_capacity"], 4)
+        self.assertEqual(event["draft_execution_capacity"], 2)
+        self.assertEqual(event["target_execution_rows"], 24)
+        self.assertEqual(event["draft_execution_rows"], 10)
+        self.assertIsNone(event["target_source_lanes"])
+        self.assertIsNone(event["draft_source_lanes"])
+        self.assertIsNone(event["target_execution_slots"])
+        self.assertIsNone(event["draft_execution_slots"])
+        self.assertIsNone(event["target_graph_key"])
+        self.assertIsNone(event["draft_graph_key"])
+
+    def test_missing_capacity_fields_default_to_n_with_bucket_mappings(self):
+        requests = qualifier.build_requests(2, 2, None)
+        row = trace_row(
+            4,
+            [1, 3],
+            [request["id"] for request in requests],
+            logical_slots={1: 3, 3: 1},
+            target_source_lanes=[1, 3, 0, 2],
+            target_slots=[3, 1, -1, -1],
+            target_graph_key=[4, 4],
+            draft_source_lanes=[1, 3, 0, 2],
+            draft_slots=[3, 1, -1, -1],
+            draft_graph_key=[4, 4],
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            result = qualifier.assess_evidence(
+                write_trace(Path(temporary), [row]), records_for(requests), batch_capacity=4)
+        self.assertEqual(result["status"], "runner_evidence_correlated")
+        event = result["matched_events"][0]
+        self.assertEqual(event["target_execution_capacity"], 4)
+        self.assertEqual(event["draft_execution_capacity"], 4)
+        self.assertEqual(event["target_graph_key"], [4, 4])
+        self.assertEqual(event["draft_graph_key"], [4, 4])
+
+    def test_invalid_execution_capacities_are_rejected(self):
+        requests = qualifier.build_requests(2, 2, None)
+        reqids = [request["id"] for request in requests]
+        rows = [
+            trace_row(6, [1, 4], reqids, target_capacity=0, draft_capacity=6),
+            trace_row(6, [1, 4], reqids, target_capacity=7, draft_capacity=6),
+            trace_row(6, [1, 4], reqids, target_capacity=True, draft_capacity=6),
+            trace_row(6, [1, 4], reqids, target_capacity=1, draft_capacity=6),
+            trace_row(6, [1, 4], reqids, target_capacity=6, draft_capacity=0),
+            trace_row(6, [1, 4], reqids, target_capacity=6, draft_capacity=7),
+            trace_row(6, [1, 4], reqids, target_capacity=6, draft_capacity=False),
+            trace_row(6, [1, 4], reqids, target_capacity=6, draft_capacity=1),
+        ]
+        with tempfile.TemporaryDirectory() as temporary:
+            result = qualifier.assess_evidence(
+                write_trace(Path(temporary), rows), records_for(requests), batch_capacity=6)
+        self.assertEqual(result["status"], "runner_evidence_not_correlated")
+        reasons = [row["reason"] for row in result["raw_refs"][0]["rejected_rows"]]
+        self.assertTrue(any("target_execution_capacity must be an integer in 1..6" in reason
+                            for reason in reasons))
+        self.assertTrue(any("draft_execution_capacity must be an integer in 1..6" in reason
+                            for reason in reasons))
+        self.assertTrue(any("target_execution_capacity 1 must be at least the actual active count 2" in reason
+                            for reason in reasons))
+        self.assertTrue(any("draft_execution_capacity 1 must be at least the actual active count 2" in reason
+                            for reason in reasons))
+
+    def test_execution_rows_must_match_independent_bucket_capacities(self):
+        requests = qualifier.build_requests(2, 2, None)
+        reqids = [request["id"] for request in requests]
+        base = trace_row(6, [1, 4], reqids, target_capacity=4, draft_capacity=2)
+        bad_target = json.loads(json.dumps(base))
+        bad_target["actual_packed_target_rows"] = 36
+        bad_draft = json.loads(json.dumps(base))
+        bad_draft["actual_packed_draft_rows"] = 30
+        bad_target_type = json.loads(json.dumps(base))
+        bad_target_type["actual_packed_target_rows"] = 24.0
+        bad_draft_type = json.loads(json.dumps(base))
+        bad_draft_type["actual_packed_draft_rows"] = 10.0
+        with tempfile.TemporaryDirectory() as temporary:
+            result = qualifier.assess_evidence(
+                write_trace(Path(temporary), [bad_target, bad_draft, bad_target_type, bad_draft_type]),
+                records_for(requests), batch_capacity=6)
+        self.assertEqual(result["status"], "runner_evidence_not_correlated")
+        reasons = [row["reason"] for row in result["raw_refs"][0]["rejected_rows"]]
+        self.assertTrue(any("actual_packed_target_rows must be 24 for Bt=4 (N=6)" in reason
+                            for reason in reasons))
+        self.assertTrue(any("actual_packed_draft_rows must be 10 for Bd=2 (N=6)" in reason
+                            for reason in reasons))
+        self.assertEqual(sum("actual_packed_target_rows must be 24" in reason for reason in reasons), 2)
+        self.assertEqual(sum("actual_packed_draft_rows must be 10" in reason for reason in reasons), 2)
+
+    def test_execution_mapping_must_cover_active_lanes_slots_and_graph_keys(self):
+        requests = qualifier.build_requests(2, 2, None)
+        reqids = [request["id"] for request in requests]
+        base = trace_row(
+            6,
+            [1, 4],
+            reqids,
+            logical_slots={1: 5, 4: 2},
+            target_capacity=4,
+            draft_capacity=2,
+            target_source_lanes=[1, 4, 0, 2],
+            target_slots=[5, 2, -1, -1],
+            target_graph_key=[6, 4],
+            draft_source_lanes=[1, 4],
+            draft_slots=[5, 2],
+            draft_graph_key=[6, 2],
+        )
+
+        def malformed(change):
+            row = json.loads(json.dumps(base))
+            change(row)
+            return row
+
+        rows = [
+            malformed(lambda row: row.__setitem__("target_source_lanes", [1, 1, 0, 2])),
+            malformed(lambda row: row.__setitem__("target_source_lanes", [1, 0, 2, 3])),
+            malformed(lambda row: row.__setitem__("target_source_lanes", [1, 4, 0, 6])),
+            malformed(lambda row: row.__setitem__("target_execution_slots", [2, 5, -1, -1])),
+            malformed(lambda row: row.__setitem__("target_execution_slots", [5, -1, -1, -1])),
+            malformed(lambda row: row.__setitem__("draft_source_lanes", [1])),
+            malformed(lambda row: row.__setitem__("draft_execution_slots", [5])),
+            malformed(lambda row: row.__setitem__("target_graph_key", [6, 8])),
+            malformed(lambda row: row.__setitem__("draft_graph_key", [6, 4])),
+        ]
+        with tempfile.TemporaryDirectory() as temporary:
+            result = qualifier.assess_evidence(
+                write_trace(Path(temporary), rows), records_for(requests), batch_capacity=6)
+        self.assertEqual(result["status"], "runner_evidence_not_correlated")
+        reasons = [row["reason"] for row in result["raw_refs"][0]["rejected_rows"]]
+        expected = (
+            "target_source_lanes must contain unique lanes",
+            "target_source_lanes must cover every active lane; missing [4]",
+            "target_source_lanes lanes must be in 0..5",
+            "target_execution_slots must preserve source-lane logical slots",
+            "target_execution_slots must cover every active logical slot exactly once",
+            "draft_source_lanes must contain exactly execution capacity B=2 lanes",
+            "draft_execution_slots must contain exactly execution capacity B=2 slots",
+            "target_graph_key must be [6, 4]",
+            "draft_graph_key must be [6, 2]",
+        )
+        for reason in expected:
+            self.assertTrue(any(reason in rejected for rejected in reasons), reason)
 
     def test_two_active_lanes_at_n4_do_not_prove_full_capacity(self):
         requests = qualifier.build_requests(2, 2, None)
@@ -301,6 +529,8 @@ class CapacityQualifierTests(unittest.TestCase):
         self.assertEqual(len(result["matched_events"]), 2)
         self.assertEqual(result["matched_events"][0]["slots"], [1, 0])
         self.assertTrue(all(event["active_count"] == 2 for event in result["matched_events"]))
+        self.assertTrue(all(event["target_execution_capacity"] == 2 for event in result["matched_events"]))
+        self.assertTrue(all(event["draft_execution_capacity"] == 2 for event in result["matched_events"]))
         self.assertTrue(result["matched_events"][1]["events"]["completion"])
         self.assertTrue(result["matched_events"][1]["events"]["final"])
 
@@ -390,7 +620,7 @@ class LauncherTests(unittest.TestCase):
         argv_lines = [line.removeprefix("ARG=") for line in log.splitlines() if line.startswith("ARG=")]
         self.assertEqual(argv_lines[argv_lines.index("--max-num-seqs") + 1], "2")
 
-    def test_generic_tp8_launcher_defaults_serial_and_forwards_custom_capacity(self):
+    def test_generic_tp8_launcher_defaults_to_64_and_forwards_custom_capacity(self):
         for capacity in (None, "1", "16", "64"):
             with self.subTest(capacity=capacity):
                 python_log = self.root / "python.log"
@@ -408,7 +638,7 @@ class LauncherTests(unittest.TestCase):
                 argv_lines = [line.removeprefix("ARG=") for line in python_log.read_text().splitlines()]
                 self.assertEqual(
                     argv_lines[argv_lines.index("--max-num-seqs") + 1],
-                    capacity or "1",
+                    capacity or "64",
                 )
 
     def test_invalid_capacity_and_b2_override_fail_before_uv_or_run_dir(self):
@@ -458,7 +688,8 @@ class LauncherTests(unittest.TestCase):
                 ("run_tp8_dspark_b2.sh", "2", "--max-num-seqs=4")):
             with self.subTest(script=script, argument=argument):
                 self.log.unlink(missing_ok=True)
-                run_dir = self.root / "override-must-not-exist"
+                # One directory per case: a shared name lets an earlier failure mask later cases.
+                run_dir = self.root / f"override-must-not-exist-{script}-{capacity}-{argument}"
                 result = self.invoke(script, (argument,), run_name=run_dir.name, MAX_NUM_SEQS=capacity)
                 self.assertEqual(result.returncode, 2)
                 self.assertFalse(self.log.exists())
@@ -468,3 +699,27 @@ class LauncherTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TargetQueryTraceTests(unittest.TestCase):
+    def test_query_trace_separates_body_and_attention_bucket_rows(self):
+        requests = qualifier.build_requests(2, 2, None)
+        aliases = qualifier.trace_aliases(records_for(requests))
+        row = trace_row(4, [1, 3], [request["id"] for request in requests])
+        row.update(target_query_rows=2, target_query_bucket_rows=8)
+        event, error = qualifier.normalize_trace_event(row, 4, aliases)
+        self.assertIsNone(error)
+        self.assertEqual(event["target_rows"], 24)
+        self.assertEqual(event["target_query_rows"], 2)
+        self.assertEqual(event["target_query_bucket_rows"], 8)
+
+    def test_invalid_attention_query_counts_are_rejected(self):
+        requests = qualifier.build_requests(2, 2, None)
+        aliases = qualifier.trace_aliases(records_for(requests))
+        for actual, bucket in ((3, 8), (2, 1), (2, 25), (None, 8), (2, None), (2, True)):
+            with self.subTest(actual=actual, bucket=bucket):
+                row = trace_row(4, [1, 3], [request["id"] for request in requests])
+                row.update(target_query_rows=actual, target_query_bucket_rows=bucket)
+                event, error = qualifier.normalize_trace_event(row, 4, aliases)
+                self.assertIsNone(event)
+                self.assertIsNotNone(error)

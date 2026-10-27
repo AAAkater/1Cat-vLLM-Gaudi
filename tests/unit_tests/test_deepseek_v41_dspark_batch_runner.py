@@ -462,7 +462,85 @@ def test_execute_calls_each_packed_stage_once_then_emits_structured_trace(tmp_pa
     assert records[0]["req_ids"] == ["a", "b"]
     assert records[0]["actual_packed_target_rows"] == 12
     assert records[0]["actual_packed_draft_rows"] == 10
+    assert records[0]["draft_execution_capacity"] == 2
+    assert records[0]["draft_execution_slots"] == [0, 1]
+    assert records[0]["draft_source_lanes"] == [0, 1]
+    assert records[0]["draft_graph_key"] == [2, 2]
     assert records[0]["completion_event_observed"] is True
+
+
+def test_trace_uses_actual_draft_bucket_for_custom_capacity_and_lane_gap():
+    capacity = 11
+    active_lanes = (1, 4, 7)
+    request_ids = tuple(f"gap-{lane}" for lane in active_lanes)
+    requests = {}
+    owners = {}
+    for lane, req_id in zip(active_lanes, request_ids, strict=True):
+        requests[req_id] = RequestState(
+            req_id=req_id,
+            prompt=[100 + lane],
+            mm_features=[],
+            sampling_params=SamplingParams(temperature=0, max_tokens=16, ignore_eos=True),
+            block_ids=((lane + 1, ), ),
+            num_computed_tokens=1,
+            output=[200 + lane],
+        )
+        owners[req_id] = SimpleNamespace(index=lane, generation=lane + 3)
+    scheduled = SimpleNamespace(
+        num_scheduled_tokens={req_id: 1 for req_id in request_ids},
+        scheduled_spec_decode_tokens={},
+    )
+    records = []
+
+    class TargetStage:
+        device = torch.device("cpu")
+
+        def forward_batch(self, metadata, input_ids, positions, padding_mask, pages):
+            del positions, padding_mask, pages
+            assert metadata.capacity == capacity
+            assert tuple(input_ids.shape) == (capacity, 6)
+            return DSparkTargetBatch(token_ids=torch.zeros((capacity, 6), dtype=torch.int32))
+
+    class DraftStage:
+        execution_buckets = (1, 4, 8, 11)
+        last_execution_plan = None
+        graph_key = (capacity, capacity)
+
+        def verify_and_propose(self, metadata, target):
+            del target
+            active = tuple(metadata.request_active.tolist())
+            assert tuple(lane for lane, enabled in enumerate(active) if enabled) == active_lanes
+            self.last_execution_plan = SimpleNamespace(
+                state_capacity=capacity,
+                execution_capacity=4,
+                source_lanes=(1, 4, 7, 0),
+                logical_slots=(1, 4, 7, -1),
+            )
+            self.graph_key = (capacity, 4)
+            return DSparkDraftBatch(
+                accepted=torch.tensor([1 if enabled else 0 for enabled in active], dtype=torch.int64),
+                output_token_ids=[[200 + lane] if enabled else [] for lane, enabled in enumerate(active)],
+                draft_token_ids=[[] for _ in range(capacity)],
+                completion_event=SimpleNamespace(query=lambda: True),
+            )
+
+    class Trace:
+        def write(self, payload):
+            records.append(payload)
+
+    runner = DSparkBatchRunner(TargetStage(), DraftStage(), trace=Trace(), batch_capacity=capacity)
+    plan = runner.build_plan(scheduled, requests, owners, max_model_len=8192)
+    runner.execute(plan)
+
+    assert len(records) == 1
+    record = records[0]
+    assert record["draft_execution_capacity"] == 4
+    assert record["draft_execution_slots"] == [1, 4, 7, -1]
+    assert record["draft_source_lanes"] == [1, 4, 7, 0]
+    assert record["draft_graph_key"] == [11, 4]
+    assert record["physical_draft_rows"] == 20
+    assert record["actual_packed_draft_rows"] == 20
+    assert record["draftrows"] == 20
 
 
 def test_disabled_bug004_observer_keeps_runner_path_and_enabled_writes_round(tmp_path, monkeypatch):
@@ -555,47 +633,61 @@ def test_execute_writes_real_jsonl_trace_with_committed_and_output_digests(tmp_p
 
 def test_trace_digest_ignores_rank_and_timing_noise(tmp_path, monkeypatch):
     digests = []
+    payload = {
+        "schema": "dsv41.dspark.round.v2",
+        "batch_round": 4,
+        "batch_capacity": 2,
+        "capacity": 2,
+        "active_count": 2,
+        "active_lanes": [0, 1],
+        "lanes": [0, 1],
+        "active_mask": [True, True],
+        "lane_request_ids": ["a", "b"],
+        "req_ids": ["a", "b"],
+        "request_slots": [0, 1],
+        "slot_generations": [7, 9],
+        "logical_target_queries": [6, 1],
+        "draft_counts": [5, 0],
+        "scheduler_draft_counts": [5, 5],
+        "physical_target_rows": 12,
+        "draft_execution_capacity": 1,
+        "draft_execution_slots": [1],
+        "draft_source_lanes": [1],
+        "draft_graph_key": [2, 1],
+        "physical_draft_rows": 5,
+        "actual_packed_target_rows": 12,
+        "actual_packed_draft_rows": 5,
+        "batch_width": 2,
+        "committed_counts": [3, 1],
+        "output_counts": [3, 1],
+        "next_draft_counts": [2, 0],
+        "metadata_digest": "m" * 64,
+        "output_ids_digest": "o" * 64,
+        "next_draft_digest": "d" * 64,
+        "completion_event_observed": True,
+        "final_event_observed": True,
+        "target_stage": "target",
+        "draft_stage": "draft",
+    }
     for rank in range(8):
         directory = tmp_path / f"rank{rank}"
         monkeypatch.setenv("DSV41_RUN_EVIDENCE", str(directory))
         trace = DSparkBatchTrace(rank=rank, tp_rank=rank, pp_rank=0)
         trace.write({
-            "schema": "dsv41.dspark.round.v2",
-            "batch_round": 4,
-            "batch_capacity": 2,
-            "capacity": 2,
-            "active_count": 2,
-            "active_lanes": [0, 1],
-            "lanes": [0, 1],
-            "active_mask": [True, True],
-            "lane_request_ids": ["a", "b"],
-            "req_ids": ["a", "b"],
-            "request_slots": [0, 1],
-            "slot_generations": [7, 9],
-            "logical_target_queries": [6, 1],
-            "draft_counts": [5, 0],
-            "scheduler_draft_counts": [5, 5],
-            "physical_target_rows": 12,
-            "physical_draft_rows": 10,
-            "actual_packed_target_rows": 12,
-            "actual_packed_draft_rows": 10,
-            "batch_width": 2,
-            "committed_counts": [3, 1],
-            "output_counts": [3, 1],
-            "next_draft_counts": [2, 0],
-            "metadata_digest": "m" * 64,
-            "output_ids_digest": "o" * 64,
-            "next_draft_digest": "d" * 64,
-            "completion_event_observed": True,
+            **payload,
             "completion_observed_ns": 100 + rank,
-            "final_event_observed": True,
             "final_event_observed_ns": 200 + rank,
-            "target_stage": "target",
-            "draft_stage": "draft",
         })
         record = json.loads((directory / f"dspark_batch_rounds.rank{rank}.jsonl").read_text().splitlines()[0])
         digests.append(record["consistency_digest"])
     assert len(set(digests)) == 1
+
+    directory = tmp_path / "changed-draft-bucket"
+    monkeypatch.setenv("DSV41_RUN_EVIDENCE", str(directory))
+    trace = DSparkBatchTrace(rank=0)
+    trace.write({**payload, "draft_graph_key": [2, 2], "draft_execution_capacity": 2})
+    changed = json.loads((directory / "dspark_batch_rounds.rank0.jsonl").read_text().splitlines()[0])
+    assert changed["consistency_digest"] != digests[0]
 
 
 def test_execute_fails_closed_without_actual_target_or_draft_stage():

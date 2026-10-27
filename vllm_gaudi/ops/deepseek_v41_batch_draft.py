@@ -17,7 +17,7 @@ import torch
 import torch.nn.functional as F
 
 from vllm_gaudi.ops.deepseek_v41_batch_attention import write_state_rows
-from vllm_gaudi.ops.deepseek_v41_capacity import validate_dspark_capacity
+from vllm_gaudi.ops.deepseek_v41_batch_target import restore_stable_target_rows
 from vllm_gaudi.ops.deepseek_v41_batch_verify import (
     BINDING_SIDECAR_SIZE,
     DEFAULT_BATCH_CAPACITY,
@@ -28,7 +28,10 @@ from vllm_gaudi.ops.deepseek_v41_batch_verify import (
     pack_record_batch,
     verify_control_from_target_batch,
 )
+from vllm_gaudi.ops.deepseek_v41_capacity import validate_dspark_capacity
+from vllm_gaudi.ops.deepseek_v41_draft_buckets import draft_execution_buckets, select_draft_bucket
 from vllm_gaudi.ops.deepseek_v41_math import hc_post, hc_pre, pack_swa, rms_norm
+from vllm_gaudi.v1.spec_decode.deepseek_v41_dspark import HPUDSparkSpeculator
 
 MAX_DRAFT_TOKENS = 5
 TARGET_QUERY_BUCKET = 6
@@ -450,10 +453,11 @@ def draft_attention_batch(
 class PackedDraftRound(torch.nn.Module):
     """One fixed capacity/C5 body plus five-step Markov HPU graph.
 
-    The graph accepts fixed ``[N,1]`` anchors, ``[N,5]`` positions, ``[N]``
-    request slots and a ``[N]`` activity mask.  Inactive lanes never write a
-    draft ring entry and return ``-1`` proposals.  ``N`` defaults to two and
-    must match the authoritative batch state.
+    ``forward`` routes through :class:`HPUDSparkSpeculator.propose_packed`, so
+    the real packed backbone is called from the speculator's ``_run_model``
+    rather than from a legacy precompute-then-cache path.  ``backbone`` and
+    ``markov`` remain public for standalone diagnostics, but production
+    ``forward`` does not use the Markov wrapper as a second execution path.
     """
 
     def __init__(
@@ -464,21 +468,50 @@ class PackedDraftRound(torch.nn.Module):
         batch_capacity: int = DEFAULT_BATCH_CAPACITY,
         backend: str = "hpu_backend",
         compile_graph: bool = True,
+        backbone: Callable | None = None,
+        markov: Callable | None = None,
+        speculator: HPUDSparkSpeculator | None = None,
+        context_writer: Callable | None = None,
+        inputs_builder: Callable | None = None,
     ):
         super().__init__()
         validate_dspark_capacity(batch_capacity, allow_serial=True, name="draft round capacity")
-        if batch_state.capacity != batch_capacity:
-            raise ValueError("draft round capacity must match the batch state")
+        if batch_state.capacity < batch_capacity:
+            raise ValueError("draft execution capacity must fit the batch state")
         self.batch_capacity = batch_capacity
-        self.backbone = PackedDraftBackbone(draft, batch_state)
-        self.markov = PackedDraftMarkovSampler(draft, batch_capacity=batch_capacity)
+        self.state_capacity = batch_state.capacity
+        # Construction-only capacity tests use headless draft placeholders.
+        # Real transactions always expose the three MTP layers and bind the
+        # actual PackedDraftBackbone here.
+        self.backbone = (backbone if backbone is not None else
+                         PackedDraftBackbone(draft, batch_state) if hasattr(draft, "layers") else None)
+        # Compatibility-only accessor used by standalone transaction tools.
+        self.markov = markov or PackedDraftMarkovSampler(draft, batch_capacity=batch_capacity)
+        if speculator is None and self.backbone is not None and hasattr(draft, "weights"):
+            speculator = HPUDSparkSpeculator(
+                draft,
+                max_num_reqs=batch_capacity,
+                linear=_linear,
+                backbone=self.backbone,
+                context_writer=context_writer or insert_context_batch,
+                inputs_builder=inputs_builder or draft_inputs_after_commit,
+                batch_state=batch_state,
+            )
+        self.speculator = speculator
         self.backend = backend
         self.compile_graph = compile_graph
         self.compiled = None
 
     def _forward(self, anchors, positions, slots, active, context_done=None):
-        hidden, logits = self.backbone(anchors, positions, slots, active, context_done=context_done)
-        return self.markov(anchors.reshape(-1), hidden, logits, active)
+        if self.speculator is None:
+            raise RuntimeError("PackedDraftRound requires a bound HPUDSparkSpeculator")
+        return self.speculator.propose_packed(
+            anchors,
+            positions,
+            slots,
+            active,
+            context_done,
+        )
 
     def forward(self, anchors, positions, slots, active, context_done=None):
         if anchors.shape != (self.batch_capacity, 1):
@@ -495,14 +528,38 @@ class PackedDraftRound(torch.nn.Module):
         return self._forward(anchors, positions, slots, active, context_done)
 
 
-class PackedDraftTransaction(torch.nn.Module):
-    """Unified fixed-capacity verify/debug/draft graph.
+def _validate_target_restore(target_restore, batch_capacity: int, device) -> None:
+    """Check the fused restore arguments of a padded stable target snapshot.
 
-    One compiled entry consumes fixed target ids/context, verify control and
-    proposals, writes only the accepted target prefix into draft request rings,
-    executes one 5*N-row MTP body, performs five Markov steps, and returns one
-    ``[N,16]`` commit record.  The caller owns ticket acquisition and the single
-    ``[N,16]`` host readback.
+    Every tensor spans the full state capacity, so the transaction graph key
+    stays ``(N, B)`` whichever target execution bucket captured the round.
+    """
+    if not isinstance(target_restore, tuple) or len(target_restore) != 6:
+        raise ValueError("fused target restore requires stable snapshot restore_arguments()")
+    lane_map, indices, owners, destinations, saved, groups = target_restore
+    entries = batch_capacity * TARGET_QUERY_BUCKET
+    tensors = (lane_map, indices, owners)
+    if (any(not isinstance(value, torch.Tensor) or value.dtype != torch.int64 or value.device != device
+            for value in tensors) or lane_map.shape != (batch_capacity, ) or indices.ndim != 2
+            or indices.shape[1] != entries or owners.shape != (2, *indices.shape)):
+        raise ValueError("fused target restore requires int64 full state-capacity layout tensors on the input device")
+    if (not isinstance(destinations, tuple) or not isinstance(saved, tuple) or not isinstance(groups, tuple)
+            or not len(destinations) == len(saved) == len(groups)):
+        raise ValueError("fused target restore destinations, saved rows and groups must be matching tuples")
+    for destination, values, group in zip(destinations, saved, groups, strict=True):
+        if (type(group) is not int or not 0 <= group < indices.shape[0] or destination.device != device
+                or values.shape != (entries, *destination.shape[1:]) or values.dtype != destination.dtype):
+            raise ValueError("fused target restore saved rows must match their destination and full layout")
+
+
+class PackedDraftTransaction(torch.nn.Module):
+    """Unified fixed-capacity verify/speculator/commit graph.
+
+    The transaction owns only the target verify call, the speculator's packed
+    proposal call and record packing.  Accepted-context writes, post-commit
+    anchors and the real backbone are orchestrated inside
+    :class:`HPUDSparkSpeculator`.  The caller owns ticket acquisition and the
+    single ``[N,16]`` host readback.
     """
 
     def __init__(
@@ -511,8 +568,12 @@ class PackedDraftTransaction(torch.nn.Module):
         batch_state: DraftBatchState,
         *,
         batch_capacity: int = DEFAULT_BATCH_CAPACITY,
+        execution_capacity: int | None = None,
         backend: str = "hpu_backend",
         compile_graph: bool = True,
+        speculator: HPUDSparkSpeculator | None = None,
+        context_writer: Callable | None = None,
+        inputs_builder: Callable | None = None,
     ):
         super().__init__()
         validate_dspark_capacity(batch_capacity, allow_serial=True, name="draft transaction capacity")
@@ -521,8 +582,22 @@ class PackedDraftTransaction(torch.nn.Module):
         self.draft = draft
         self.batch_state = batch_state
         self.batch_capacity = batch_capacity
+        self.execution_capacity = batch_capacity if execution_capacity is None else execution_capacity
+        validate_dspark_capacity(self.execution_capacity, allow_serial=True, name="draft execution capacity")
+        if self.execution_capacity > batch_capacity:
+            raise ValueError("draft execution capacity must fit the state capacity")
+        self.graph_key = (batch_capacity, self.execution_capacity)
         self.round = PackedDraftRound(
-            draft, batch_state, batch_capacity=batch_capacity, backend=backend, compile_graph=False)
+            draft,
+            batch_state,
+            batch_capacity=self.execution_capacity,
+            backend=backend,
+            compile_graph=False,
+            speculator=speculator,
+            context_writer=context_writer,
+            inputs_builder=inputs_builder,
+        )
+        self.speculator = speculator or self.round.speculator
         self.backend = backend
         self.compile_graph = compile_graph
         self.compiled = None
@@ -537,32 +612,38 @@ class PackedDraftTransaction(torch.nn.Module):
         proposals,
         active,
         binding_sidecar=None,
+        execution_lanes=None,
+        target_restore=None,
     ):
         _, output, committed, output_count, _, draft_enabled, status = verify_control_from_target_batch(
             target_ids, proposals, control, active, binding_sidecar)
-        valid_context = active & (status == 0)
-        context_done = insert_context_batch(
-            self.draft,
-            self.batch_state,
+        if self.speculator is None:
+            raise RuntimeError("PackedDraftTransaction requires a bound HPUDSparkSpeculator")
+        draft_active = draft_enabled & active & (status == 0)
+        propose_kwargs = {} if execution_lanes is None else {"execution_lanes": execution_lanes}
+        proposal_ids, _confidence = self.speculator.propose_after_verify(
             target_states,
             positions,
             request_slots,
             committed,
-            valid_context,
-        )
-        draft_active = draft_enabled & valid_context
-        anchors, draft_positions = draft_inputs_after_commit(
-            positions, output, output_count, committed, draft_active)
-        proposal_ids, _confidence = self.round(
-            anchors.reshape(self.batch_capacity, 1),
-            draft_positions,
-            request_slots,
-            draft_active,
-            context_done=context_done,
+            output,
+            output_count,
+            draft_enabled,
+            active,
+            status,
+            **propose_kwargs,
         )
         record = pack_record_batch(
             control, committed, output_count, output, proposal_ids, draft_active, status, binding_sidecar)
-        return record, committed, output, output_count, proposal_ids, status
+        if target_restore is None:
+            return record, committed, output, output_count, proposal_ids, status
+        # Fused target finish: the same ``committed`` that column 1 of the
+        # record carries restores the target's accepted prefix inside this
+        # graph, after the record and before any host readback (the eager
+        # device finish order).  HPU writes go through the native state writer.
+        restore_done = restore_stable_target_rows(
+            committed, *target_restore, native_writes=committed.device.type == "hpu")
+        return record, committed, output, output_count, proposal_ids, status, restore_done
 
     def forward(
         self,
@@ -574,6 +655,8 @@ class PackedDraftTransaction(torch.nn.Module):
         proposals,
         active,
         binding_sidecar=None,
+        execution_lanes=None,
+        target_restore=None,
     ):
         if target_ids.shape != (self.batch_capacity, TARGET_QUERY_BUCKET):
             raise ValueError(
@@ -596,14 +679,26 @@ class PackedDraftTransaction(torch.nn.Module):
               or binding_sidecar.shape != (self.batch_capacity, BINDING_SIDECAR_SIZE)):
             raise ValueError(
                 "PackedDraftTransaction requires int32 [N,2] [low, high] binding sidecar on the input device")
+        if self.execution_capacity < self.batch_capacity:
+            if (not isinstance(execution_lanes, torch.Tensor)
+                    or execution_lanes.shape != (self.execution_capacity, )
+                    or execution_lanes.dtype != torch.int64 or execution_lanes.device != target_ids.device):
+                raise ValueError("compact draft transaction requires int64 [B] execution lanes on the input device")
+        elif execution_lanes is not None:
+            raise ValueError("full-capacity draft transaction uses the identity lane layout")
+        if target_restore is not None:
+            _validate_target_restore(target_restore, self.batch_capacity, target_ids.device)
+        restore_args = () if target_restore is None else (target_restore, )
         if self.compile_graph and target_ids.device.type == "hpu":
             if self.compiled is None:
                 self.compiled = torch.compile(
                     self._forward, backend=self.backend, fullgraph=True, dynamic=False)
             return self.compiled(
-                target_ids, target_states, positions, request_slots, control, proposals, active, binding_sidecar)
+                target_ids, target_states, positions, request_slots, control, proposals, active, binding_sidecar,
+                execution_lanes, *restore_args)
         return self._forward(
-            target_ids, target_states, positions, request_slots, control, proposals, active, binding_sidecar)
+            target_ids, target_states, positions, request_slots, control, proposals, active, binding_sidecar,
+            execution_lanes, *restore_args)
 
     def prepare(
         self,
@@ -615,8 +710,15 @@ class PackedDraftTransaction(torch.nn.Module):
         proposals,
         active,
         binding_sidecar=None,
+        execution_lanes=None,
+        target_restore=None,
     ):
-        """Compile the fixed transaction before serving and restore draft state."""
+        """Compile the fixed transaction before serving and restore draft state.
+
+        A ``target_restore`` argument must come from a captured stable target
+        snapshot whose owner aborts it afterwards; only draft rings are saved
+        and restored here.
+        """
         if target_ids.device.type != "hpu":
             return
         snapshots = tuple(ring.clone() for ring in self.batch_state.rings)
@@ -631,6 +733,8 @@ class PackedDraftTransaction(torch.nn.Module):
                     proposals,
                     active,
                     binding_sidecar,
+                    execution_lanes,
+                    target_restore=target_restore,
                 )
                 torch.hpu.synchronize()
             if self.compiled is None:
@@ -724,7 +828,7 @@ def sample_greedy_markov_batch(
     logits: torch.Tensor,
     active: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Five sequential Markov steps, with all requests advanced in parallel."""
+    """Run the real upstream five-step loop over the packed HPU tensors."""
     if first_token.ndim != 1:
         raise ValueError("Markov anchors must be [B]")
     batch_size = first_token.shape[0]
@@ -737,19 +841,16 @@ def sample_greedy_markov_batch(
     if first_token.device != hidden.device or logits.device != hidden.device or active.device != hidden.device:
         raise ValueError("Markov tensors must share one device")
 
-    last = draft.weights.get_submodule("2")
-    previous = torch.where(active, first_token.long(), 0)
-    token_ids, confidence = [], []
-    for index in range(MAX_DRAFT_TOKENS):
-        markov = draft._embed(previous, last.markov_head.embed)
-        bias = F.linear(markov.float(), last.markov_head.head.weight)
-        scores = logits[:, index] + bias
-        sampled = draft._global_argmax(scores).reshape(batch_size)
-        token_ids.append(torch.where(active, sampled, -1))
-        confidence_input = torch.cat((hidden[:, index], markov), dim=-1).float()
-        confidence.append(_linear(confidence_input, last.confidence_head.proj).reshape(batch_size))
-        previous = torch.where(active, sampled, 0)
-    return torch.stack(token_ids, dim=1), torch.stack(confidence, dim=1)
+    # The adapter is intentionally per-call here so no request tensor is kept
+    # beyond this sampler invocation.  The packed transaction constructs one
+    # sampler-backed adapter ahead of time for graph capture.
+    speculator = HPUDSparkSpeculator(
+        draft,
+        device=hidden.device,
+        max_num_reqs=batch_size,
+        linear=_linear,
+    )
+    return speculator.propose_cached(first_token, hidden, logits, active)
 
 
 class PackedDraftMarkovSampler(torch.nn.Module):
@@ -760,11 +861,24 @@ class PackedDraftMarkovSampler(torch.nn.Module):
         validate_dspark_capacity(batch_capacity, allow_serial=True, name="Markov batch capacity")
         self.draft = draft
         self.batch_capacity = batch_capacity
+        # Construction-only transaction tests use headless draft placeholders.
+        # Real drafts bind eagerly so their compiled graph state stays stable.
+        self.speculator = (HPUDSparkSpeculator(
+            draft,
+            max_num_reqs=batch_capacity,
+            linear=_linear,
+        ) if hasattr(draft, "weights") else None)
 
     def forward(self, first_token, hidden, logits, active):
         if first_token.shape != (self.batch_capacity, ):
             raise ValueError(f"Markov batch must contain exactly {self.batch_capacity} lanes")
-        return sample_greedy_markov_batch(self.draft, first_token, hidden, logits, active)
+        if self.speculator is None:
+            self.speculator = HPUDSparkSpeculator(
+                self.draft,
+                max_num_reqs=self.batch_capacity,
+                linear=_linear,
+            )
+        return self.speculator.propose_cached(first_token, hidden, logits, active)
 
 
 def draft_inputs_after_commit(
@@ -869,6 +983,82 @@ def _host_metadata_values(metadata):
     return host, request_ids, target_counts, proposal_counts, active, round_generation
 
 
+# I64: control[7] | proposals[5] | target start per lane, then the B execution lanes.
+_PACKED_I64_COLUMNS = 7 + MAX_DRAFT_TOKENS + 1
+# I32: request slot | sidecar[2] per lane.  The bool vector carries the activity.
+_PACKED_I32_COLUMNS = 1 + BINDING_SIDECAR_SIZE
+_PACKED_INPUT_COLUMNS = _PACKED_I64_COLUMNS + _PACKED_I32_COLUMNS + 1
+
+
+class DraftRoundInputStaging:
+    """Fixed typed staging vectors: three small H2D copies per round, no device casts.
+
+    ``I64[13*N + B]``: ``control[N,7] | proposals[N,5] | starts[N] |
+    execution_lanes[B]`` (B is 0 for the identity layout); ``I32[3*N]``:
+    ``slots[N] | sidecar[N,2]``; ``bool[N]``: ``active``.  Device tensors are views
+    of persistent device copies and already carry the exact dtypes of the
+    separate uploads they replace, so no device-side cast runs: on HPU each
+    eager cast kernel costs more than one of these small copies.  Host vectors
+    are pinned only on HPU and the copies are blocking, so the next round may
+    reuse them immediately.
+    """
+
+    def __init__(self, capacity: int, lanes: int, device):
+        validate_dspark_capacity(capacity, allow_serial=True, name="draft input staging capacity")
+        if not 0 <= lanes <= capacity:
+            raise ValueError("draft input staging lanes must fit the state capacity")
+        device = torch.device(device)
+        self.capacity = capacity
+        self.lanes = lanes
+        self.device = device
+        self.size = capacity * _PACKED_INPUT_COLUMNS + lanes
+        hosts = (torch.zeros(capacity * _PACKED_I64_COLUMNS + lanes, dtype=torch.int64),
+                 torch.zeros(capacity * _PACKED_I32_COLUMNS, dtype=torch.int32),
+                 torch.zeros(capacity, dtype=torch.bool))
+        self.hosts = tuple(host.pin_memory("hpu") if device.type == "hpu" else host for host in hosts)
+        self.device_buffers = tuple(torch.zeros(host.shape, dtype=host.dtype, device=device) for host in hosts)
+
+    def _views(self, buffers):
+        capacity = self.capacity
+        wide, narrow, active = buffers
+        proposals_start = 7 * capacity
+        starts_start = proposals_start + MAX_DRAFT_TOKENS * capacity
+        lanes_start = starts_start + capacity
+        return (wide[:proposals_start].view(capacity, 7),
+                wide[proposals_start:starts_start].view(capacity, MAX_DRAFT_TOKENS),
+                wide[starts_start:lanes_start],
+                narrow[:capacity],
+                active,
+                narrow[capacity:].view(capacity, BINDING_SIDECAR_SIZE),
+                wide[lanes_start:lanes_start + self.lanes])
+
+    def upload(self, control, proposals, starts, slots, active, sidecar, lanes=None):
+        """Fill the host vectors, copy each once and return device views.
+
+        Returns ``(control I64[N,7], proposals I64[N,5], starts I64[N],
+        slots I32[N], active bool[N], sidecar I32[N,2], lanes I64[B] | None)``.
+        """
+        capacity = self.capacity
+        if lanes is None and self.lanes or lanes is not None and len(lanes) != self.lanes:
+            raise ValueError("draft input staging lanes do not match the staged execution bucket")
+        if (control.shape != (capacity, 7) or proposals.shape != (capacity, MAX_DRAFT_TOKENS)
+                or sidecar.shape != (capacity, BINDING_SIDECAR_SIZE)):
+            raise ValueError("draft input staging requires fixed [N] control, proposal and sidecar rows")
+        host = self._views(self.hosts)
+        host[0].copy_(control)
+        host[1].copy_(proposals)
+        host[2].copy_(torch.tensor(starts, dtype=torch.int64))
+        host[3].copy_(torch.tensor(slots, dtype=torch.int32))
+        host[4].copy_(torch.tensor(active, dtype=torch.bool))
+        host[5].copy_(sidecar)
+        if self.lanes:
+            host[6].copy_(torch.tensor(lanes, dtype=torch.int64))
+        for device_buffer, host_buffer in zip(self.device_buffers, self.hosts, strict=True):
+            device_buffer.copy_(host_buffer)
+        device = self._views(self.device_buffers)
+        return (*device[:6], device[6] if self.lanes else None)
+
+
 def _fixed_proposals(counts: tuple[int, ...], flat: tuple[int, ...], active: tuple[bool, ...]) -> torch.Tensor:
     proposals = torch.full((len(counts), MAX_DRAFT_TOKENS), -1, dtype=torch.int64)
     offset = 0
@@ -947,11 +1137,45 @@ class DSparkBatchDraftStage:
         self.markov = markov
         self.draft_round = draft_round
         self.transaction = transaction
+        self._owns_transactions = transaction is None and draft_round is None and backbone is None
+        self.execution_buckets = (batch_capacity, )
+        self.transactions = {} if transaction is None else {batch_capacity: transaction}
+        self.last_execution_plan = None
         self.result_factory = result_factory or BatchDraftResult
         self.target_ids = target_ids
         self.target_context = target_context
         self.max_model_len = max_model_len
         self._bug004_profile = None
+        # Opt-in single-H2D round inputs (dsv41_dspark_draft_packed_inputs).
+        self.packed_inputs = False
+        self.input_staging: dict[int, DraftRoundInputStaging] = {}
+
+    def configure_execution_buckets(self, enabled: bool, *, buckets=(1, 2, 4, 8, 16, 32, 64)):
+        if type(enabled) is not bool:
+            raise TypeError("dsv41_dspark_draft_buckets must be a boolean")
+        selected = draft_execution_buckets(self.batch_capacity, buckets)
+        if enabled and not self._owns_transactions and selected != (self.batch_capacity, ):
+            raise ValueError("draft execution buckets require the default packed transaction")
+        if (self.transactions and (set(self.transactions) != {self.batch_capacity}
+                                   or any(getattr(value, "compiled", None) is not None
+                                          for value in self.transactions.values()))):
+            raise RuntimeError("draft execution buckets must be configured before warmup")
+        self.execution_buckets = selected if enabled else (self.batch_capacity, )
+
+    def configure_packed_inputs(self, enabled):
+        """Upload the per-round draft inputs as one fixed staging vector (default off)."""
+        if type(enabled) is not bool:
+            raise TypeError("dsv41_dspark_draft_packed_inputs must be a boolean")
+        if any(getattr(value, "compiled", None) is not None for value in self.transactions.values()):
+            raise RuntimeError("draft packed inputs must be configured before warmup")
+        self.packed_inputs = enabled
+        self.input_staging = {}
+
+    def _round_input_staging(self, lanes: int, device) -> DraftRoundInputStaging:
+        staging = self.input_staging.get(lanes)
+        if staging is None or staging.device != torch.device(device):
+            staging = self.input_staging[lanes] = DraftRoundInputStaging(self.batch_capacity, lanes, device)
+        return staging
 
     def _bug004_mark(self, name):
         profile = getattr(self, "_bug004_profile", None)
@@ -986,8 +1210,7 @@ class DSparkBatchDraftStage:
         if default_path:
             self.transaction = PackedDraftTransaction(
                 self.draft, self.batch_state, batch_capacity=self.batch_capacity)
-        elif self.draft_round is None and self.backbone is None and self.markov is None:
-            self.markov = PackedDraftMarkovSampler(self.draft, batch_capacity=self.batch_capacity)
+            self.transactions[self.batch_capacity] = self.transaction
         return self.batch_state, self.verify_ring, self.backbone, self.markov
 
     def verify_and_propose(self, metadata, target):
@@ -1011,10 +1234,27 @@ class DSparkBatchDraftStage:
             raise TypeError("DSpark target token_ids must be int32 or int64")
         device = target_ids.device
         batch_state, verify_ring, backbone, markov = self._ensure_runtime(device)
+        execution_plan = select_draft_bucket(active_tuple, host["request_slots"], self.execution_buckets)
+        transaction = self.transaction
+        execution_lanes = None
+        packed_inputs = getattr(self, "packed_inputs", False)
+        staged_lanes = None
+        if self._owns_transactions:
+            bucket = execution_plan.execution_capacity
+            if bucket not in self.transactions:
+                self.transactions[bucket] = PackedDraftTransaction(
+                    self.draft, batch_state, batch_capacity=self.batch_capacity, execution_capacity=bucket)
+            transaction = self.transactions[bucket]
+            if bucket < self.batch_capacity:
+                if packed_inputs:
+                    staged_lanes = tuple(execution_plan.source_lanes)
+                else:
+                    execution_lanes = torch.tensor(execution_plan.source_lanes, dtype=torch.int64, device=device)
         profile = getattr(self, "_bug004_profile", None)
         self._bug004_mark("draft.control_prepare")
-        active = torch.tensor(active_tuple, dtype=torch.bool, device=device)
-        proposals = _fixed_proposals(proposal_counts, host["draft_token_ids"], active_tuple).to(device)
+        if not packed_inputs:
+            active = torch.tensor(active_tuple, dtype=torch.bool, device=device)
+            proposals = _fixed_proposals(proposal_counts, host["draft_token_ids"], active_tuple).to(device)
         control_host = batch_control_metadata(
             round_generation=round_generation,
             request_slots=host["request_slots"],
@@ -1027,10 +1267,23 @@ class DSparkBatchDraftStage:
             need_sample=tuple(1 if enabled else 0 for enabled in active_tuple),
             active=active_tuple,
         )
-        binding_sidecar = batch_binding_sidecar(control_host).to(device)
-        control = control_host.to(device)
+        if packed_inputs:
+            control, proposals, starts, slots, active, binding_sidecar, execution_lanes = (
+                self._round_input_staging(0 if staged_lanes is None else len(staged_lanes), device).upload(
+                    control_host,
+                    _fixed_proposals(proposal_counts, host["draft_token_ids"], active_tuple),
+                    host["target_start_positions"],
+                    host["request_slots"],
+                    active_tuple,
+                    batch_binding_sidecar(control_host),
+                    staged_lanes,
+                ))
+        else:
+            binding_sidecar = batch_binding_sidecar(control_host).to(device)
+            control = control_host.to(device)
+            starts = torch.tensor(host["target_start_positions"], dtype=torch.int64, device=device)
         positions = (
-            torch.tensor(host["target_start_positions"], dtype=torch.int64, device=device).unsqueeze(1)
+            starts.unsqueeze(1)
             + torch.arange(TARGET_QUERY_BUCKET, dtype=torch.int32, device=device).unsqueeze(0)
         ).to(torch.int32)
         positions = torch.where(active.unsqueeze(1), positions, torch.zeros_like(positions))
@@ -1040,7 +1293,13 @@ class DSparkBatchDraftStage:
         if not isinstance(target_states, torch.Tensor) or target_states.shape[:2] != (
                 batch_size, TARGET_QUERY_BUCKET) or target_states.device != device:
             raise ValueError(f"DSpark target context must be [{batch_size},{TARGET_QUERY_BUCKET},D]")
-        slots = torch.tensor(host["request_slots"], dtype=torch.int32, device=device)
+        if not packed_inputs:
+            slots = torch.tensor(host["request_slots"], dtype=torch.int32, device=device)
+        target_payload = getattr(target, "payload", None)
+        # A fused target restore runs inside the packed transaction graph.
+        fused_restore = target_payload.get("fused_target_restore") if isinstance(target_payload, dict) else None
+        if fused_restore is not None and transaction is None:
+            raise RuntimeError("fused target restore requires the packed draft transaction")
 
         ticket = verify_ring.acquire(
             round_generation=round_generation,
@@ -1051,9 +1310,13 @@ class DSparkBatchDraftStage:
         )
         try:
             self._bug004_mark("draft.verify_and_propose")
-            if self.transaction is not None:
-                values = self.transaction(
-                    target_ids, target_states, positions, slots, control, proposals, active, binding_sidecar)
+            if transaction is not None:
+                transaction_args = (target_ids, target_states, positions, slots, control, proposals, active,
+                                    binding_sidecar)
+                transaction_kwargs = {} if execution_lanes is None else {"execution_lanes": execution_lanes}
+                if fused_restore is not None:
+                    transaction_kwargs["target_restore"] = fused_restore
+                values = transaction(*transaction_args, **transaction_kwargs)
                 record = values[0] if isinstance(values, (tuple, list)) else values
                 if not isinstance(record, torch.Tensor) or record.shape != (self.batch_capacity, 16):
                     raise RuntimeError(
@@ -1099,6 +1362,20 @@ class DSparkBatchDraftStage:
                     binding_sidecar,
                 )
 
+            if fused_restore is not None:
+                # The graph already restored target state; only mark the host
+                # payload, which keeps the same finish/abort authority.
+                fused_finish = target_payload.get("fused_finish_callback")
+                if not isinstance(values, (tuple, list)) or len(values) < 7 or not callable(fused_finish):
+                    raise RuntimeError("fused target restore requires the transaction's in-graph restore result")
+                fused_finish(target, values[1])
+            else:
+                device_finish = (target_payload.get("device_finish_callback")
+                                 if isinstance(target_payload, dict) else None)
+                if device_finish is not None:
+                    if transaction is None or not isinstance(values, (tuple, list)) or len(values) < 2:
+                        raise RuntimeError("device target finish requires the packed transaction's device counts")
+                    device_finish(target, values[1])
             ticket.record.copy_(record)
             self._bug004_mark("draft.record_stage")
             verify_ring.stage(ticket)
@@ -1114,6 +1391,7 @@ class DSparkBatchDraftStage:
             )
             verify_ring.release(ticket)
             ticket = None
+            self.last_execution_plan = execution_plan
             self._bug004_mark("draft.publish")
             return result
         except BaseException as error:

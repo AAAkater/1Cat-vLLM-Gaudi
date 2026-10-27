@@ -3010,6 +3010,9 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
         defer_output_finish=False,
         tile_indices=None,
         runtime_request_slots=False,
+        query_indices=None,
+        query_valid=None,
+        ragged_compressor=False,
     ):
         """Packed C1/C6 target attention with per-lane state and page ownership.
 
@@ -3018,6 +3021,9 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
         projection/reduction so the target program can finish only active
         lanes.  ``tile_indices`` is optional runtime tile-plan data for the
         N32 complete-tile path; None retains the original full-row MLA path.
+        ``ragged_compressor`` is a static compact-query option: the compressor
+        runs its row-local projections on the query rows and keeps only its
+        lane-local history on the C6 layout.
         The default false/None path is unchanged for direct callers.
         """
         from vllm_gaudi.ops.deepseek_v41_batch_attention import (
@@ -3040,8 +3046,52 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
                 or candidates.shape != (row_count, 2048) or main_done.shape != (row_count, )
                 or index_done.shape != (row_count, ) or pages.shape[0] != row_count):
             raise ValueError("target attention inputs must match the fixed 6*N capacity")
+        full_positions = positions
+        full_active = row_valid.to(torch.bool) & (slots >= 0)
+        full_selected, full_candidates = selected, candidates
+        full_main_done, full_index_done = main_done, index_done
+        compact_queries = query_indices is not None
+        if compact_queries:
+            if (not isinstance(query_indices, torch.Tensor) or query_indices.ndim != 1
+                    or query_indices.dtype != torch.int64 or query_indices.device != value.device
+                    or not 1 <= query_indices.numel() < row_count
+                    or not isinstance(query_valid, torch.Tensor) or query_valid.dtype != torch.bool
+                    or query_valid.shape != query_indices.shape or query_valid.device != value.device):
+                raise ValueError("compact target queries require int64 indices and bool validity on the input device")
+            if tile_indices is not None:
+                raise ValueError("compact target queries require the dense MLA path")
+            # The masked compressor ABI remains C6. Keep its accepted-prefix
+            # publication unchanged before gathering the actual attention rows.
+            if self.ratio and self.owns_kv and ragged_compressor:
+                from vllm_gaudi.ops.deepseek_v41_target_ragged import compress_target_query_rows
+
+                main_done, index_done = compress_target_query_rows(
+                    self, value, positions, slots, pages, full_active, request_lengths, request_slots,
+                    query_indices, query_valid, runtime_request_slots=runtime_request_slots)
+            elif self.ratio and self.owns_kv:
+                main_done, index_done = self._compress_batch_target(
+                    value, positions, slots, pages, full_active, request_lengths, request_slots,
+                    runtime_request_slots=runtime_request_slots)
+            full_main_done, full_index_done = main_done, index_done
+            value = value.index_select(0, query_indices)
+            positions = positions.index_select(0, query_indices)
+            slots = slots.index_select(0, query_indices)
+            pages = pages.index_select(0, query_indices)
+            selected = selected.index_select(0, query_indices)
+            candidates = candidates.index_select(0, query_indices)
+            main_done = main_done.index_select(0, query_indices)
+            index_done = index_done.index_select(0, query_indices)
+            row_valid = row_valid.index_select(0, query_indices) & query_valid
+            value = torch.where(row_valid[:, None], value, torch.zeros_like(value))
+            positions = torch.where(row_valid, positions, torch.zeros_like(positions))
+            slots = torch.where(row_valid, slots, torch.full_like(slots, -1))
+            row_count = query_indices.shape[0]
+        elif query_valid is not None:
+            raise ValueError("target query validity requires execution indices")
+        elif ragged_compressor:
+            raise ValueError("ragged target compressor requires compact query indices")
         safe_positions = positions.clamp_min(0)
-        active = row_valid.to(torch.bool) & (slots >= 0)
+        active = row_valid.to(torch.bool) & (slots >= 0) if compact_queries else full_active
         query_input, kv_input = self._project_qkv_input(value)
         norm = torch.ops.custom_op.custom_deepseek_v41_attention_norm_bf16_gaudi2 if self.fused_norm else rms_norm
         needs_index_query = self.ratio and self.owns_index
@@ -3067,20 +3117,18 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
         swa_done = write_state_rows(self.batch_state.swa, pack_swa(kv), rows)
         blocks = candidates
         if self.ratio:
-            if self.owns_kv:
+            if self.owns_kv and not compact_queries:
                 main_done, index_done = self._compress_batch_target(
                     value, positions, slots, pages, active, request_lengths, request_slots,
                     runtime_request_slots=runtime_request_slots,
                 )
             if self.owns_index:
                 q, weights = self._prepare_index_queries(value, qr, safe_positions, request_batch=True)
-                # Native index selection accepts at most 64 rows. Ten fixed
-                # six-row lanes keep every chunk within that ABI while
-                # retaining row order after the selected/blocks concatenation.
+                # Bound native index selection to at most 60 query rows per
+                # call, including partial tails in the compact query layout.
                 selected_parts = []
                 updated_parts = []
-                for first_lane in range(0, capacity, 10):
-                    first_row = first_lane * 6
+                for first_row in range(0, row_count, 60):
                     last_row = min(first_row + 60, row_count)
                     lane_q = q[first_row:last_row]
                     lane_weights = weights[first_row:last_row]
@@ -3187,6 +3235,19 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
             vector_gather=packed_gather and self.batch_packed_mla_vector,
             tile_indices=tile_indices,
         )
+        if compact_queries:
+            from vllm_gaudi.ops.deepseek_v41_target_queries import restore_target_query_rows
+
+            body_rows = 6 * capacity
+            output = restore_target_query_rows(output, query_indices, row_valid, body_rows)
+            # Candidate and completion producers must retain the full C6 layout
+            # for following layers even though this attention executed fewer Qs.
+            selected = full_selected.index_copy(0, query_indices, selected)
+            blocks = full_candidates.index_copy(0, query_indices, blocks)
+            main_done = full_main_done.index_copy(0, query_indices, main_done)
+            index_done = full_index_done.index_copy(0, query_indices, index_done)
+            safe_positions = full_positions.clamp_min(0)
+            active = full_active
         if defer_output_finish:
             return output, selected, blocks, main_done, index_done
         finished_outputs = []

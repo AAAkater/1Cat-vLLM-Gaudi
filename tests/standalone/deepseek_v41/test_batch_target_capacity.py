@@ -991,3 +991,64 @@ def _run_n11_index_tiling(monkeypatch, branch):
 @pytest.mark.parametrize("branch", ("full", "reindex", "bounded", "runtime"))
 def test_n11_index_selection_tiles_native_rows_and_preserves_order(monkeypatch, branch):
     _run_n11_index_tiling(monkeypatch, branch)
+
+
+def test_compact_target_attention_runs_eight_queries_and_keeps_c6_compressor(monkeypatch):
+    from vllm_gaudi.ops.deepseek_v41_target_queries import pack_target_query_rows
+
+    capacity, body_rows = 11, 66
+    harness = _ForwardHarness(capacity)
+    harness.ratio = 2
+    harness.owns_kv = True
+    harness.cache = SimpleNamespace(main=torch.zeros((1, 288), dtype=torch.uint8))
+    events, writes = [], []
+
+    def compress(value, positions, slots, pages, active, request_lengths, request_slots,
+                 runtime_request_slots=False):
+        events.append(("compress", value.shape[0]))
+        assert request_lengths == (6, ) * capacity
+        return torch.ones(body_rows, dtype=torch.int32), torch.ones(body_rows, dtype=torch.int32)
+
+    def qkv(value):
+        events.append(("qkv", value.shape[0]))
+        return value, value
+
+    def write(cache, values, row_ids):
+        writes.append(row_ids.clone())
+        return torch.zeros_like(row_ids)
+
+    def mla(query, swa, main, selected, pages, positions, slots, sink, scale, swa_done, main_done, **kwargs):
+        events.append(("mla", query.shape[0]))
+        assert kwargs["tile_indices"] is None
+        assert main_done.shape == swa_done.shape == (query.shape[0], )
+        return query[:, :4].clone()
+
+    harness._compress_batch_target = compress
+    harness._project_qkv_input = qkv
+    monkeypatch.setattr(batch_attention, "write_state_rows", write)
+    monkeypatch.setattr(batch_attention, "batch_packed_mla", mla)
+    monkeypatch.setattr(paged_module, "rms_norm", lambda value, *_args, **_kwargs: value)
+    monkeypatch.setattr(paged_module, "pack_swa", lambda value: value)
+    valid = torch.zeros(body_rows, dtype=torch.bool)
+    valid[6:12] = True
+    valid[60] = True
+    slots = torch.where(valid, torch.arange(body_rows, dtype=torch.int32) // 6, -1)
+    positions = torch.where(valid, torch.arange(body_rows, dtype=torch.int32) + 100, -1)
+    value = torch.arange(body_rows * 512, dtype=torch.float32).reshape(body_rows, 512)
+    plan = pack_target_query_rows(valid.tolist())
+    selected = torch.full((body_rows, 512), -1, dtype=torch.int32)
+    candidates = torch.full((body_rows, 2048), -1, dtype=torch.int32)
+    done = torch.zeros(body_rows, dtype=torch.int32)
+    result = paged_module.PagedCSA2Attention.forward_batch_target(
+        harness, value, positions, slots, torch.ones((body_rows, 4), dtype=torch.int32),
+        selected, candidates, done, done, row_valid=valid, request_lengths=(6, ) * capacity,
+        request_slots=tuple(range(capacity)), query_indices=torch.tensor(plan.source_rows),
+        query_valid=torch.tensor(plan.valid))
+    assert events == [("compress", 66), ("qkv", 8), ("mla", 8)]
+    assert len(writes) == 1 and writes[0].shape == (8, )
+    assert writes[0][-1] == -1
+    assert torch.equal(result[0][valid], value[valid, :4])
+    assert torch.count_nonzero(result[0][~valid]) == 0
+    assert result[1].shape == (body_rows, 512)
+    assert result[2].shape == (body_rows, 2048)
+    assert result[3].shape == result[4].shape == (body_rows, )

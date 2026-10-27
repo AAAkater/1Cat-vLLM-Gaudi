@@ -103,6 +103,51 @@ def warmup_scenarios(capacity: int) -> tuple[tuple[str, dict[int, int]], ...]:
     )
 
 
+def _execution_buckets(stage: Any, capacity: int) -> tuple[int, ...]:
+    """Read one configured bucket set without assuming target/draft parity."""
+    raw = getattr(stage, "execution_buckets", (capacity, ))
+    if not isinstance(raw, (list, tuple)) or not raw:
+        raise ValueError("DSpark execution buckets must be a nonempty list or tuple")
+    buckets = tuple(raw)
+    if any(type(bucket) is not int or bucket < 1 or bucket > capacity for bucket in buckets):
+        raise ValueError(f"DSpark execution buckets must be integers in 1..{capacity}")
+    if buckets != tuple(sorted(set(buckets))):
+        raise ValueError("DSpark execution buckets must be sorted and unique")
+    if buckets[-1] != capacity:
+        raise ValueError("DSpark execution buckets must end at the state capacity")
+    return buckets
+
+
+def _execution_bucket_for(active_count: int, buckets: Sequence[int]) -> int:
+    for bucket in buckets:
+        if bucket >= active_count:
+            return bucket
+    raise RuntimeError("DSpark active request count exceeds every configured execution bucket")
+
+
+def _warmup_scenarios_for_buckets(
+    capacity: int,
+    target_buckets: Sequence[int],
+    draft_buckets: Sequence[int],
+) -> tuple[tuple[str, dict[int, int]], ...]:
+    """Cover independent target/draft bucket sets without extra full rounds."""
+    base = warmup_scenarios(capacity)
+    # Target buckets remove the active-pattern specialization, including the
+    # legacy N32 tile scenarios.  With target buckets disabled those tile
+    # scenarios remain part of the required draft warmup as well.
+    scenarios = list(base[:3] if len(target_buckets) > 1 else base)
+    active_counts = tuple(len(lengths_by_lane) for _name, lengths_by_lane in scenarios)
+    target_covered = {_execution_bucket_for(count, target_buckets) for count in active_counts}
+    draft_covered = {_execution_bucket_for(count, draft_buckets) for count in active_counts}
+    missing = ((set(target_buckets) - target_covered) | (set(draft_buckets) - draft_covered))
+    for bucket in sorted(missing):
+        scenarios.append((
+            f"execution_bucket_{bucket}_mixed",
+            {lane: (_TARGET_QUERY_BUCKET if lane % 2 == 0 else 1) for lane in range(bucket)},
+        ))
+    return tuple(scenarios)
+
+
 def _component_capacity(value: Any) -> int | None:
     """Read one fixed batch capacity from a runner-owned component."""
     if value is None:
@@ -597,6 +642,17 @@ class DSparkPackedTargetStages:
         self._bug004_profile = None
         self._backend = backend
         self.execution_buckets = (self.batch_capacity,)
+        self.query_bucketing = False
+        self.ragged_compressor = False
+        self.device_finish = False
+        # Opt-in stable (N,B) snapshot storage; None keeps the legacy snapshot.
+        self.device_owner_layout = False
+        self.stable_target_layout = None
+        # Opt-in: run that stable restore inside the packed draft transaction.
+        self.fused_target_restore = False
+        self.query_buckets = (1, 8, 32, 128)
+        self.query_stages = {}
+        self.observed_query_keys = set()
         # One mapping entry is retained for older introspection callers.  The
         # key is physical lane order, not request order or an active-lane set.
         self.stages = {self.stage_key: self.stage}
@@ -619,12 +675,111 @@ class DSparkPackedTargetStages:
         # dense packed MLA call, including a supported partial tail tile.
         self.stage.compiled.use_sparse_mla_plan = not enabled
 
+    def configure_device_finish(self, enabled):
+        if type(enabled) is not bool:
+            raise TypeError("dsv41_dspark_device_target_finish must be a boolean")
+        if self.observed_query_keys:
+            raise RuntimeError("device target finish must be configured before warmup")
+        self.device_finish = enabled
+
+    def configure_device_owner_layout(self, enabled):
+        """Select the persistent fixed-shape target snapshot (default off).
+
+        It replaces the per-round host owner layout with device-derived
+        ``(N,B)`` buffers and one pure tensor restore, so it requires the
+        device target finish that consumes it.
+        """
+        if type(enabled) is not bool:
+            raise TypeError("dsv41_dspark_device_owner_layout must be a boolean")
+        if getattr(self, "observed_query_keys", None):
+            raise RuntimeError("device owner layout must be configured before warmup")
+        if enabled and not getattr(self, "device_finish", False):
+            raise ValueError("dsv41_dspark_device_owner_layout requires dsv41_dspark_device_target_finish=true")
+        if not enabled and getattr(self, "fused_target_restore", False):
+            raise ValueError("dsv41_dspark_fused_target_restore requires dsv41_dspark_device_owner_layout=true")
+        self.device_owner_layout = enabled
+
+    def configure_fused_target_restore(self, enabled):
+        """Restore target state inside the packed draft transaction (default off).
+
+        The transaction receives the full-capacity stable snapshot buffers as
+        graph inputs and restores with the committed counts after packing the
+        record; the host payload is only marked device-finished afterwards.
+        """
+        if type(enabled) is not bool:
+            raise TypeError("dsv41_dspark_fused_target_restore must be a boolean")
+        if getattr(self, "observed_query_keys", None):
+            raise RuntimeError("fused target restore must be configured before warmup")
+        if enabled and not getattr(self, "device_owner_layout", False):
+            raise ValueError("dsv41_dspark_fused_target_restore requires dsv41_dspark_device_owner_layout=true")
+        self.fused_target_restore = enabled
+
+    def _stable_target_ticket(self, batch, source_lanes):
+        """Capture one round into the persistent ``(N,B)`` snapshot storage."""
+        from vllm_gaudi.ops.deepseek_v41_batch_target import DSparkStableTargetLayout, DSparkTargetTicket
+
+        layout = getattr(self, "stable_target_layout", None)
+        if layout is None or not layout.matches(self.program):
+            if layout is not None and layout.owner is not None:
+                raise RuntimeError("target state bindings changed while a stable snapshot is in flight")
+            layout = DSparkStableTargetLayout(self.program, self.batch_capacity, device=self.device)
+            self.stable_target_layout = layout
+        # The fused consumer is compiled per (N, B_draft): give it the same
+        # full-capacity buffers for every target bucket.
+        snapshot = layout.view(batch.batch_capacity, padded=getattr(self, "fused_target_restore", False))
+        snapshot.capture(batch, source_lanes)
+        return DSparkTargetTicket(batch=batch, snapshot=snapshot)
+
+    @staticmethod
+    def _release_target_snapshot(ticket) -> None:
+        release = getattr(getattr(ticket, "snapshot", None), "release", None)
+        if callable(release):
+            release()
+
+    def configure_query_buckets(self, enabled, *, buckets=(1, 8, 32, 128)):
+        from vllm_gaudi.ops.deepseek_v41_target_queries import target_query_buckets
+
+        if type(enabled) is not bool:
+            raise TypeError("dsv41_dspark_target_query_buckets must be a boolean")
+        target_query_buckets(6 * self.batch_capacity, buckets)
+        if self.observed_query_keys:
+            raise RuntimeError("target query buckets must be configured before warmup")
+        self.query_bucketing = enabled
+        self.query_buckets = tuple(buckets)
+
+    def configure_ragged_compressor(self, enabled):
+        from vllm_gaudi.ops.deepseek_v41_target_ragged import validate_target_ragged_compressor
+
+        validate_target_ragged_compressor(enabled, query_bucketing=getattr(self, "query_bucketing", False))
+        if getattr(self, "observed_query_keys", ()) or getattr(self, "query_stages", {}):
+            raise RuntimeError("target ragged compressor must be configured before warmup")
+        self.ragged_compressor = enabled
+
+    def query_warmup_cases(self):
+        from vllm_gaudi.ops.deepseek_v41_target_queries import target_query_warmup_cases
+
+        if not self.query_bucketing:
+            return ()
+        return target_query_warmup_cases(self.execution_buckets, self.query_buckets)
+
     def stage_for(self, batch):
         from vllm_gaudi.models.deepseek_v41_batch_target_program import DSparkTargetStage
 
         capacity = batch.batch_capacity
         if capacity not in getattr(self, "execution_buckets", (self.batch_capacity,)):
             raise ValueError("DSpark target execution bucket was not selected for warmup")
+        query_rows = getattr(batch, "query_bucket_rows", None)
+        if query_rows is not None and query_rows < 6 * capacity:
+            key = (capacity, query_rows)
+            if key not in self.query_stages:
+                ragged = {"ragged_compressor": True} if getattr(self, "ragged_compressor", False) else {}
+                stage = DSparkTargetStage(
+                    self.program, (6, ) * capacity, tuple(range(capacity)), backend=self._backend,
+                    state_capacity=self.batch_capacity, **ragged)
+                stage.compiled.execution_bucket_count = len(self.execution_buckets) * (len(self.query_buckets) + 1)
+                stage.compiled.use_sparse_mla_plan = False
+                self.query_stages[key] = stage
+            return self.query_stages[key]
         if capacity == self.batch_capacity:
             if batch.host_request_slots != self.stage_key:
                 raise ValueError("DSpark canonical target host slots must be range(batch_capacity)")
@@ -667,6 +822,8 @@ class DSparkPackedTargetStages:
             state_capacity=self.batch_capacity if compact else None,
             device=self.device,
         )
+        if getattr(self, "query_bucketing", False):
+            batch = batch.with_query_buckets(self.query_buckets)
         source_indices = (torch.tensor(packed.source_lanes[:active_count], dtype=torch.int64, device=self.device)
                           if compact else None)
         stage = self.stage_for(batch)
@@ -675,7 +832,12 @@ class DSparkPackedTargetStages:
         try:
             if profile is not None:
                 profile.mark("target.snapshot")
-            ticket = stage.snapshot(batch)
+            if getattr(self, "device_owner_layout", False):
+                ticket = self._stable_target_ticket(batch, packed.source_lanes)
+            else:
+                ticket = stage.snapshot(batch)
+                if getattr(self, "device_finish", False):
+                    ticket.snapshot.prepare_device_restore()
             if profile is not None:
                 profile.mark("target.engram")
             engram_rows, engram_owner = self._engram_rows(batch, input_ids)
@@ -697,6 +859,10 @@ class DSparkPackedTargetStages:
                 expanded_aux.index_copy_(0, source_indices, aux.reshape(execution_capacity, 6, *aux.shape[1:])[
                     :active_count])
                 aux = expanded_aux.reshape(self.batch_capacity * 6, *aux.shape[1:])
+            query_rows = batch.query_bucket_rows or rows
+            if not hasattr(self, "observed_query_keys"):
+                self.observed_query_keys = set()
+            self.observed_query_keys.add((execution_capacity, query_rows))
             payload = {
                 "hidden": hidden,
                 "aux": aux,
@@ -704,16 +870,30 @@ class DSparkPackedTargetStages:
                 "ticket": ticket,
                 "engram_owner": engram_owner,
                 "finished": False,
+                "device_finished": False,
+                "device_finish_callback": self.finish_device if getattr(self, "device_finish", False) else None,
                 "source_lanes": packed.source_lanes,
                 "target_execution_capacity": execution_capacity,
                 "target_execution_rows": rows,
+                "target_query_rows": batch.actual_query_rows,
+                "target_query_bucket_rows": query_rows,
                 "target_execution_slots": batch.host_request_slots,
             }
+            if getattr(self, "fused_target_restore", False):
+                # The packed draft transaction restores in-graph; the eager
+                # device callback is replaced by a mark-only callback.
+                payload.update(
+                    device_finish_callback=None,
+                    fused_target_restore=ticket.snapshot.restore_arguments(),
+                    fused_finish_callback=self.finish_device_fused,
+                )
             return DSparkTargetBatch(token_ids=target_ids, payload=payload)
         except BaseException as error:
             if ticket is not None:
                 try:
                     ticket.restore((0, ) * batch.batch_capacity)
+                    # A failed rollback keeps stable storage owned (fail closed).
+                    self._release_target_snapshot(ticket)
                 except BaseException as cleanup_error:
                     if hasattr(error, "add_note"):
                         error.add_note(
@@ -804,6 +984,50 @@ class DSparkPackedTargetStages:
             owner.wait(ticket)
         owner.complete_batch(ticket, (0, ) * active_count)
 
+    def _validate_device_counts(self, payload, committed) -> None:
+        if payload.get("finished") or payload.get("device_finished"):
+            raise RuntimeError("DSpark target device transaction was already completed")
+        expected_device = getattr(payload["batch"], "input_ids", None)
+        expected_device = expected_device.device if expected_device is not None else self.device
+        if (not isinstance(committed, torch.Tensor) or committed.shape != (self.batch_capacity, )
+                or committed.dtype not in (torch.int32, torch.int64) or committed.device != expected_device):
+            raise ValueError("device target finish requires full state-capacity device counts")
+
+    def finish_device_fused(self, target, committed):
+        """Mark a round whose packed transaction already restored target state.
+
+        No tensor work happens here.  Host ``finish`` still validates the
+        read-back counts and ``abort`` still rolls back with zero counts.
+        """
+        from vllm_gaudi.ops.deepseek_v41_batch_target import DSparkStableTargetSnapshot
+
+        payload = target.payload
+        self._validate_device_counts(payload, committed)
+        snapshot = payload["ticket"].snapshot
+        if not isinstance(snapshot, DSparkStableTargetSnapshot) or not snapshot.padded:
+            raise RuntimeError("fused target restore requires a full-capacity stable target snapshot")
+        payload["device_finished"] = True
+
+    def finish_device(self, target, committed):
+        payload = target.payload
+        self._validate_device_counts(payload, committed)
+        from vllm_gaudi.ops.deepseek_v41_batch_target import DSparkStableTargetSnapshot
+
+        snapshot = payload["ticket"].snapshot
+        if isinstance(snapshot, DSparkStableTargetSnapshot):
+            # One pure tensor call maps the N counts to B lanes on device
+            # through the persistent lane map; no per-round host tensors.
+            snapshot.restore_device(committed)
+            payload["device_finished"] = True
+            return
+        lanes = payload["source_lanes"]
+        if len(lanes) != self.batch_capacity:
+            indices = torch.tensor([max(0, lane) for lane in lanes], dtype=torch.int64, device=committed.device)
+            valid = torch.tensor([lane >= 0 for lane in lanes], dtype=torch.bool, device=committed.device)
+            committed = torch.where(valid, committed.index_select(0, indices), 0)
+        snapshot.restore_device(committed)
+        payload["device_finished"] = True
+
     def finish(self, target, accepted):
         payload = getattr(target, "payload", None)
         if not isinstance(payload, dict):
@@ -816,8 +1040,11 @@ class DSparkPackedTargetStages:
             raise ValueError("DSpark target completion requires one accepted value per lane")
         batch = payload["batch"]
         lanes = payload.get("source_lanes", tuple(range(self.batch_capacity)))
+        if payload.get("device_finished", False):
+            self._validate_device_finished_accepted(accepted, lanes, batch.host_request_active)
         accepted = tuple(accepted[lane] if lane >= 0 else 0 for lane in lanes)
-        payload["ticket"].restore(accepted)
+        if not payload.get("device_finished", False):
+            payload["ticket"].restore(accepted)
         owner_info = payload.get("engram_owner")
         if owner_info is not None:
             owner, ticket = owner_info
@@ -825,14 +1052,49 @@ class DSparkPackedTargetStages:
                                     zip(accepted, batch.host_request_active, strict=True) if active)
             owner.complete_batch(ticket, active_accepted)
         payload["finished"] = True
+        self._release_target_snapshot(payload["ticket"])
+
+    @staticmethod
+    def _validate_device_finished_accepted(accepted, lanes, active) -> None:
+        """Reject host counts that disagree with what the device restore could apply.
+
+        ``finish_device`` restores target state from the same device tensor
+        that is packed into the commit record (``values[1]`` of the packed
+        transaction is ``committed``, and ``pack_record_batch`` writes it to
+        column 1), so a valid record implies the device restore used these
+        counts.  The device restore cannot raise; on any out-of-range count it
+        rolls back every lane instead.  This host check is the authority that
+        surfaces that divergence: it rejects exactly what the host restore
+        path would have rejected, before Engram or publication use the counts.
+        The caller then aborts, which restores the snapshot with zero counts
+        (idempotent with any device restore).
+        """
+        bad = [(lane, value) for lane, value in enumerate(accepted) if not 0 <= value <= _TARGET_QUERY_BUCKET]
+        if bad:
+            raise RuntimeError(
+                f"DSpark device-finished target received accepted counts outside 0..{_TARGET_QUERY_BUCKET} "
+                f"(lane, value)={bad}; device restore rolled back every lane")
+        active_lanes = {lane for lane, live in zip(lanes, active, strict=True) if live and lane >= 0}
+        stray = [(lane, value) for lane, value in enumerate(accepted) if value and lane not in active_lanes]
+        if stray:
+            raise RuntimeError(
+                f"DSpark device-finished target received nonzero accepted counts for inactive lanes "
+                f"(lane, value)={stray}")
 
     def abort(self, target) -> None:
-        """Roll back an uncommitted warmup/failure transaction exactly once."""
+        """Roll back an uncommitted warmup/failure transaction exactly once.
+
+        This also covers a device-finished transaction whose host finish
+        failed: restoring every snapshot row with zero counts is idempotent
+        with the partial device restore already applied.
+        """
         payload = getattr(target, "payload", None)
         if not isinstance(payload, dict) or payload.get("finished"):
             return
         batch = payload["batch"]
         payload["ticket"].restore((0, ) * batch.batch_capacity)
+        # Released only after a successful rollback; otherwise fail closed.
+        self._release_target_snapshot(payload["ticket"])
         owner_info = payload.get("engram_owner")
         if owner_info is not None:
             owner, ticket = owner_info
@@ -890,6 +1152,10 @@ class DSparkBatchTrace:
         request_slots = list(payload.get("active_lanes", payload["request_slots"]))
         capacity = int(payload.get("batch_capacity", payload.get("capacity", len(request_slots))))
         active_count = int(payload.get("active_count", len(req_ids)))
+        draft_execution_capacity = int(payload.get("draft_execution_capacity", capacity))
+        draft_execution_slots = list(payload.get("draft_execution_slots", request_slots))
+        draft_source_lanes = list(payload.get("draft_source_lanes", range(capacity)))
+        draft_graph_key = list(payload.get("draft_graph_key", (capacity, draft_execution_capacity)))
         digest_payload = {
             "schema": payload["schema"],
             "batch_round": payload["batch_round"],
@@ -910,7 +1176,14 @@ class DSparkBatchTrace:
                                                      payload["actual_packed_target_rows"])),
             "physical_draft_rows": int(payload.get("physical_draft_rows",
                                                     payload["actual_packed_draft_rows"])),
+            "draft_execution_capacity": draft_execution_capacity,
+            "draft_execution_slots": draft_execution_slots,
+            "draft_source_lanes": draft_source_lanes,
+            "draft_graph_key": draft_graph_key,
         }
+        for name in ("target_query_rows", "target_query_bucket_rows"):
+            if name in payload:
+                digest_payload[name] = payload[name]
         if "active_metadata" in payload:
             digest_payload["active_metadata"] = payload["active_metadata"]
         if "target_execution_slots" in payload:
@@ -1032,14 +1305,13 @@ class DSparkBatchRunner:
         started_round = self.round_generation
         observed: list[dict[str, Any]] = []
         try:
-            buckets = getattr(self.target_stage, "execution_buckets", (self.batch_capacity,))
-            scenarios = warmup_scenarios(self.batch_capacity)
-            if len(buckets) > 1:
-                scenarios = scenarios[:3] + tuple(
-                    (f"target_bucket_{bucket}_mixed", {lane: (6 if lane % 2 == 0 else 1)
-                                                       for lane in range(bucket)})
-                    for bucket in buckets if 1 < bucket < self.batch_capacity
-                )
+            buckets = _execution_buckets(self.target_stage, self.batch_capacity)
+            draft_buckets = _execution_buckets(self.draft_stage, self.batch_capacity)
+            scenarios = _warmup_scenarios_for_buckets(self.batch_capacity, buckets, draft_buckets)
+            query_cases_fn = getattr(self.target_stage, "query_warmup_cases", None)
+            query_cases = query_cases_fn() if callable(query_cases_fn) else ()
+            scenarios += tuple((f"target_queries_{capacity}_{query_rows}", lengths)
+                               for capacity, query_rows, lengths in query_cases)
             for round_index, (name, lengths_by_lane) in enumerate(scenarios):
                 observed.append(
                     self._warmup_round(
@@ -1065,12 +1337,39 @@ class DSparkBatchRunner:
             expected_keys = {tuple(range(bucket)) for bucket in buckets}
             if isinstance(stages, Mapping) and set(stages) != expected_keys:
                 raise RuntimeError("DSpark warmup target keys differ from its bounded execution buckets")
-            transaction = getattr(self.draft_stage, "transaction", None)
+            if query_cases:
+                expected_query_keys = {(capacity, query_rows) for capacity, query_rows, _lengths in query_cases}
+                if set(getattr(self.target_stage, "observed_query_keys", ())) != expected_query_keys:
+                    raise RuntimeError("DSpark warmup did not cover the reachable target query buckets")
             verify_ring = getattr(self.draft_stage, "verify_ring", None)
             if getattr(fixed_stage, "compiled", None) is None:
                 raise RuntimeError("DSpark warmup did not build the fixed target graph")
-            if transaction is None or getattr(transaction, "compiled", None) is None:
-                raise RuntimeError("DSpark warmup did not build the packed draft transaction")
+            transactions = getattr(self.draft_stage, "transactions", None)
+            if isinstance(transactions, Mapping):
+                expected_transactions = set(draft_buckets)
+                if set(transactions) != expected_transactions:
+                    raise RuntimeError(
+                        "DSpark warmup draft transactions differ from its execution buckets")
+                for bucket in draft_buckets:
+                    transaction = transactions[bucket]
+                    if getattr(transaction, "batch_capacity", None) != self.batch_capacity:
+                        raise RuntimeError("DSpark warmup draft transaction state capacity changed")
+                    if getattr(transaction, "execution_capacity", None) != bucket:
+                        raise RuntimeError("DSpark warmup draft transaction execution capacity changed")
+                    if getattr(transaction, "compiled", None) is None:
+                        raise RuntimeError(
+                            f"DSpark warmup did not compile draft execution bucket {bucket}")
+                if getattr(self.draft_stage, "transaction", None) is not transactions.get(self.batch_capacity):
+                    raise RuntimeError("DSpark warmup full-capacity draft transaction alias changed")
+                exercised = {item["draft_execution_capacity"] for item in observed}
+                if exercised != expected_transactions:
+                    raise RuntimeError(
+                        "DSpark warmup did not execute every configured draft transaction bucket")
+            else:
+                # Legacy stages expose only the full-capacity transaction.
+                transaction = getattr(self.draft_stage, "transaction", None)
+                if transaction is None or getattr(transaction, "compiled", None) is None:
+                    raise RuntimeError("DSpark warmup did not build the packed draft transaction")
             if verify_ring is None or self.round_generation != verify_ring.generation:
                 raise RuntimeError("DSpark warmup round and verify generations diverged")
             if self.round_generation != started_round + len(scenarios):
@@ -1095,6 +1394,53 @@ class DSparkBatchRunner:
             self.single_draft_owner = None
             self.draft_bank_generations.clear()
             state.restore_single_bindings()
+
+    def _draft_execution_metadata(self, plan: DSparkBatchPlan) -> dict[str, Any]:
+        """Read the last draft bucket plan, retaining the legacy full-N fallback."""
+        last_plan = getattr(self.draft_stage, "last_execution_plan", None)
+        fallback_lanes = tuple(range(plan.capacity))
+        lane_slots = tuple(int(value) for value in plan.metadata.request_slots.tolist())
+        if last_plan is None:
+            execution_capacity = plan.capacity
+            source_lanes = fallback_lanes
+            logical_slots = lane_slots
+            graph_key = (plan.capacity, execution_capacity)
+        else:
+            state_capacity = _host_integer(getattr(last_plan, "state_capacity", None),
+                                            "DraftBucketPlan.state_capacity")
+            execution_capacity = _host_integer(getattr(last_plan, "execution_capacity", None),
+                                                "DraftBucketPlan.execution_capacity")
+            if state_capacity != plan.capacity:
+                raise RuntimeError("DSpark draft bucket plan changed the fixed state capacity")
+            raw_lanes = getattr(last_plan, "source_lanes", None)
+            raw_slots = getattr(last_plan, "logical_slots", None)
+            if isinstance(raw_lanes, torch.Tensor) or isinstance(raw_slots, torch.Tensor):
+                raise ValueError("DraftBucketPlan lanes and slots must remain on the host")
+            source_lanes = tuple(_host_integer(value, "DraftBucketPlan.source_lanes") for value in raw_lanes)
+            logical_slots = tuple(_host_integer(value, "DraftBucketPlan.logical_slots") for value in raw_slots)
+            graph_key = tuple(getattr(last_plan, "graph_key", (state_capacity, execution_capacity)))
+        active_lanes = tuple(index for index, enabled in enumerate(plan.active_mask) if enabled)
+        if not len(active_lanes) <= execution_capacity <= plan.capacity or execution_capacity < 1:
+            raise RuntimeError("DSpark draft execution bucket does not cover its active requests")
+        if (len(source_lanes) != execution_capacity or len(logical_slots) != execution_capacity
+                or len(set(source_lanes)) != execution_capacity
+                or any(lane < 0 or lane >= plan.capacity for lane in source_lanes)
+                or not set(active_lanes).issubset(source_lanes)):
+            raise RuntimeError("DSpark draft execution lanes must uniquely cover every active lane")
+        if logical_slots != tuple(lane_slots[lane] for lane in source_lanes):
+            raise RuntimeError("DSpark draft execution slots disagree with the current request owners")
+        if len(graph_key) != 2:
+            raise ValueError("DSpark draft graph key must contain state and execution capacities")
+        graph_key = tuple(_host_integer(value, "DSpark draft graph key") for value in graph_key)
+        if graph_key != (plan.capacity, execution_capacity):
+            raise RuntimeError("DSpark draft graph key disagrees with its bucket plan")
+        return {
+            "draft_execution_capacity": execution_capacity,
+            "draft_source_lanes": source_lanes,
+            "draft_execution_slots": logical_slots,
+            "draft_graph_key": graph_key,
+            "draft_plan_observed": last_plan is not None,
+        }
 
     def _warmup_round(self, *, round_index: int, name: str, lengths_by_lane: Mapping[int, int], pool_blocks: int,
                       max_model_len: int, request_factory: Any, state, draft_state, engram) -> dict[str, Any]:
@@ -1123,12 +1469,12 @@ class DSparkBatchRunner:
             for lane in reversed(active_lanes):
                 request = by_lane[lane]
                 count = lengths_by_lane[lane]
-                if count not in (1, _TARGET_QUERY_BUCKET):
-                    raise ValueError("DSpark warmup target lengths must be C1 or C6")
+                if type(count) is not int or not 1 <= count <= _TARGET_QUERY_BUCKET:
+                    raise ValueError("DSpark warmup target lengths must be C1 through C6")
                 counts[request.req_id] = count
-                if count == _TARGET_QUERY_BUCKET:
+                if count > 1:
                     first = 1000 + round_index * 128 + lane * 8
-                    proposals[request.req_id] = tuple(range(first, first + _MAX_DRAFT_TOKENS))
+                    proposals[request.req_id] = tuple(range(first, first + count - 1))
             scheduled = SimpleNamespace(
                 num_scheduled_tokens=counts,
                 scheduled_spec_decode_tokens=proposals,
@@ -1147,12 +1493,14 @@ class DSparkBatchRunner:
                     (True, ) * len(plan.requests)):
                 raise RuntimeError("DSpark warmup plan does not own its request slots")
             self.execute(plan)
+            draft_metadata = self._draft_execution_metadata(plan)
             return {
                 "name": name,
                 "active_count": len(active_lanes),
                 "active_lanes": active_lanes,
                 "target_lengths": tuple(plan.target_lengths),
                 "slot_generations": tuple(entry.slot_generation for entry in plan.requests),
+                **draft_metadata,
             }
         finally:
             self._clear_warmup_entries(entries, state, draft_state, engram)
@@ -1422,7 +1770,9 @@ class DSparkBatchRunner:
         target_payload = getattr(target, "payload", None)
         target_payload = target_payload if isinstance(target_payload, dict) else {}
         physical_target_rows = target_payload.get("target_execution_rows", plan.capacity * _TARGET_QUERY_BUCKET)
-        physical_draft_rows = plan.capacity * _MAX_DRAFT_TOKENS
+        draft_metadata = self._draft_execution_metadata(plan)
+        draft_execution_capacity = draft_metadata["draft_execution_capacity"]
+        physical_draft_rows = draft_execution_capacity * _MAX_DRAFT_TOKENS
         payload = {
             "schema": _TRACE_SCHEMA,
             "batch_round": plan.round_generation,
@@ -1443,7 +1793,14 @@ class DSparkBatchRunner:
             "scheduler_draft_counts": [entry.scheduler_draft_count for entry in plan.requests],
             "physical_target_rows": physical_target_rows,
             "target_execution_capacity": target_payload.get("target_execution_capacity", plan.capacity),
-            "target_execution_slots": list(target_payload.get("target_execution_slots", ())),
+            "target_query_rows": target_payload.get("target_query_rows", sum(plan.target_lengths)),
+            "target_query_bucket_rows": target_payload.get("target_query_bucket_rows", physical_target_rows),
+            "target_execution_slots": list(target_payload.get(
+                "target_execution_slots", plan.metadata.request_slots.tolist())),
+            "draft_execution_capacity": draft_execution_capacity,
+            "draft_execution_slots": list(draft_metadata["draft_execution_slots"]),
+            "draft_source_lanes": list(draft_metadata["draft_source_lanes"]),
+            "draft_graph_key": list(draft_metadata["draft_graph_key"]),
             "physical_draft_rows": physical_draft_rows,
             "actual_packed_target_rows": physical_target_rows,
             "actual_packed_draft_rows": physical_draft_rows,

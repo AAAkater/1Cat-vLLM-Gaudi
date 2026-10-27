@@ -763,7 +763,9 @@ def test_prepared_decoder_target_method_forwards_fixed_args_and_aux(monkeypatch,
     assert all(call["decode"] is True and call["ordinary_decode"] is False for call in moe_calls)
 
 
-def test_compiled_target_group_uses_one_12row_loop_and_mixed_mask():
+def test_compiled_target_group_uses_one_12row_loop_and_mixed_mask(monkeypatch):
+    # Dynamo's stream tracker must not acquire a visible-but-busy HPU in CPU tests.
+    monkeypatch.setattr(torch.accelerator, "is_available", lambda: False)
     stage, calls = _fake_stage()
     batch = _batch()
     compiled = CompiledTargetBatchStage(stage, batch.request_lengths, batch.host_request_slots, backend="eager")

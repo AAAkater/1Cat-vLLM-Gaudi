@@ -576,9 +576,111 @@ def canonical_request_ids(reqids: Any, active_lanes: list[int], capacity: int) -
     return active_ids, None
 
 
+_EXECUTION_TRACE_FIELDS = {
+    "target": {
+        "capacity": ("target_execution_capacity", "targetexecutioncapacity", "target_execution_bucket"),
+        "source_lanes": (
+            "target_source_lanes",
+            "target_execution_source_lanes",
+            "targetexecutionsourcelanes",
+            "source_lanes",
+        ),
+        "slots": ("target_execution_slots", "target_slots", "targetexecutionslots"),
+        "graph_key": ("target_graph_key", "target_execution_graph_key", "targetgraphkey", "graph_key"),
+    },
+    "draft": {
+        "capacity": ("draft_execution_capacity", "draftexecutioncapacity", "draft_execution_bucket"),
+        "source_lanes": (
+            "draft_source_lanes",
+            "draft_execution_source_lanes",
+            "draftexecutionsourcelanes",
+        ),
+        "slots": ("draft_execution_slots", "draft_slots", "draftexecutionslots"),
+        "graph_key": ("draft_graph_key", "draft_execution_graph_key", "draftgraphkey"),
+    },
+}
+
+
+def _execution_field(row: dict[str, Any], prefix: str, kind: str) -> Any:
+    return evidence_field(row, *_EXECUTION_TRACE_FIELDS[prefix][kind])
+
+
+def _execution_capacity(row: dict[str, Any], prefix: str, state_capacity: int,
+                        active_count: int) -> tuple[int | None, str | None]:
+    field = f"{prefix}_execution_capacity"
+    capacity = _execution_field(row, prefix, "capacity")
+    if capacity is None:
+        return state_capacity, None
+    if type(capacity) is not int or not 1 <= capacity <= state_capacity:
+        return None, f"{field} must be an integer in 1..{state_capacity}"
+    if capacity < active_count:
+        return None, f"{field} {capacity} must be at least the actual active count {active_count}"
+    return capacity, None
+
+
+def _execution_mapping(row: dict[str, Any], prefix: str, state_capacity: int,
+                       execution_capacity: int, active_lanes: list[int],
+                       active_slots: list[int]) -> tuple[dict[str, Any] | None, str | None]:
+    source_field = f"{prefix}_source_lanes"
+    slots_field = f"{prefix}_execution_slots"
+    graph_field = f"{prefix}_graph_key"
+    raw_source_lanes = _execution_field(row, prefix, "source_lanes")
+    raw_slots = _execution_field(row, prefix, "slots")
+    raw_graph_key = _execution_field(row, prefix, "graph_key")
+    if raw_source_lanes is None and raw_slots is None and raw_graph_key is None:
+        return {"source_lanes": None, "execution_slots": None, "graph_key": None}, None
+
+    source_lanes = None
+    if raw_source_lanes is not None:
+        if not isinstance(raw_source_lanes, list) or len(raw_source_lanes) != execution_capacity:
+            return None, f"{source_field} must contain exactly execution capacity B={execution_capacity} lanes"
+        if any(type(lane) is not int for lane in raw_source_lanes):
+            return None, f"{source_field} must contain only integers"
+        if any(lane < 0 or lane >= state_capacity for lane in raw_source_lanes):
+            return None, f"{source_field} lanes must be in 0..{state_capacity - 1}"
+        if len(set(raw_source_lanes)) != len(raw_source_lanes):
+            return None, f"{source_field} must contain unique lanes"
+        missing_lanes = sorted(set(active_lanes) - set(raw_source_lanes))
+        if missing_lanes:
+            return None, f"{source_field} must cover every active lane; missing {missing_lanes}"
+        source_lanes = list(raw_source_lanes)
+
+    execution_slots = None
+    if raw_slots is not None:
+        if not isinstance(raw_slots, list) or len(raw_slots) != execution_capacity:
+            return None, f"{slots_field} must contain exactly execution capacity B={execution_capacity} slots"
+        if any(type(slot) is not int for slot in raw_slots):
+            return None, f"{slots_field} must contain only integers"
+        if any(slot < -1 or slot >= state_capacity for slot in raw_slots):
+            return None, f"{slots_field} slots must be -1 or in 0..{state_capacity - 1}"
+        active_execution_slots = [slot for slot in raw_slots if slot >= 0]
+        if len(set(active_execution_slots)) != len(active_execution_slots):
+            return None, f"{slots_field} must contain unique active logical slots"
+        if set(active_execution_slots) != set(active_slots):
+            return None, f"{slots_field} must cover every active logical slot exactly once"
+        execution_slots = list(raw_slots)
+        if source_lanes is not None:
+            slot_by_lane = dict(zip(active_lanes, active_slots, strict=True))
+            expected_slots = [slot_by_lane.get(lane, -1) for lane in source_lanes]
+            if execution_slots != expected_slots:
+                return None, (f"{slots_field} must preserve source-lane logical slots and use -1 "
+                              "for inactive fillers")
+
+    graph_key = None
+    if raw_graph_key is not None:
+        if (not isinstance(raw_graph_key, list) or len(raw_graph_key) != 2
+                or any(type(value) is not int for value in raw_graph_key)):
+            return None, f"{graph_field} must be a two-integer list"
+        expected_key = [state_capacity, execution_capacity]
+        if raw_graph_key != expected_key:
+            return None, f"{graph_field} must be {expected_key}"
+        graph_key = list(raw_graph_key)
+    return {"source_lanes": source_lanes, "execution_slots": execution_slots, "graph_key": graph_key}, None
+
+
 def normalize_trace_event(row: dict[str, Any], expected_capacity: int,
                           aliases: dict[str, set[str]]) -> tuple[dict[str, Any] | None, str | None]:
-    """Validate one trace row and expose capacity ``N`` separately from activity ``A``."""
+    """Validate state capacity N, activity A, and independent target/draft buckets."""
     schema = row.get("schema")
     if schema == TRACE_SCHEMA_V2:
         legacy = False
@@ -613,6 +715,17 @@ def normalize_trace_event(row: dict[str, Any], expected_capacity: int,
     active_ids, error = canonical_request_ids(reqids, active_lanes, observed_capacity)
     if error is not None:
         return None, error
+    target_execution_capacity, error = _execution_capacity(
+        row, "target", observed_capacity, len(active_lanes))
+    if error is not None:
+        return None, error
+    draft_execution_capacity, error = _execution_capacity(
+        row, "draft", observed_capacity, len(active_lanes))
+    if error is not None:
+        return None, error
+    execution_bucket_fields_present = any(
+        _execution_field(row, prefix, kind) is not None
+        for prefix in ("target", "draft") for kind in ("capacity", "source_lanes", "slots", "graph_key"))
 
     lane_reqids = evidence_field(row, "lane_request_ids")
     if lane_reqids is not None:
@@ -642,10 +755,12 @@ def normalize_trace_event(row: dict[str, Any], expected_capacity: int,
     if error is not None:
         return None, error
 
-    if any(type(value) is not int or value < 0 for value in slots):
-        return None, "active request_slots must be nonnegative integers"
-    if not legacy and slots != active_lanes:
-        return None, "v2 active request_slots must equal active_lanes"
+    if any(type(value) is not int or value < 0 or value >= observed_capacity for value in slots):
+        return None, f"active request_slots must be integers in 0..{observed_capacity - 1}"
+    if len(set(slots)) != len(slots):
+        return None, "active request_slots must be unique"
+    if not legacy and not execution_bucket_fields_present and slots != active_lanes:
+        return None, "v2 active request_slots must equal active_lanes without execution bucket metadata"
     if any(type(value) is not int or value < 1 for value in gens):
         return None, "active slot_generations must be positive integers"
     if any(type(value) is not int or not 1 <= value <= TARGET_ROWS_PER_LANE for value in query_counts):
@@ -704,12 +819,30 @@ def normalize_trace_event(row: dict[str, Any], expected_capacity: int,
 
     target_rows = evidence_field(row, "actual_packed_target_rows", "targetrows", "target_rows", "targetrows12")
     draft_rows = evidence_field(row, "actual_packed_draft_rows", "draftrows", "draft_rows", "draftrows10")
-    if target_rows != observed_capacity * TARGET_ROWS_PER_LANE:
-        expected = observed_capacity * TARGET_ROWS_PER_LANE
-        return None, f"actual_packed_target_rows must be {expected} for N={observed_capacity}"
-    if draft_rows != observed_capacity * DRAFT_ROWS_PER_LANE:
-        expected = observed_capacity * DRAFT_ROWS_PER_LANE
-        return None, f"actual_packed_draft_rows must be {expected} for N={observed_capacity}"
+    expected_target_rows = target_execution_capacity * TARGET_ROWS_PER_LANE
+    expected_draft_rows = draft_execution_capacity * DRAFT_ROWS_PER_LANE
+    if type(target_rows) is not int or target_rows != expected_target_rows:
+        return None, (f"actual_packed_target_rows must be {expected_target_rows} for "
+                      f"Bt={target_execution_capacity} (N={observed_capacity})")
+    if type(draft_rows) is not int or draft_rows != expected_draft_rows:
+        return None, (f"actual_packed_draft_rows must be {expected_draft_rows} for "
+                      f"Bd={draft_execution_capacity} (N={observed_capacity})")
+    target_query_rows = evidence_field(row, "target_query_rows")
+    target_query_bucket_rows = evidence_field(row, "target_query_bucket_rows")
+    if target_query_rows is not None or target_query_bucket_rows is not None:
+        if type(target_query_rows) is not int or target_query_rows != sum(query_counts):
+            return None, "target_query_rows must match the actual logical target query count"
+        if (type(target_query_bucket_rows) is not int
+                or not target_query_rows <= target_query_bucket_rows <= target_rows):
+            return None, "target_query_bucket_rows must cover real queries within the C6 body rows"
+    target_mapping, error = _execution_mapping(
+        row, "target", observed_capacity, target_execution_capacity, active_lanes, slots)
+    if error is not None:
+        return None, error
+    draft_mapping, error = _execution_mapping(
+        row, "draft", observed_capacity, draft_execution_capacity, active_lanes, slots)
+    if error is not None:
+        return None, error
 
     events = trace_event_flags(row)
     if not events["completion"] or not events["final"]:
@@ -752,6 +885,18 @@ def normalize_trace_event(row: dict[str, Any], expected_capacity: int,
         "next_draft_counts": next_draft_counts,
         "target_rows": target_rows,
         "draft_rows": draft_rows,
+        "target_execution_capacity": target_execution_capacity,
+        "draft_execution_capacity": draft_execution_capacity,
+        "target_execution_rows": target_rows,
+        "target_query_rows": target_query_rows,
+        "target_query_bucket_rows": target_query_bucket_rows,
+        "draft_execution_rows": draft_rows,
+        "target_source_lanes": target_mapping["source_lanes"],
+        "draft_source_lanes": draft_mapping["source_lanes"],
+        "target_execution_slots": target_mapping["execution_slots"],
+        "draft_execution_slots": draft_mapping["execution_slots"],
+        "target_graph_key": target_mapping["graph_key"],
+        "draft_graph_key": draft_mapping["graph_key"],
         "commit_counts": commit_counts,
         "request_evidence": request_evidence,
         "completion_event_observed": True,
@@ -925,7 +1070,8 @@ def assess_evidence(path: Path | None, records: list[dict[str, Any]],
         else:
             raw_ref["errors"].append(
                 f"no packed line matched HTTP request IDs at capacity N={expected_capacity} with canonical "
-                "active_lanes, inactive-no-ID, 6N/5N rows, and observed completion/final events")
+                "active_lanes, inactive-no-ID, independent target/draft execution buckets and rows, "
+                "and observed completion/final events")
         raw_ref["rejected_row_count"] = len(rejected)
         raw_ref["rejected_rows"] = rejected
         result["observed_capacities"] = sorted(observed_capacities)

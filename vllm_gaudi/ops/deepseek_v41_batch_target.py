@@ -11,7 +11,8 @@ does not execute a model or mutate scheduler state.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections.abc import Callable
+from dataclasses import dataclass, replace
 import operator
 from types import SimpleNamespace
 
@@ -131,6 +132,9 @@ class DSparkTargetBatch:
     host_slot_generations: tuple[int, ...]
     host_round_generation: int
     state_capacity: int | None = None
+    query_bucket_rows: int | None = None
+    query_indices: torch.Tensor | None = None
+    query_valid: torch.Tensor | None = None
 
     @property
     def request_offsets(self) -> tuple[int, ...]:
@@ -144,6 +148,21 @@ class DSparkTargetBatch:
     def host_active_lanes(self) -> tuple[int, ...]:
         """Return active physical lanes from the validated host mask only."""
         return tuple(lane for lane, active in enumerate(self.host_request_active) if active)
+
+    @property
+    def actual_query_rows(self):
+        return sum(self.host_row_valid)
+
+    def with_query_buckets(self, buckets=(1, 8, 32, 128)):
+        from vllm_gaudi.ops.deepseek_v41_target_queries import pack_target_query_rows
+
+        plan = pack_target_query_rows(self.host_row_valid, buckets)
+        if plan.bucket_rows == self.target_rows:
+            return replace(self, query_bucket_rows=plan.bucket_rows)
+        return replace(
+            self, query_bucket_rows=plan.bucket_rows,
+            query_indices=torch.tensor(plan.source_rows, dtype=torch.int64, device=self.input_ids.device),
+            query_valid=torch.tensor(plan.valid, dtype=torch.bool, device=self.input_ids.device))
 
     def to(self, device) -> "DSparkTargetBatch":
         """Move graph inputs while retaining the host-owned snapshot map."""
@@ -177,6 +196,9 @@ class DSparkTargetBatch:
             host_slot_generations=self.host_slot_generations,
             host_round_generation=self.host_round_generation,
             state_capacity=self.state_capacity,
+            query_bucket_rows=self.query_bucket_rows,
+            query_indices=None if self.query_indices is None else self.query_indices.to(device),
+            query_valid=None if self.query_valid is None else self.query_valid.to(device),
         )
 
     @classmethod
@@ -468,6 +490,44 @@ class _RowSnapshot:
     # Each index maps to (request_index, row_inside_request) owners.  A row is
     # retained when any owner is inside the verifier's accepted prefix.
     owners: tuple[tuple[tuple[int, int], ...], ...]
+    # One combined I64 ``[2, rows, width]`` tensor: plane 0 is the owner
+    # request lane, plane 1 the row inside that request.  Padding owners use
+    # query ``TARGET_ROWS_PER_REQUEST``, which no count in 0..6 can retain, so
+    # no separate validity mask is needed.  Identical owner layouts share one
+    # tensor (see :meth:`DSparkTargetSnapshot.prepare_device_restore`).
+    device_owners: torch.Tensor | None = None
+
+    @staticmethod
+    def build_device_owners(owners, device) -> torch.Tensor:
+        width = max(1, max((len(row) for row in owners), default=0))
+        requests, queries = [], []
+        for row in owners:
+            padding = width - len(row)
+            requests.extend([request for request, _query in row] + [0] * padding)
+            queries.extend([query for _request, query in row] + [TARGET_ROWS_PER_REQUEST] * padding)
+        return torch.tensor(requests + queries, dtype=torch.int64, device=device).reshape(2, len(owners), width)
+
+    def prepare_device_restore(self, cache: dict | None = None):
+        device = self.indices.device
+        if cache is None:
+            self.device_owners = self.build_device_owners(self.owners, device)
+            return
+        key = (self.owners, device)
+        tensor = cache.get(key)
+        if tensor is None:
+            tensor = cache[key] = self.build_device_owners(self.owners, device)
+        self.device_owners = tensor
+
+    def restore_device(self, committed):
+        if self.device_owners is None:
+            raise RuntimeError("target snapshot device ownership must be prepared before execution")
+        requests, queries = self.device_owners[0], self.device_owners[1]
+        limits = committed.index_select(0, requests.reshape(-1)).reshape(requests.shape)
+        retained = (queries < limits).any(dim=1)
+        current = self.destination.index_select(0, self.indices)
+        shape = (retained.shape[0], ) + (1, ) * (self.values.ndim - 1)
+        restored = torch.where(retained.reshape(shape), current, self.values)
+        self.destination.index_copy_(0, self.indices, restored)
 
     def restore(self, committed=None) -> None:
         keep = self.indices
@@ -503,6 +563,32 @@ class DSparkTargetSnapshot:
                 raise ValueError("committed lengths must be in 0..6")
         for row in self.rows:
             row.restore(committed)
+
+    def prepare_device_restore(self):
+        """Upload owner layouts once per distinct ``(owners, device)`` layout.
+
+        SWA/history/page rows of every layer usually share one owner layout,
+        so a round performs one small H2D copy per layout rather than per row.
+        """
+        cache: dict = {}
+        for row in self.rows:
+            row.prepare_device_restore(cache)
+
+    def restore_device(self, committed):
+        if (not isinstance(committed, torch.Tensor) or committed.shape != (self.capacity, )
+                or committed.dtype not in (torch.int32, torch.int64)):
+            raise ValueError("device target restore requires integer accepted counts for every target lane")
+        if any(committed.device != row.indices.device for row in self.rows):
+            raise ValueError("device target restore counts must share the snapshot device")
+        # A malformed count cannot authorize tentative state retention, so any
+        # out-of-range count rolls back every lane (safe fallback).  This path
+        # cannot raise without a host readback; the host finish
+        # (DSparkPackedTargetStages.finish) is the authority that detects the
+        # same counts, read back from the [N,16] record, and fails the round.
+        valid = ((committed >= 0) & (committed <= TARGET_ROWS_PER_REQUEST)).all()
+        safe_counts = torch.where(valid, committed, torch.zeros_like(committed))
+        for row in self.rows:
+            row.restore_device(safe_counts)
 
     @classmethod
     def capture(cls, program, batch: DSparkTargetBatch) -> "DSparkTargetSnapshot":
@@ -603,12 +689,371 @@ class DSparkTargetSnapshot:
         return cls(tuple(snapshots), total_bytes, batch.batch_capacity)
 
 
+# Stable (N, B) snapshot layout.  Entry ``e`` of every layout group is the
+# physical target row ``e`` (owner lane ``e // 6``, query ``e % 6``), so every
+# shape depends only on the state capacity N and the execution bucket B.
+_STABLE_PADDING_QUERY = TARGET_ROWS_PER_REQUEST
+
+
+def _stable_target_destinations(program):
+    """Return the target write set as ``((destination, (kind, parameter)), ...)``.
+
+    The order and predicates mirror :meth:`DSparkTargetSnapshot.capture`.
+    """
+    entries = []
+    for layer in getattr(program, "layers", ()):
+        attention = getattr(layer, "attention", None)
+        state = getattr(attention, "batch_state", None)
+        if state is None:
+            continue
+        entries.append((state.swa, ("swa", _SWA_ROWS)))
+        if hasattr(state, "kv_history"):
+            entries.append((state.kv_history, ("history", _HISTORY_ROWS)))
+            entries.append((state.score_history, ("history", _HISTORY_ROWS)))
+    shared = getattr(program, "shared", None)
+    if shared is not None:
+        for cache in getattr(shared, "sources", {}).values():
+            ratio = int(getattr(cache, "ratio", 1))
+            if ratio < 1:
+                continue
+            if ratio > _PAGE_TOKENS:
+                raise ValueError("stable target snapshot requires compressed ratios in 1..128")
+            entries.append((cache.main, ("page", ratio)))
+            entries.append((cache.index, ("page", ratio)))
+    return tuple((destination, kind) for destination, kind in entries if destination.ndim)
+
+
+def stable_target_restore_layout(positions, row_slots, row_valid, row_pages, groups):
+    """Return fixed ``[G, 6B]`` destination rows and owner queries on device.
+
+    Pure tensor function of the target batch's existing device metadata.  Real
+    entries are exactly the rows the target writes (the predicates of
+    :meth:`DSparkTargetSnapshot.capture` and the batch attention publication).
+    Every other entry is padding: destination row 0 and owner query 6, which
+    no accepted count in 0..6 can retain.
+    """
+    rows = positions.shape[0]
+    device = positions.device
+    query = torch.arange(rows, dtype=torch.int64, device=device).remainder(TARGET_ROWS_PER_REQUEST)
+    position = positions.to(torch.int64)
+    slot = row_slots.to(torch.int64)
+    live = row_valid.to(torch.bool) & (position >= 0) & (slot >= 0)
+    safe_position = position.clamp_min(0)
+    safe_slot = slot.clamp_min(0)
+    pages = row_pages.to(torch.int32)
+    page_count = pages.shape[1]
+    padding_query = torch.full_like(query, _STABLE_PADDING_QUERY)
+    indices, queries = [], []
+    for kind, parameter, limit in groups:
+        if kind == "page":
+            width = _PAGE_TOKENS // parameter
+            logical = torch.div(safe_position, parameter, rounding_mode="floor")
+            page_slot = torch.div(logical, width, rounding_mode="floor")
+            # Gather the I32 page table and widen afterwards: an eager HPU
+            # gather over I64 data fails graph compilation (synStatus 26).
+            page = pages.gather(1, page_slot.clamp_max(page_count - 1).unsqueeze(1)).squeeze(1).to(torch.int64)
+            index = page * width + logical.remainder(width)
+            real = live & ((safe_position + 1).remainder(parameter) == 0) & (page_slot < page_count)
+        else:
+            index = safe_slot * parameter + safe_position.remainder(parameter)
+            real = live
+        real = real & (index >= 0) & (index < limit)
+        indices.append(torch.where(real, index, torch.zeros_like(index)))
+        queries.append(torch.where(real, query, padding_query))
+    if not indices:
+        empty = torch.zeros((0, rows), dtype=torch.int64, device=device)
+        return empty, empty.clone()
+    return torch.stack(indices), torch.stack(queries)
+
+
+def capture_stable_target_rows(positions, row_slots, row_valid, row_pages, request_slots, groups, indices,
+                               owners, lane_map, destinations, saved, destination_groups):
+    """Write one round's layout and saved rows into persistent buffers in place.
+
+    Buffers may be larger than the round's ``6*B`` rows (the fused restore
+    always uses the ``6*N`` storage); the static tail becomes padding: row 0,
+    owner query 6, lane -1, and saved bytes read from row 0 like any padding.
+    """
+    layout_indices, layout_queries = stable_target_restore_layout(positions, row_slots, row_valid, row_pages,
+                                                                  groups)
+    padding = indices.shape[1] - layout_indices.shape[1]
+    if padding:
+        layout_indices = torch.cat((layout_indices, layout_indices.new_zeros((layout_indices.shape[0], padding))), 1)
+        layout_queries = torch.cat(
+            (layout_queries, layout_queries.new_full((layout_queries.shape[0], padding), _STABLE_PADDING_QUERY)), 1)
+    indices.copy_(layout_indices)
+    owners[1].copy_(layout_queries)
+    slots = request_slots.to(torch.int64)
+    lanes = torch.where(slots >= 0, slots, torch.full_like(slots, -1))
+    if lane_map.shape[0] != lanes.shape[0]:
+        lanes = torch.cat((lanes, lanes.new_full((lane_map.shape[0] - lanes.shape[0], ), -1)))
+    lane_map.copy_(lanes)
+    for destination, values, group in zip(destinations, saved, destination_groups):
+        values.copy_(destination.index_select(0, indices[group]))
+
+
+def _restore_stable_target_lanes(limits, indices, owners, destinations, saved, destination_groups, *,
+                                 native_writes=False):
+    """Apply accepted-prefix rollback for B-lane limits over the fixed layout.
+
+    A destination row is rolled back iff some real entry writes it and no real
+    entry for that row is inside its owner's accepted prefix; this is the
+    "any owner accepted keeps the row" rule of :class:`_RowSnapshot`.  The
+    decision is reduced over equal destination rows, so repeated rows (shared
+    owners or padding at row 0) all write identical bytes: padding not sharing
+    a real row writes back its current value.
+
+    ``native_writes`` (compiled HPU graphs) uses the qualified native state
+    writer instead of ``index_copy_`` on a graph input: only the first real
+    entry of each rolled-back row writes its saved bytes, every other entry is
+    a ``-1`` no-write row, so there are no duplicate destinations at all.
+    Both variants leave bit-identical state.  Returns a completion tensor.
+    """
+    requests, queries = owners[0], owners[1]
+    real = queries < _STABLE_PADDING_QUERY
+    accepted = queries < limits.index_select(0, requests.reshape(-1)).reshape(requests.shape)
+    plans = {}
+    completions = []
+    for destination, values, group in zip(destinations, saved, destination_groups):
+        plan = plans.get(group)
+        if plan is None:
+            index = indices[group]
+            real_rows = real[group]
+            same = index.unsqueeze(1) == index.unsqueeze(0)
+            owned = (same & real_rows.unsqueeze(0)).any(1)
+            kept = (same & accepted[group].unsqueeze(0)).any(1)
+            rollback = owned & ~kept
+            rows = None
+            if native_writes:
+                order = torch.arange(index.shape[0], device=index.device)
+                earlier = (same & real_rows.unsqueeze(0) & (order.unsqueeze(0) < order.unsqueeze(1))).any(1)
+                rows = torch.where(rollback & real_rows & ~earlier, index, torch.full_like(index, -1))
+                rows = rows.to(torch.int32)
+            plan = plans[group] = (index, rollback, rows)
+        index, rollback, rows = plan
+        if rows is not None:
+            from vllm_gaudi.ops.deepseek_v41_batch_attention import write_state_rows
+
+            completions.append(write_state_rows(destination, values, rows).to(torch.int32).amax())
+            continue
+        current = destination.index_select(0, index)
+        shape = (index.shape[0], ) + (1, ) * (destination.ndim - 1)
+        destination.index_copy_(0, index, torch.where(rollback.reshape(shape), values, current))
+    if completions:
+        return torch.stack(completions).amax()
+    return torch.zeros((), dtype=torch.int32, device=limits.device)
+
+
+def restore_stable_target_rows(counts, lane_map, indices, owners, destinations, saved, destination_groups, *,
+                               native_writes=False):
+    """Map full state-capacity counts to B lanes and restore target rows.
+
+    Pure tensor entry for the device target finish: no host reads, no Python
+    scalars derived from tensors and no data-dependent Python branch.  Shapes
+    depend only on ``(N, B)`` and the program's fixed destination set.  Any
+    out-of-range count rolls back every lane (the host finish rejects the
+    same counts after readback).  Returns a completion tensor.
+    """
+    in_range = ((counts >= 0) & (counts <= TARGET_ROWS_PER_REQUEST)).all()
+    counts = counts.to(torch.int64)
+    safe_counts = torch.where(in_range, counts, torch.zeros_like(counts))
+    limits = torch.where(lane_map >= 0, safe_counts.index_select(0, lane_map.clamp_min(0)),
+                         torch.zeros_like(lane_map))
+    return _restore_stable_target_lanes(limits, indices, owners, destinations, saved, destination_groups,
+                                        native_writes=native_writes)
+
+
+class DSparkStableTargetLayout:
+    """Persistent fixed-shape target snapshot storage for one state capacity N.
+
+    All buffers are allocated once for ``6*N`` entries; an execution bucket B
+    uses ``[:6*B]`` views (see :meth:`view`).  Only one round may own the
+    storage at a time, matching the runner's single in-flight transaction.
+    """
+
+    def __init__(self, program, state_capacity: int, *, device=None):
+        validate_dspark_capacity(state_capacity, allow_serial=True, name="target state capacity")
+        destinations = _stable_target_destinations(program)
+        if len({id(destination) for destination, _kind in destinations}) != len(destinations):
+            raise ValueError("stable target snapshot requires each state tensor in exactly one layout")
+        devices = {destination.device for destination, _kind in destinations}
+        if len(devices) > 1:
+            raise ValueError("stable target snapshot state tensors must share one device")
+        device = devices.pop() if devices else torch.device("cpu" if device is None else device)
+        groups: list[tuple[str, int, int]] = []
+        destination_groups = []
+        for destination, (kind, parameter) in destinations:
+            key = (kind, parameter, int(destination.shape[0]))
+            if key not in groups:
+                groups.append(key)
+            destination_groups.append(groups.index(key))
+        entries = state_capacity * TARGET_ROWS_PER_REQUEST
+        self.program = program
+        self.state_capacity = state_capacity
+        self.device = device
+        self.destinations = tuple(destination for destination, _kind in destinations)
+        self.groups = tuple(groups)
+        self.destination_groups = tuple(destination_groups)
+        self.signature = self._signature(destinations)
+        self.indices = torch.zeros((len(groups), entries), dtype=torch.int64, device=device)
+        self.owners = torch.empty((2, len(groups), entries), dtype=torch.int64, device=device)
+        lanes = torch.div(torch.arange(entries, dtype=torch.int64), TARGET_ROWS_PER_REQUEST, rounding_mode="floor")
+        self.owners[0].copy_(lanes.expand(len(groups), entries))
+        self.owners[1].fill_(_STABLE_PADDING_QUERY)
+        self.lane_map = torch.full((state_capacity, ), -1, dtype=torch.int64, device=device)
+        self.zero_limits = torch.zeros((state_capacity, ), dtype=torch.int64, device=device)
+        self.saved = tuple(
+            torch.empty((entries, *destination.shape[1:]), dtype=destination.dtype, device=destination.device)
+            for destination in self.destinations)
+        self.owner = None
+        self.views: dict[tuple[int, bool], DSparkStableTargetSnapshot] = {}
+        self._compiled: dict[str, Callable] = {}
+
+    def _run(self, name, function, *args, **kwargs):
+        """Run a pure-tensor layout step; HPU uses one compiled graph per view.
+
+        Each eager HPU launch costs about as much as the whole step's device
+        work (dozens of small index ops per round), so HPU compiles the step
+        once per ``(B, padded)`` view shape.  All variants share one code
+        object, so the recompile budget covers every cached view.
+        """
+        if self.device.type != "hpu":
+            return function(*args, **kwargs)
+        compiled = self._compiled.get(name)
+        if compiled is None:
+            compiled = self._compiled[name] = torch.compile(function, backend="hpu_backend", fullgraph=True,
+                                                            dynamic=False)
+        limit = max(torch._dynamo.config.recompile_limit, len(self.views) + 1)
+        with torch._dynamo.config.patch(recompile_limit=limit):
+            return compiled(*args, **kwargs)
+
+    @staticmethod
+    def _signature(destinations):
+        return tuple((id(destination), tuple(destination.shape), destination.dtype, kind)
+                     for destination, kind in destinations)
+
+    def matches(self, program) -> bool:
+        """Return whether ``program`` still binds the same state tensors."""
+        return program is self.program and self._signature(_stable_target_destinations(program)) == self.signature
+
+    @property
+    def bytes(self) -> int:
+        return sum(values.numel() * values.element_size() for values in self.saved)
+
+    def view(self, batch_capacity: int, *, padded: bool = False) -> "DSparkStableTargetSnapshot":
+        """Return the cached view for bucket B.
+
+        ``padded`` views span the full ``6*N`` storage for every B, so a
+        consumer compiled once per N (the fused draft transaction) sees the
+        same tensor arguments whichever target bucket ran.
+        """
+        key = (batch_capacity, bool(padded))
+        view = self.views.get(key)
+        if view is None:
+            view = self.views[key] = DSparkStableTargetSnapshot(self, batch_capacity, padded=bool(padded))
+        return view
+
+
+class DSparkStableTargetSnapshot:
+    """Fixed ``(N, B)`` snapshot view with :class:`DSparkTargetSnapshot` semantics.
+
+    ``restore_device`` consumes the full state-capacity counts and maps them
+    to B lanes inside :func:`restore_stable_target_rows`; host ``restore``
+    (abort/fallback) uses B-lane counts like the legacy snapshot.
+    """
+
+    def __init__(self, layout: DSparkStableTargetLayout, batch_capacity: int, *, padded: bool = False):
+        validate_dspark_capacity(batch_capacity, allow_serial=True, name="target execution capacity")
+        if batch_capacity > layout.state_capacity:
+            raise ValueError("target execution capacity must fit the state capacity")
+        lanes = layout.state_capacity if padded else batch_capacity
+        entries = lanes * TARGET_ROWS_PER_REQUEST
+        self.layout = layout
+        self.capacity = batch_capacity
+        self.padded = padded
+        self.state_capacity = layout.state_capacity
+        self.indices = layout.indices[:, :entries]
+        self.owners = layout.owners[:, :, :entries]
+        self.lane_map = layout.lane_map[:lanes]
+        self.zero_limits = layout.zero_limits[:lanes]
+        self.saved = tuple(values[:entries] for values in layout.saved)
+        self.bytes = sum(values.numel() * values.element_size() for values in self.saved)
+        self.captured = False
+
+    def restore_arguments(self):
+        """Tensor arguments of :func:`restore_stable_target_rows` after ``counts``."""
+        layout = self.layout
+        return (self.lane_map, self.indices, self.owners, layout.destinations, self.saved,
+                layout.destination_groups)
+
+    def capture(self, batch: DSparkTargetBatch, source_lanes) -> None:
+        layout = self.layout
+        if layout.owner is not None:
+            raise RuntimeError("stable target snapshot is still owned by an unfinished round")
+        if batch.batch_capacity != self.capacity or batch.row_valid.numel() != target_rows_for_capacity(self.capacity):
+            raise ValueError("stable target snapshot rows disagree with the execution bucket")
+        if batch.positions.device != layout.device:
+            raise ValueError("stable target snapshot requires batch metadata on the state device")
+        source_lanes = tuple(source_lanes)
+        if len(source_lanes) != self.capacity:
+            raise ValueError("stable target snapshot requires one source lane per execution lane")
+        # The device lane map is the target's own request-slot tensor.  It is
+        # authoritative only while state lane == logical slot, which the
+        # runner's canonical plan guarantees; verify that on host tuples.
+        for lane, (active, slot) in enumerate(zip(batch.host_request_active, batch.host_request_slots,
+                                                  strict=True)):
+            if active and source_lanes[lane] != slot:
+                raise ValueError("stable target snapshot requires state lane == logical slot for active lanes")
+        layout._run("capture", capture_stable_target_rows, batch.positions, batch.row_slots, batch.row_valid,
+                    batch.row_pages, batch.request_slots, layout.groups, self.indices, self.owners, self.lane_map,
+                    layout.destinations, self.saved, layout.destination_groups)
+        layout.owner = self
+        self.captured = True
+
+    def _require_captured(self):
+        if not self.captured or self.layout.owner is not self:
+            raise RuntimeError("stable target snapshot has no captured round")
+
+    def restore(self, committed=None) -> None:
+        self._require_captured()
+        if committed is None:
+            committed = (0, ) * self.capacity
+        committed = tuple(int(value) for value in committed)
+        if len(committed) != self.capacity:
+            raise ValueError(f"partial target restore requires committed[B={self.capacity}]")
+        if any(value < 0 or value > TARGET_ROWS_PER_REQUEST for value in committed):
+            raise ValueError("committed lengths must be in 0..6")
+        padding = (0, ) * (self.zero_limits.shape[0] - self.capacity)
+        limits = (self.zero_limits if not any(committed) else
+                  torch.tensor(committed + padding, dtype=torch.int64, device=self.layout.device))
+        _restore_stable_target_lanes(limits, self.indices, self.owners, self.layout.destinations, self.saved,
+                                     self.layout.destination_groups)
+
+    def restore_device(self, committed) -> None:
+        self._require_captured()
+        if (not isinstance(committed, torch.Tensor) or committed.shape != (self.state_capacity, )
+                or committed.dtype not in (torch.int32, torch.int64)):
+            raise ValueError("stable device target restore requires integer counts for every state lane")
+        if committed.device != self.layout.device:
+            raise ValueError("device target restore counts must share the snapshot device")
+        # HPU compiled graphs write through the native state writer, like the
+        # fused transaction; both variants leave bit-identical state.
+        native = self.layout.device.type == "hpu"
+        self.layout._run("restore", restore_stable_target_rows, committed, *self.restore_arguments(),
+                         native_writes=native)
+
+    def release(self) -> None:
+        if self.layout.owner is self:
+            self.layout.owner = None
+        self.captured = False
+
+
 @dataclass(frozen=True)
 class DSparkTargetTicket:
     """Round identity plus the state snapshot owned by the target transaction."""
 
     batch: DSparkTargetBatch
-    snapshot: DSparkTargetSnapshot
+    snapshot: DSparkTargetSnapshot | DSparkStableTargetSnapshot
 
     @property
     def round_generation(self) -> int:
@@ -816,6 +1261,8 @@ def initialize_target_batch_state(program, capacity: int | None = None):
 
 
 __all__ = [
+    "DSparkStableTargetLayout",
+    "DSparkStableTargetSnapshot",
     "DSparkTargetBatch",
     "DSparkTargetSnapshot",
     "DSparkTargetTicket",
@@ -823,6 +1270,7 @@ __all__ = [
     "TARGET_REQUEST_OFFSETS",
     "TARGET_ROWS",
     "TARGET_ROWS_PER_REQUEST",
+    "capture_stable_target_rows",
     "compressor_sequence_slot_masked",
     "compressor_sequence_slot_native_mix",
     "compressor_sequence_slot_publish_read",
@@ -830,7 +1278,9 @@ __all__ = [
     "compressor_sequence_slot_torch_mix",
     "initialize_target_batch_state",
     "make_target_ticket",
+    "restore_stable_target_rows",
     "select_compressor_norm_by_request_length",
+    "stable_target_restore_layout",
     "target_request_offsets",
     "target_rows_for_capacity",
 ]

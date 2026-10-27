@@ -257,14 +257,13 @@ def test_transaction_uses_capacity_shaped_contracts(monkeypatch, capacity, activ
     class Round:
         batch_capacity = capacity
 
-        def __call__(self, anchors, positions, slots, active, *, context_done=None):
-            round_calls.append((
-                tuple(anchors.shape),
-                tuple(positions.shape),
-                tuple(slots.shape),
-                tuple(active.shape),
-                context_done,
-            ))
+        def __init__(self):
+            self.speculator = self
+
+        def propose_after_verify(self, states, positions, slots, committed, output, output_count,
+                                 draft_enabled, active, status):
+            round_calls.append((states.shape, positions.shape, slots.shape, active.shape,
+                                committed.clone(), output_count.clone(), status.clone()))
             return torch.full((capacity, 5), 77, dtype=torch.int64), torch.zeros((capacity, 5))
 
     monkeypatch.setattr(draft_batch, "PackedDraftRound", lambda *args, **kwargs: Round())
@@ -316,8 +315,10 @@ def test_transaction_uses_capacity_shaped_contracts(monkeypatch, capacity, activ
     assert proposals.shape == (capacity, 5)
     assert len(round_calls) == 1
     assert round_calls[0][:4] == (
-        (capacity, 1), (capacity, 5), (capacity, ), (capacity, ))
-    assert round_calls[0][4] is context_done
+        (capacity, 6, 8), (capacity, 6), (capacity, ), (capacity, ))
+    assert round_calls[0][4].tolist() == [6] * capacity
+    assert round_calls[0][5].tolist() == [6] * capacity
+    assert round_calls[0][6].tolist() == [0] * capacity
 
 
 @pytest.mark.parametrize("prepared_rows", [15, 30, 40, 55, 80, 320])
@@ -563,3 +564,86 @@ def test_legacy_custom_stage_component_stays_compatible_on_cpu():
 
     assert hidden is anchors and logits is anchors
     assert calls == [(anchors, positions, slots, active)]
+
+
+class _ValidatingCpuRing:
+    """CPU ring double that keeps the real record validation.
+
+    The production ring pins host buffers for HPU and therefore needs an
+    acquirable device; this double exercises the same acquire/stage/consume
+    contract with plain host tensors.
+    """
+
+    def __init__(self, capacity):
+        self.batch_capacity = capacity
+        self.kwargs = None
+
+    def acquire(self, **kwargs):
+        self.kwargs = kwargs
+        return SimpleNamespace(
+            record=torch.empty((self.batch_capacity, 16), dtype=torch.int64),
+            host=torch.empty((self.batch_capacity, 16), dtype=torch.int64),
+            completion=SimpleNamespace(query=lambda: True),
+        )
+
+    def stage(self, ticket):
+        ticket.host.copy_(ticket.record)
+
+    def consume(self, ticket):
+        return validate_batch_records(
+            ticket.host,
+            round_generation=self.kwargs["round_generation"],
+            request_slots=self.kwargs["request_slots"],
+            slot_generations=self.kwargs["slot_generations"],
+            max_committed=self.kwargs["max_committed"],
+            active=self.kwargs["active"],
+        )
+
+    def release(self, ticket):
+        pass
+
+    def abort(self, ticket):
+        pass
+
+
+@pytest.mark.parametrize("capacity,enabled,bucket", [(11, True, 4), (32, True, 4), (11, False, 11)])
+def test_draft_stage_selects_bounded_transactions_and_keeps_full_commit_records(
+        monkeypatch, capacity, enabled, bucket):
+    calls = []
+
+    class Transaction:
+        def __init__(self, draft, state, *, batch_capacity, execution_capacity=None):
+            self.batch_capacity = batch_capacity
+            self.execution_capacity = execution_capacity or batch_capacity
+            self.graph_key = (batch_capacity, self.execution_capacity)
+            self.compiled = None
+
+        def __call__(self, target_ids, states, positions, slots, control, proposals, active, sidecar,
+                     execution_lanes=None):
+            calls.append((self.execution_capacity, None if execution_lanes is None else execution_lanes.tolist()))
+            _, output, committed, output_count, _, draft_enabled, status = (
+                draft_batch.verify_control_from_target_batch(target_ids, proposals, control, active, sidecar))
+            draft_active = draft_enabled & active & (status == 0)
+            proposed = torch.where(draft_active[:, None], torch.full((capacity, 5), 77, dtype=torch.int64), -1)
+            record = draft_batch.pack_record_batch(
+                control, committed, output_count, output, proposed, draft_active, status, sidecar)
+            assert record.shape == (capacity, 16)
+            return record, committed, output, output_count, proposed, status
+
+    monkeypatch.setattr(draft_batch, "PackedDraftTransaction", Transaction)
+    active = tuple(lane in (3, capacity - 1) for lane in range(capacity))
+    stage = draft_batch.DSparkBatchDraftStage(
+        SimpleNamespace(), batch_state=SimpleNamespace(capacity=capacity), batch_capacity=capacity,
+        verify_ring=_ValidatingCpuRing(capacity),
+        max_model_len=1024, target_ids=lambda target, size: target.token_ids,
+        target_context=lambda target, positions: target.states)
+    stage.configure_execution_buckets(enabled, buckets=(4, ))
+    result = stage.verify_and_propose(_metadata(capacity, active), _target(capacity, active))
+    assert stage.transaction is stage.transactions[capacity]
+    assert stage.last_execution_plan.graph_key == (capacity, bucket)
+    assert calls[0][0] == bucket
+    expected_sources = [3, capacity - 1, 0, 1] if enabled else None
+    assert calls[0][1] == expected_sources
+    assert len(result.output_token_ids) == len(result.draft_token_ids) == capacity
+    assert all(result.draft_token_ids[lane] == () for lane in range(capacity) if not active[lane])
+    assert all(len(result.draft_token_ids[lane]) == 5 for lane in range(capacity) if active[lane])

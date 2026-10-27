@@ -615,3 +615,112 @@ to `false`. The runtime retains request-slot and draft-ring handoffs when
 switching between these execution backends. Queued device-round controls and
 models without native replay keep the existing packed policy. DSpark and its
 speculative-token configuration remain enabled.
+
+### Upstream DSpark speculator bridge
+
+The packed TP8 draft sampler uses the plugin's `HPUDSparkSpeculator` adapter,
+which inherits vLLM's `_generate_draft` and `_sample_sequential` methods directly.
+No engine source changes are required for this adapter. The HPU hooks retain
+local vocabulary shards and the existing tensor-parallel greedy argmax.
+Inactive rows feed token zero internally and publish proposal ID `-1`.
+
+The transaction retains verification and commit-record packing. The speculator
+commits accepted target context, builds draft inputs, and calls the existing
+`PackedDraftBackbone` from its `_run_model` hook before invoking the inherited
+sampling methods. The context completion tensors remain explicit dependencies
+of draft attention. The cached-input entry remains available for standalone
+sampler diagnostics. This does not replace the full GPU `DFlash.propose` path,
+request-state ownership, or HPU graph management. The bridge supports the
+existing five-token greedy profile; probabilistic and top-k drafting remain
+outside its scope. Confidence values preserve the transaction interface without
+enabling adaptive acceptance.
+
+Draft execution buckets are independent of target buckets and persistent state
+capacity. `dsv41_dspark_draft_buckets` defaults to `true`, and
+`dsv41_dspark_draft_warmup_buckets` defaults to `[1, 2, 4, 8, 16, 32, 64]`.
+The plugin always includes the configured request capacity as a fallback,
+including non-power-of-two capacities. Disabling active metadata forces the
+full-capacity draft layout. Set `dsv41_dspark_draft_buckets` to `false` for the
+same fallback explicitly.
+
+A transaction still verifies N lanes and returns an `[N, 16]` record. Only the
+draft model and sampler execute B lanes, with five query rows per lane. Device
+gather/scatter preserves logical slots and inactive no-write behavior; persistent
+SWA rings keep N slots. Internal dense-kernel padding is independent of this
+query-row count. Graphs are bounded by `(N, B)`, and warmup covers the target
+and draft bucket sets independently. Round traces report `draft_execution_capacity`,
+`draft_execution_slots`, `draft_source_lanes`, `draft_graph_key`, and the actual
+`5 * B` draft query rows. These changes require device validation before making
+performance claims.
+
+
+### Experimental target query and scheduling controls
+
+The following additional-config controls default to disabled and require
+qualification before performance claims:
+
+| Control | Default | Scope |
+|---|---|---|
+| `dsv41_dspark_target_query_buckets` | `false` | Compact QKV/index/MLA query rows while retaining C6 body math |
+| `dsv41_dspark_target_query_warmup_buckets` | `[1, 8, 32, 128]` | Query row buckets, with a full `6B` fallback for each request bucket |
+| `dsv41_dspark_device_target_finish` | `false` | Restore target accepted-prefix state using device counts before record readback |
+| `dsv41_dspark_device_owner_layout` | `false` | Keep the target snapshot in persistent `(N, B)` device buffers derived from target metadata; requires device target finish |
+| `dsv41_dspark_target_ragged_compressor` | `false` | Run stateless compressor projections on compact query rows; requires target query buckets |
+| `dsv41_dspark_fused_target_restore` | `false` | Restore the target accepted prefix inside the packed draft transaction graph; requires the device owner layout |
+| `dsv41_dspark_draft_packed_inputs` | `false` | Upload the per-round draft control, proposal, slot, activity, sidecar and lane inputs through three fixed typed host-to-device copies |
+| `dsv41_dspark_separate_query_pass` | `false` | Exclude separate draft input rows from the synchronous scheduler admission budget |
+
+Query compaction preserves the masked compressor, mHC/MoE, Engram, output
+projection, auxiliary states and verification layout. It is not full target
+ragged execution. Traces distinguish C6 body rows from `target_query_rows`
+and `target_query_bucket_rows`, and warmup covers reachable request/query
+bucket pairs. The compact attention path uses dense MLA rather than the
+complete-tile N32 sparse plan.
+
+Device target finish requires the standard packed draft transaction. The host
+still owns Engram completion, request publication and error rollback. This
+control does not combine the target, draft and finish into one captured graph.
+
+The device owner layout derives restore rows and owner queries on device from
+the target batch metadata, so it adds no per-round host-to-device copies, and
+exposes the restore as a pure tensor function whose shapes depend only on the
+state capacity and execution bucket. On HPU the capture and the device restore
+each run as one compiled graph per execution bucket and padding mode (compiled
+during warmup; the restore writes through the native state-row writer), still
+outside the draft transaction graph. Out-of-range counts on any state lane roll
+back the whole round; the host finish still validates the read-back counts and
+aborts.
+
+The fused target restore runs the same pure tensor restore inside the packed
+draft transaction graph, after the commit record is packed and before host
+readback, using the committed counts carried by the record. All target
+execution buckets share the full state-capacity snapshot storage, so the
+transaction graph key remains the state capacity and draft execution bucket.
+On HPU the restore uses the native state-row writer with one write per rolled
+back row. The restore only reads the saved rows, so the host abort can always
+return to the captured state.
+
+Packed draft inputs fill three fixed typed host vectors (pinned only on HPU):
+int64 `[13N + B]` for control, proposals, start positions and execution lanes,
+int32 `[3N]` for slots and sidecars, and bool `[N]` for activity. Each is copied
+once to a persistent device buffer, and the device views already have the
+dtypes of the separate uploads they replace, so no device-side cast runs.
+
+The ragged compressor runs the non-ratio-two `wkv` projection, indexer
+projection, RoPE and FP4 packing on compact query rows only. The ratio-two
+FP32 input projection keeps the fixed `6N` rows because its HPU GEMM results
+depend on the row count and feed persistent history; with that, the ratio-two
+layers matched the C6 compressor bit for bit in op-level HPU checks. The
+stateful lane-local history update, mixing and norm selection keep the fixed
+`[N, 6]` layout, and cache writes keep the `6N` row identifiers. The
+remaining compact-row BF16 projection can still differ from C6 in rare
+last-bit cases, like a change of execution bucket. mHC, MoE, Engram, output
+projection, auxiliary states and verification remain C6.
+
+The separate-query scheduler is restricted to synchronous, prefix-off TP8/PP1
+DSpark batches with capacity 2–64 and five speculative tokens. A scheduler-local
+view excludes redundant draft input reservations while retaining five KV
+lookahead slots and the original engine configuration. It restores the original
+configuration reference after successful or failed scheduling and rejects an
+explicitly configured foreign scheduler. Engine-wide configuration guards remain
+unchanged; this is not an upgrade of the entire engine scheduling protocol.

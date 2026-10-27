@@ -139,6 +139,45 @@ class _DraftStage:
         )
 
 
+class _BucketedDraftStage(_DraftStage):
+    def __init__(self, *, capacity, buckets, fail=False):
+        super().__init__(capacity=capacity, fail=fail)
+        self.execution_buckets = tuple(buckets)
+        self.transactions = {
+            bucket: SimpleNamespace(
+                compiled=None,
+                batch_capacity=capacity,
+                execution_capacity=bucket,
+            )
+            for bucket in buckets
+        }
+        self.transaction = self.transactions[capacity]
+        self.last_execution_plan = None
+        self.graph_key = (capacity, capacity)
+        self.executed_buckets = []
+
+    def verify_and_propose(self, metadata, target):
+        active_lanes = tuple(lane for lane, active in enumerate(metadata.request_active.tolist()) if active)
+        execution_capacity = next(bucket for bucket in self.execution_buckets if bucket >= len(active_lanes))
+        result = super().verify_and_propose(metadata, target)
+        inactive_lanes = tuple(lane for lane in range(self.batch_capacity) if lane not in active_lanes)
+        padding = execution_capacity - len(active_lanes)
+        source_lanes = (tuple(range(self.batch_capacity)) if execution_capacity == self.batch_capacity else
+                        active_lanes + inactive_lanes[:padding])
+        self.last_execution_plan = SimpleNamespace(
+            state_capacity=self.batch_capacity,
+            execution_capacity=execution_capacity,
+            source_lanes=source_lanes,
+            logical_slots=tuple(int(metadata.request_slots[lane]) for lane in source_lanes),
+        )
+        self.graph_key = (self.batch_capacity, execution_capacity)
+        transaction = self.transactions[execution_capacity]
+        if transaction.compiled is None:
+            transaction.compiled = object()
+        self.executed_buckets.append(execution_capacity)
+        return result
+
+
 def _request_factory(req_id, page, token):
     params = SamplingParams(temperature=0, max_tokens=64, ignore_eos=True)
     assert params.temperature == 0 and params.max_tokens == 64 and params.ignore_eos
@@ -159,6 +198,32 @@ def _batch_runner(capacity, *, fail=False):
     engram = _Engram()
     target = _TargetStage(state, engram, capacity)
     draft = _DraftStage(capacity=capacity, fail=fail)
+    runner = DSparkBatchRunner(
+        target,
+        draft,
+        slots=slots,
+        batch_capacity=capacity,
+        trace=SimpleNamespace(write=lambda payload: None),
+    )
+    return runner, target, draft, state, engram
+
+
+def _bucketed_batch_runner(capacity, *, target_buckets, draft_buckets):
+    slots = RequestSlots(capacity)
+    state = _TargetState(slots)
+    engram = _Engram()
+    target = _TargetStage(state, engram, capacity)
+    target.execution_buckets = tuple(target_buckets)
+    original = target.forward_batch
+
+    def forward(metadata, *args):
+        active = int(metadata.request_active.sum())
+        bucket = next(value for value in target.execution_buckets if value >= active)
+        target.stages.setdefault(tuple(range(bucket)), SimpleNamespace(compiled=object()))
+        return original(metadata, *args)
+
+    target.forward_batch = forward
+    draft = _BucketedDraftStage(capacity=capacity, buckets=draft_buckets)
     runner = DSparkBatchRunner(
         target,
         draft,
@@ -252,6 +317,8 @@ def test_n32_warmup_covers_tile_scenarios_and_cleans_all_state():
     capacity = 32
     scenarios = warmup_scenarios(capacity)
     runner, target, draft, state, engram = _batch_runner(capacity)
+    target.execution_buckets = (capacity, )
+    draft.execution_buckets = (1, capacity)
     validated, validate = [], runner.slots.validate_batch_identities
     runner.slots.validate_batch_identities = lambda slots, generations, active: (
         validated.append((slots, generations, active)) or validate(slots, generations, active))
@@ -441,6 +508,143 @@ def test_b2_startup_failure_stops_before_barrier_and_state_clear(monkeypatch):
         runner.warmup_model()
     assert events[-1] == "b2_warmup"
     assert "barrier" not in events and "state_clear" not in events
+
+
+@pytest.mark.parametrize(
+    ("additional", "expected_target", "expected_draft", "error"),
+    (
+        (
+            {},
+            (True, (1, 2, 4, 8, 16, 32, 64)),
+            (True, (1, 2, 4, 8, 16, 32, 64)),
+            None,
+        ),
+        (
+            {
+                "dsv41_dspark_target_warmup_buckets": (1, 2, 4),
+                "dsv41_dspark_draft_warmup_buckets": (1, 4),
+            },
+            (True, (1, 2, 4)),
+            (True, (1, 4)),
+            None,
+        ),
+        (
+            {
+                "dsv41_dspark_active_metadata": False,
+                "dsv41_dspark_draft_buckets": True,
+                "dsv41_dspark_draft_warmup_buckets": (1, 4),
+            },
+            (True, (1, 2, 4, 8, 16, 32, 64)),
+            (False, (1, 4)),
+            None,
+        ),
+        (
+            {
+                "dsv41_dspark_active_metadata": False,
+                "dsv41_dspark_draft_buckets": "false",
+            },
+            None,
+            None,
+            "dsv41_dspark_draft_buckets must be a boolean",
+        ),
+    ),
+)
+def test_runner_configures_independent_draft_buckets(monkeypatch, additional, expected_target, expected_draft, error):
+    from vllm_gaudi.v1.worker import deepseek_v41_runner
+
+    calls = {}
+
+    class Stage:
+        def __init__(self, name):
+            self.name = name
+
+        def configure_execution_buckets(self, enabled, *, buckets):
+            calls[self.name] = (enabled, buckets)
+
+    target, draft = Stage("target"), Stage("draft")
+
+    class Adapter:
+        def __init__(self, target_stage, draft_stage, **kwargs):
+            self.target_stage = target_stage
+            self.draft_stage = draft_stage
+            self.batch_capacity = kwargs["batch_capacity"]
+
+    slots = RequestSlots(4)
+    state = SimpleNamespace(
+        capacity=4,
+        slots=slots,
+        pending=None,
+        single_owner=None,
+        prefill_owner=None,
+    )
+    runner = object.__new__(V41ModelRunner)
+    runner.vllm_config = SimpleNamespace(additional_config=additional)
+    runner.model = SimpleNamespace(
+        batch_state=state,
+        tp_rank=0,
+        pp_rank=0,
+        initialize_dspark_batch=lambda capacity: (target, draft),
+    )
+    monkeypatch.setattr(deepseek_v41_runner, "DSparkBatchRunner", Adapter)
+    monkeypatch.setattr(
+        deepseek_v41_runner,
+        "DSparkBatchTrace",
+        lambda **kwargs: SimpleNamespace(**kwargs),
+    )
+    monkeypatch.setattr(deepseek_v41_runner.dist, "is_initialized", lambda: False)
+
+    if error is not None:
+        with pytest.raises(TypeError, match=error):
+            runner._initialize_dspark_batch_runner(4)
+        assert "draft" not in calls
+        return
+
+    runner._initialize_dspark_batch_runner(4)
+
+    assert calls["target"] == expected_target
+    assert calls["draft"] == expected_draft
+    assert runner.dspark_batch_runner.target_stage is target
+    assert runner.dspark_batch_runner.draft_stage is draft
+
+
+def test_warmup_covers_independent_target_and_draft_bucket_sets():
+    capacity = 8
+    runner, target, draft, _state, _engram = _bucketed_batch_runner(
+        capacity,
+        target_buckets=(1, 2, 8),
+        draft_buckets=(1, 4, 8),
+    )
+
+    runner.warmup(pool_blocks=capacity + 1, max_model_len=8192, request_factory=_request_factory)
+
+    assert target.orders == [
+        tuple(range(capacity)),
+        (capacity - 1, ),
+        (capacity - 1, ),
+        (0, 1),
+        (0, 1, 2, 3),
+    ]
+    # Target stage keys follow target buckets only: the four-lane draft-bucket round executes on target bucket 8,
+    # while partial_gap/reuse_c1 cover target bucket 1.
+    assert set(target.stages) == {tuple(range(bucket)) for bucket in (1, 2, capacity)}
+    assert set(draft.transactions) == {1, 4, 8}
+    assert all(transaction.compiled is not None for transaction in draft.transactions.values())
+    assert draft.transaction is draft.transactions[capacity]
+    assert set(draft.executed_buckets) == {1, 4, 8}
+    assert runner.round_generation == draft.verify_ring.generation == len(target.orders)
+
+
+def test_warmup_rejects_a_mismatched_actual_draft_transaction_bucket():
+    capacity = 8
+    runner, _target, draft, _state, _engram = _bucketed_batch_runner(
+        capacity,
+        target_buckets=(1, 8),
+        draft_buckets=(1, 4, 8),
+    )
+    draft.transactions[4].execution_capacity = 2
+
+    with pytest.raises(RuntimeError, match="draft transaction execution capacity changed"):
+        runner.warmup(pool_blocks=capacity + 1, max_model_len=8192, request_factory=_request_factory)
 
 
 @pytest.mark.parametrize("capacity,buckets", [(32, (1, 32)), (11, (1, 2, 4, 8, 11))])

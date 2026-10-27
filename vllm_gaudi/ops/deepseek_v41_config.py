@@ -201,6 +201,9 @@ def configure(config):
     if not envs.VLLM_HPU_DSV41_PREPARED_SHARDS:
         raise ValueError("V4.1 on HPU requires VLLM_HPU_DSV41_PREPARED_SHARDS=1")
     validate_dspark_tp8_profile(config)
+    from vllm_gaudi.ops.deepseek_v41_scheduling import configure_separate_query_scheduler
+
+    configure_separate_query_scheduler(config)
     from vllm_gaudi.entrypoints.deepseek_v41 import prepare_native_libraries
 
     prepare_native_libraries()

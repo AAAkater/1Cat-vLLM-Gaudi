@@ -81,11 +81,13 @@ class _TargetAttentionCall:
     """
 
     def __init__(self, attention, *, request_lengths: tuple[int, ...], request_slots: tuple[int, ...],
-                 runtime_request_slots: bool = False):
+                 runtime_request_slots: bool = False, ragged_compressor: bool = False):
         self.attention = attention
         self.request_lengths = tuple(request_lengths)
         self.request_slots = tuple(request_slots)
         self.runtime_request_slots = runtime_request_slots
+        # Static compact-query option; the full-body path never receives it.
+        self.ragged_compressor = ragged_compressor
 
     def __call__(
         self,
@@ -100,8 +102,14 @@ class _TargetAttentionCall:
         row_valid,
         ready_outputs,
         tile_indices=None,
+        query_indices=None,
+        query_valid=None,
     ):
         slot_kwargs = {"runtime_request_slots": True} if self.runtime_request_slots else {}
+        if query_indices is not None:
+            slot_kwargs.update(query_indices=query_indices, query_valid=query_valid)
+            if self.ragged_compressor:
+                slot_kwargs["ragged_compressor"] = True
         return self.attention.forward_batch_target(
             value,
             positions,
@@ -140,11 +148,14 @@ class _TargetAttentionFinishAdapter:
     compiled callable.
     """
 
-    def __init__(self, raw_attention, finish_output, active_lanes, tile_indices=None):
+    def __init__(self, raw_attention, finish_output, active_lanes, tile_indices=None,
+                 query_indices=None, query_valid=None):
         self.raw_attention = raw_attention
         self.finish_output = finish_output
         self.active_lanes = tuple(active_lanes)
         self.tile_indices = tile_indices
+        self.query_indices = query_indices
+        self.query_valid = query_valid
 
     def __call__(
         self,
@@ -159,6 +170,8 @@ class _TargetAttentionFinishAdapter:
         row_valid,
         ready_outputs,
     ):
+        query_kwargs = ({} if self.query_indices is None else
+                        {"query_indices": self.query_indices, "query_valid": self.query_valid})
         raw_output, selected, candidates, main_done, index_done = self.raw_attention(
             value,
             positions,
@@ -171,6 +184,7 @@ class _TargetAttentionFinishAdapter:
             row_valid,
             ready_outputs,
             tile_indices=self.tile_indices,
+            **query_kwargs,
         )
         if raw_output.shape[0] % TARGET_ROWS_PER_REQUEST:
             raise ValueError("packed target attention returned a non-lane-aligned result")
@@ -208,7 +222,8 @@ class PreparedTargetBatchLayerGroup(nn.Module):
                  request_lengths: tuple[int, ...],
                  request_slots: tuple[int, ...],
                  text_input: bool = False,
-                 runtime_request_slots: bool = False):
+                 runtime_request_slots: bool = False,
+                 ragged_compressor: bool = False):
         super().__init__()
         if not getattr(stage, "dspark", False):
             raise ValueError("DSpark target batch requires a DSpark prepared stage")
@@ -235,6 +250,7 @@ class PreparedTargetBatchLayerGroup(nn.Module):
                 request_lengths=self.request_lengths,
                 request_slots=self.request_slots,
                 runtime_request_slots=runtime_request_slots,
+                ragged_compressor=ragged_compressor,
             )
             for layer in self.layers
         ) if self.slice_target_layers else ())
@@ -303,12 +319,16 @@ class PreparedTargetBatchLayerGroup(nn.Module):
         *,
         active_lanes=None,
         tile_indices=_AUTO_TARGET_MLA_TILE_PLAN,
+        query_indices=None,
+        query_valid=None,
     ):
         if residual.shape[0] != self.rows or positions.numel() != self.rows:
             raise ValueError(f"DSpark target layer group requires exactly {self.rows} rows")
         lane_indices = (_validated_active_lanes(active_lanes, self.batch_capacity)
                         if self.slice_target_layers else tuple(range(self.batch_capacity)))
         active_lane_set = set(lane_indices)
+        if query_indices is not None:
+            tile_indices = None
         if tile_indices is _AUTO_TARGET_MLA_TILE_PLAN:
             # Standalone group callers retain the convenient auto-plan path.
             # The production stage supplies either one shared tensor or an
@@ -362,6 +382,8 @@ class PreparedTargetBatchLayerGroup(nn.Module):
                     self.output_finish_wrappers[layer_index],
                     lane_indices,
                     tile_indices=tile_indices,
+                    query_indices=query_indices,
+                    query_valid=query_valid,
                 )
                 result = layer.forward_batch_target(
                     *target_args,
@@ -417,7 +439,7 @@ class CompiledTargetBatchStage:
 
     def __init__(self, stage, request_lengths: tuple[int, ...], request_slots: tuple[int, ...], *,
                  backend: str = "hpu_backend", group_size: int = 4,
-                 runtime_request_slots: bool = False):
+                 runtime_request_slots: bool = False, ragged_compressor: bool = False):
         if not getattr(stage, "dspark", False):
             raise ValueError("DSpark target batch requires a DSpark prepared stage")
         if len(stage.layers) % group_size:
@@ -442,6 +464,7 @@ class CompiledTargetBatchStage:
                 request_slots=self.request_slots,
                 text_input=start == 0,
                 runtime_request_slots=runtime_request_slots,
+                ragged_compressor=ragged_compressor,
             )
             for start in range(0, len(stage.layers), group_size)
         ])
@@ -477,6 +500,8 @@ class CompiledTargetBatchStage:
         row_valid,
         engram_rows=(),
         active_lanes=None,
+        query_indices=None,
+        query_valid=None,
     ):
         if hidden.shape[0] != self.rows or positions.numel() != self.rows:
             raise ValueError(f"DSpark target batch requires fixed {self.rows}-row inputs")
@@ -484,10 +509,13 @@ class CompiledTargetBatchStage:
             lane_indices = _validated_active_lanes(active_lanes, self.batch_capacity)
             # This is the sole tile-plan H2D for the round.  Every layer in
             # every group receives the same runtime tensor (or explicit None).
-            tile_indices = self._target_mla_tile_indices(lane_indices, positions.device)
+            tile_indices = (self._target_mla_tile_indices(lane_indices, positions.device)
+                            if query_indices is None else None)
         else:
             lane_indices = active_lanes
             tile_indices = None
+        if query_indices is not None and not self.slice_target_layers:
+            raise RuntimeError("target query compaction requires the C6 attention wrapper path")
         selections = tuple(
             torch.full((self.rows, 512), -1, dtype=torch.int32, device=positions.device)
             for _ in self.stage.shared.topk
@@ -532,7 +560,9 @@ class CompiledTargetBatchStage:
                     index_ready,
                 )
                 if self.slice_target_layers:
-                    result = chunk(*chunk_args, active_lanes=lane_indices, tile_indices=tile_indices)
+                    query_kwargs = ({} if query_indices is None else
+                                    {"query_indices": query_indices, "query_valid": query_valid})
+                    result = chunk(*chunk_args, active_lanes=lane_indices, tile_indices=tile_indices, **query_kwargs)
                 else:
                     result = chunk(*chunk_args)
                 hidden, pre_mix, aux, selections, candidates, main_ready, index_ready = result
@@ -551,9 +581,12 @@ class DSparkTargetStage(nn.Module):
     """
 
     def __init__(self, program, request_lengths: tuple[int, ...], request_slots: tuple[int, ...], *,
-                 backend: str = "hpu_backend", state_capacity: int | None = None):
+                 backend: str = "hpu_backend", state_capacity: int | None = None, ragged_compressor: bool = False):
         super().__init__()
+        if type(ragged_compressor) is not bool:
+            raise TypeError("target ragged compressor must be a boolean")
         self.program = program
+        self.ragged_compressor = ragged_compressor
         if len(request_lengths) != len(request_slots):
             raise ValueError("target request lengths and slots must describe the same capacity")
         self.batch_capacity = len(request_slots)
@@ -569,9 +602,10 @@ class DSparkTargetStage(nn.Module):
             configure_recipes(backend)
         owner_capacity = self.batch_capacity if state_capacity is None else state_capacity
         self.state = initialize_target_batch_state(program, owner_capacity)
+        ragged_kwargs = {"ragged_compressor": True} if ragged_compressor else {}
         self.compiled = CompiledTargetBatchStage(
             program, self.request_lengths, self.request_slots, backend=backend,
-            runtime_request_slots=state_capacity is not None)
+            runtime_request_slots=state_capacity is not None, **ragged_kwargs)
 
     @classmethod
     def from_batch(cls, program, batch: DSparkTargetBatch, *, backend: str = "hpu_backend"):
@@ -597,6 +631,10 @@ class DSparkTargetStage(nn.Module):
         # This is the scheduler-owned host plan shared by every TP rank; never
         # derive lane filtering from a rank-local device mask.
         active_lanes = _validated_active_lanes(batch.host_active_lanes, self.batch_capacity)
+        # Legacy batch views predate compact queries and mean the full C6 body.
+        query_indices = getattr(batch, "query_indices", None)
+        query_kwargs = ({} if query_indices is None else
+                        {"query_indices": query_indices, "query_valid": batch.query_valid})
         return self.compiled(
             hidden,
             pre_mix,
@@ -607,6 +645,7 @@ class DSparkTargetStage(nn.Module):
             batch.row_valid,
             engram_rows,
             active_lanes,
+            **query_kwargs,
         )
 
     def stage_interface(self) -> SimpleNamespace:
