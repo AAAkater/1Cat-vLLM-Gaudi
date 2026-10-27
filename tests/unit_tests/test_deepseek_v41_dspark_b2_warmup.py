@@ -441,3 +441,25 @@ def test_b2_startup_failure_stops_before_barrier_and_state_clear(monkeypatch):
         runner.warmup_model()
     assert events[-1] == "b2_warmup"
     assert "barrier" not in events and "state_clear" not in events
+
+
+@pytest.mark.parametrize("capacity,buckets", [(32, (1, 32)), (11, (1, 2, 4, 8, 11))])
+def test_execution_bucket_warmup_covers_only_configured_keys(capacity, buckets):
+    runner, target, draft, state, _engram = _batch_runner(capacity)
+    target.execution_buckets = buckets
+    original = target.forward_batch
+
+    def forward(metadata, *args):
+        active = int(metadata.request_active.sum())
+        bucket = next(value for value in buckets if value >= active)
+        target.stages.setdefault(tuple(range(bucket)), SimpleNamespace(compiled=object()))
+        return original(metadata, *args)
+
+    target.forward_batch = forward
+    runner.warmup(pool_blocks=capacity + 1, max_model_len=8192, request_factory=_request_factory)
+    expected_rounds = 3 + sum(1 < bucket < capacity for bucket in buckets)
+    assert len(target.orders) == expected_rounds
+    assert runner.round_generation == draft.verify_ring.generation == expected_rounds
+    assert set(target.stages) == {tuple(range(bucket)) for bucket in buckets}
+    assert not runner.slots.owners
+    assert not runner.pending

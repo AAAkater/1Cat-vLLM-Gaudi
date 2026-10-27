@@ -1663,3 +1663,84 @@ def test_dspark_request_state_uses_the_bounded_capacity_range(monkeypatch):
         assert model.batch_state == (model.program, capacity)
     with pytest.raises(ValueError, match="1\\.\\.64"):
         model.initialize_request_state(65)
+
+
+def test_active_adapter_keeps_scheduler_order_separate_from_fixed_lanes():
+    plan, _ = _single_page_plan(2, 6144)
+    scheduled = SimpleNamespace(
+        num_scheduled_tokens={"short-1": 1, "short-0": 1},
+        scheduled_spec_decode_tokens={},
+    )
+    entries = {entry.req_id: entry for entry in plan.requests}
+    actual = DSparkBatchPlan.from_scheduler(
+        scheduled,
+        {key: entry.request for key, entry in entries.items()},
+        {key: SimpleNamespace(index=entry.request_slot, generation=entry.slot_generation)
+         for key, entry in entries.items()},
+        max_model_len=6144,
+        round_generation=2,
+        batch_capacity=2,
+    )
+    assert actual.request_ids == ("short-0", "short-1")
+    assert actual.active_metadata.request_ids == ("short-1", "short-0")
+    assert actual.active_metadata.compact_to_logical_slots == (1, 0)
+    assert actual.active_metadata.canonical_compact_rows == (1, 0)
+    restored = actual.active_metadata.to_fixed_metadata()
+    for name in actual.metadata.__dataclass_fields__:
+        left, right = getattr(actual.metadata, name), getattr(restored, name)
+        assert torch.equal(left, right) if isinstance(left, torch.Tensor) else left == right
+    assert actual.packed_input_ids.shape == (2, 6)
+
+
+def test_active_adapter_n32_tail_slot_stays_owned_by_slot31():
+    small, _ = _single_page_plan(1, 6144)
+    entry = small.requests[0]
+    actual = DSparkBatchPlan.from_scheduler(
+        SimpleNamespace(num_scheduled_tokens={entry.req_id: 1}, scheduled_spec_decode_tokens={}),
+        {entry.req_id: entry.request},
+        {entry.req_id: SimpleNamespace(index=31, generation=19)},
+        max_model_len=6144,
+        round_generation=7,
+        batch_capacity=32,
+    )
+    assert actual.active_metadata.active_count == 1
+    assert actual.active_metadata.compact_to_logical_slots == (31,)
+    assert actual.active_metadata.identities[0].as_tuple() == (entry.req_id, 31, 19, 7)
+    assert actual.packed_input_ids.shape == (32, 6)
+    assert actual.active_lanes == (31,)
+    assert actual.active_metadata.no_write_mask[:31].all()
+
+
+def test_active_adapter_rejects_reused_slot_before_any_stage_runs():
+    plan, _ = _single_page_plan(2, 6144)
+    owners = {entry.req_id: SimpleNamespace(index=entry.request_slot, generation=entry.slot_generation)
+              for entry in plan.requests}
+    owners[plan.requests[0].req_id].generation += 1
+    runner = DSparkBatchRunner(
+        SimpleNamespace(), SimpleNamespace(), slots=SimpleNamespace(capacity=2, owners=owners), batch_capacity=2)
+    runner.round_generation = plan.round_generation
+    with pytest.raises(RuntimeError, match="stale|generation|owner"):
+        runner.execute(plan)
+    assert not runner.pending
+
+
+def test_active_adapter_can_be_disabled_for_fixed_layout_rollback():
+    plan, _ = _single_page_plan(2, 6144)
+    runner = DSparkBatchRunner(SimpleNamespace(), SimpleNamespace(), batch_capacity=2, use_active_metadata=False)
+    actual = runner.build_plan(
+        SimpleNamespace(num_scheduled_tokens={entry.req_id: 1 for entry in plan.requests},
+                        scheduled_spec_decode_tokens={}),
+        {entry.req_id: entry.request for entry in plan.requests},
+        {entry.req_id: SimpleNamespace(index=entry.request_slot, generation=entry.slot_generation)
+         for entry in plan.requests},
+        max_model_len=6144,
+    )
+    assert actual.active_metadata is None
+    assert torch.equal(actual.packed_input_ids, plan.packed_input_ids)
+    assert actual.request_ids == plan.request_ids
+
+
+@pytest.mark.parametrize("value", [0, 1, "true", None])
+def test_active_adapter_switch_requires_boolean(value):
+    with pytest.raises(TypeError, match="boolean"):
+        DSparkBatchRunner(SimpleNamespace(), SimpleNamespace(), use_active_metadata=value)

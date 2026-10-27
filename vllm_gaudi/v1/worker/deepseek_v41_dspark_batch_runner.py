@@ -18,6 +18,7 @@ import torch
 from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
 from vllm_gaudi.ops.deepseek_v41_capacity import validate_dspark_capacity
 from vllm_gaudi.ops.deepseek_v41_batch_speculation import DSparkBatchMetadata
+from vllm_gaudi.ops.deepseek_v41_active_batch import DSparkActiveBatchMetadata, compact_dspark_metadata
 from vllm_gaudi.ops.deepseek_v41_verify import vocab_parallel_argmax
 
 
@@ -304,6 +305,7 @@ class DSparkBatchPlan:
     packed_positions: torch.Tensor
     packed_padding_mask: torch.Tensor
     pages: torch.Tensor
+    active_metadata: DSparkActiveBatchMetadata | None = None
 
     @property
     def request_ids(self) -> tuple[str, ...]:
@@ -359,7 +361,10 @@ class DSparkBatchPlan:
         max_model_len: int,
         round_generation: int,
         batch_capacity: int | None = None,
+        use_active_metadata: bool = True,
     ) -> "DSparkBatchPlan":
+        if type(use_active_metadata) is not bool:
+            raise TypeError("use_active_metadata must be a boolean")
         max_model_len = _host_integer(max_model_len, "max_model_len")
         fixed_page_width = _fixed_page_table_width(max_model_len)
         scheduled_order = tuple(scheduled.num_scheduled_tokens)
@@ -530,6 +535,14 @@ class DSparkBatchPlan:
             round_generation=round_generation,
             active=active_mask,
         )
+        active_metadata = None
+        if use_active_metadata:
+            active_metadata = compact_dspark_metadata(
+                metadata,
+                scheduler_order=scheduled_order,
+                owners=slot_owners,
+                expected_round_generation=round_generation,
+            )
         return cls(
             requests=tuple(entries),
             metadata=metadata,
@@ -538,6 +551,7 @@ class DSparkBatchPlan:
             packed_positions=raw_packed_positions,
             packed_padding_mask=raw_packed_mask,
             pages=torch.tensor(padded_pages, dtype=torch.int32),
+            active_metadata=active_metadata,
         )
 
 
@@ -581,6 +595,8 @@ class DSparkPackedTargetStages:
             backend=backend,
         )
         self._bug004_profile = None
+        self._backend = backend
+        self.execution_buckets = (self.batch_capacity,)
         # One mapping entry is retained for older introspection callers.  The
         # key is physical lane order, not request order or an active-lane set.
         self.stages = {self.stage_key: self.stage}
@@ -591,12 +607,38 @@ class DSparkPackedTargetStages:
     def scoped_recipe_status(self):
         return self.stage.scoped_recipe_status()
 
+    def configure_execution_buckets(self, enabled: bool, *, buckets=(1, 2, 4, 8, 16, 32, 64)):
+        from vllm_gaudi.ops.deepseek_v41_target_buckets import target_execution_buckets
+
+        if type(enabled) is not bool:
+            raise TypeError("dsv41_dspark_target_buckets must be a boolean")
+        selected = target_execution_buckets(self.batch_capacity, buckets)
+        self.execution_buckets = selected if enabled else (self.batch_capacity,)
+        self.stage.compiled.execution_bucket_count = len(self.execution_buckets)
+        # Buckets remove active-pattern specialization. Each bucket uses its
+        # dense packed MLA call, including a supported partial tail tile.
+        self.stage.compiled.use_sparse_mla_plan = not enabled
+
     def stage_for(self, batch):
-        if batch.batch_capacity != self.batch_capacity:
-            raise ValueError("DSpark target batch capacity differs from its fixed stage")
-        if batch.host_request_slots != self.stage_key:
-            raise ValueError("DSpark canonical target host slots must be range(batch_capacity)")
-        return self.stage
+        from vllm_gaudi.models.deepseek_v41_batch_target_program import DSparkTargetStage
+
+        capacity = batch.batch_capacity
+        if capacity not in getattr(self, "execution_buckets", (self.batch_capacity,)):
+            raise ValueError("DSpark target execution bucket was not selected for warmup")
+        if capacity == self.batch_capacity:
+            if batch.host_request_slots != self.stage_key:
+                raise ValueError("DSpark canonical target host slots must be range(batch_capacity)")
+            return self.stage
+        key = tuple(range(capacity))
+        if key not in self.stages:
+            stage = DSparkTargetStage(
+                self.program, (6,) * capacity, key, backend=self._backend,
+                state_capacity=self.batch_capacity,
+            )
+            stage.compiled.execution_bucket_count = len(self.execution_buckets)
+            stage.compiled.use_sparse_mla_plan = False
+            self.stages[key] = stage
+        return self.stages[key]
 
     def enter_batched(self):
         """Retire the selected native B1 owner before packed target reads state."""
@@ -609,13 +651,24 @@ class DSparkPackedTargetStages:
         from vllm_gaudi.ops.deepseek_v41_batch_target import DSparkTargetBatch as TargetBatch
 
         profile = self._bug004_profile_for_round()
+        from vllm_gaudi.ops.deepseek_v41_target_buckets import pack_target_bucket
+
+        active_count = int(metadata.request_active.sum())
+        execution_capacity = next(bucket for bucket in getattr(
+            self, "execution_buckets", (self.batch_capacity,)) if bucket >= active_count)
+        packed = pack_target_bucket(metadata, input_ids, pages, execution_capacity)
+        compact = execution_capacity != self.batch_capacity
+        input_ids = packed.queries
         batch = TargetBatch.from_metadata(
-            metadata,
+            packed.metadata,
             input_ids,
-            pages,
-            batch_capacity=self.batch_capacity,
+            packed.pages,
+            batch_capacity=execution_capacity,
+            state_capacity=self.batch_capacity if compact else None,
             device=self.device,
         )
+        source_indices = (torch.tensor(packed.source_lanes[:active_count], dtype=torch.int64, device=self.device)
+                          if compact else None)
         stage = self.stage_for(batch)
         ticket = None
         engram_owner = None
@@ -628,10 +681,22 @@ class DSparkPackedTargetStages:
             engram_rows, engram_owner = self._engram_rows(batch, input_ids)
             if profile is not None:
                 profile.mark("target.forward")
-            hidden, aux = stage(self.hidden_seed, self.pre_mix_seed, batch, engram_rows)
+            rows = batch.target_rows
+            hidden, aux = stage(self.hidden_seed[:rows], self.pre_mix_seed[:rows], batch, engram_rows)
             if profile is not None:
                 profile.mark("target.head_projection")
             target_ids = _target_greedy_ids(self.program, hidden, batch.host_active_lanes)
+            if compact:
+                expanded_ids = torch.zeros((self.batch_capacity, 6), dtype=target_ids.dtype, device=self.device)
+                expanded_ids.index_copy_(0, source_indices, target_ids.reshape(execution_capacity, 6)[:active_count])
+                target_ids = expanded_ids.reshape(-1)
+                if not isinstance(aux, torch.Tensor) or aux.shape[0] != rows:
+                    raise ValueError("compact target must return one aux state per execution row")
+                expanded_aux = torch.zeros((self.batch_capacity, 6, *aux.shape[1:]),
+                                           dtype=aux.dtype, device=aux.device)
+                expanded_aux.index_copy_(0, source_indices, aux.reshape(execution_capacity, 6, *aux.shape[1:])[
+                    :active_count])
+                aux = expanded_aux.reshape(self.batch_capacity * 6, *aux.shape[1:])
             payload = {
                 "hidden": hidden,
                 "aux": aux,
@@ -639,12 +704,16 @@ class DSparkPackedTargetStages:
                 "ticket": ticket,
                 "engram_owner": engram_owner,
                 "finished": False,
+                "source_lanes": packed.source_lanes,
+                "target_execution_capacity": execution_capacity,
+                "target_execution_rows": rows,
+                "target_execution_slots": batch.host_request_slots,
             }
             return DSparkTargetBatch(token_ids=target_ids, payload=payload)
         except BaseException as error:
             if ticket is not None:
                 try:
-                    ticket.restore((0, ) * self.batch_capacity)
+                    ticket.restore((0, ) * batch.batch_capacity)
                 except BaseException as cleanup_error:
                     if hasattr(error, "add_note"):
                         error.add_note(
@@ -746,6 +815,8 @@ class DSparkPackedTargetStages:
         if len(accepted) != self.batch_capacity:
             raise ValueError("DSpark target completion requires one accepted value per lane")
         batch = payload["batch"]
+        lanes = payload.get("source_lanes", tuple(range(self.batch_capacity)))
+        accepted = tuple(accepted[lane] if lane >= 0 else 0 for lane in lanes)
         payload["ticket"].restore(accepted)
         owner_info = payload.get("engram_owner")
         if owner_info is not None:
@@ -761,7 +832,7 @@ class DSparkPackedTargetStages:
         if not isinstance(payload, dict) or payload.get("finished"):
             return
         batch = payload["batch"]
-        payload["ticket"].restore((0, ) * self.batch_capacity)
+        payload["ticket"].restore((0, ) * batch.batch_capacity)
         owner_info = payload.get("engram_owner")
         if owner_info is not None:
             owner, ticket = owner_info
@@ -840,6 +911,11 @@ class DSparkBatchTrace:
             "physical_draft_rows": int(payload.get("physical_draft_rows",
                                                     payload["actual_packed_draft_rows"])),
         }
+        if "active_metadata" in payload:
+            digest_payload["active_metadata"] = payload["active_metadata"]
+        if "target_execution_slots" in payload:
+            digest_payload["target_execution_slots"] = payload["target_execution_slots"]
+            digest_payload["target_execution_capacity"] = payload["target_execution_capacity"]
         digest = self._digest(digest_payload)
         record = {
             **payload,
@@ -884,7 +960,11 @@ class DSparkBatchRunner:
         trace: DSparkBatchTrace | None = None,
         slots: Any = None,
         batch_capacity: int | None = None,
+        use_active_metadata: bool = True,
     ):
+        if type(use_active_metadata) is not bool:
+            raise TypeError("use_active_metadata must be a boolean")
+        self.use_active_metadata = use_active_metadata
         if target_stage is None or draft_stage is None:
             raise RuntimeError("DSpark requires actual packed target and draft stages")
         self.target_stage = target_stage
@@ -928,6 +1008,7 @@ class DSparkBatchRunner:
             max_model_len=max_model_len,
             round_generation=round_generation,
             batch_capacity=batch_capacity,
+            use_active_metadata=getattr(self, "use_active_metadata", True),
         )
         self.round_generation = round_generation
         return plan
@@ -951,7 +1032,14 @@ class DSparkBatchRunner:
         started_round = self.round_generation
         observed: list[dict[str, Any]] = []
         try:
+            buckets = getattr(self.target_stage, "execution_buckets", (self.batch_capacity,))
             scenarios = warmup_scenarios(self.batch_capacity)
+            if len(buckets) > 1:
+                scenarios = scenarios[:3] + tuple(
+                    (f"target_bucket_{bucket}_mixed", {lane: (6 if lane % 2 == 0 else 1)
+                                                       for lane in range(bucket)})
+                    for bucket in buckets if 1 < bucket < self.batch_capacity
+                )
             for round_index, (name, lengths_by_lane) in enumerate(scenarios):
                 observed.append(
                     self._warmup_round(
@@ -974,8 +1062,9 @@ class DSparkBatchRunner:
                 fixed_stage = stages.get(stage_key)
             if getattr(self.target_stage, "stage_key", stage_key) != stage_key:
                 raise RuntimeError("DSpark warmup observed a capacity-dependent target key")
-            if isinstance(stages, Mapping) and len(stages) != 1:
-                raise RuntimeError("DSpark warmup requires exactly one target graph variant")
+            expected_keys = {tuple(range(bucket)) for bucket in buckets}
+            if isinstance(stages, Mapping) and set(stages) != expected_keys:
+                raise RuntimeError("DSpark warmup target keys differ from its bounded execution buckets")
             transaction = getattr(self.draft_stage, "transaction", None)
             verify_ring = getattr(self.draft_stage, "verify_ring", None)
             if getattr(fixed_stage, "compiled", None) is None:
@@ -1159,6 +1248,9 @@ class DSparkBatchRunner:
             raise RuntimeError("DSpark plan generation is stale")
         if self.pending:
             raise RuntimeError("Previous DSpark transaction is still in flight")
+        if plan.active_metadata is not None and self.slots is not None:
+            plan.active_metadata.validate_owners(
+                self.slots.owners, expected_round_generation=self.round_generation)
         target = None
         finished = False
         self.pending = True
@@ -1192,6 +1284,7 @@ class DSparkBatchRunner:
                 prepared,
                 readback_observed_ns=readback_observed_ns,
                 final_observed_ns=0,
+                target=target,
             )
             if profile is not None:
                 profile.mark("round.finish")
@@ -1300,6 +1393,9 @@ class DSparkBatchRunner:
     def _validate_final_owners(self, plan: DSparkBatchPlan) -> None:
         if self.slots is None:
             return
+        if plan.active_metadata is not None:
+            plan.active_metadata.validate_owners(
+                self.slots.owners, expected_round_generation=self.round_generation)
         for entry in plan.requests:
             slot = self.slots.owners.get(entry.req_id)
             if slot is None or slot.index != entry.request_slot or slot.generation != entry.slot_generation:
@@ -1312,6 +1408,7 @@ class DSparkBatchRunner:
         *,
         readback_observed_ns: int,
         final_observed_ns: int,
+        target: DSparkTargetBatch | None = None,
     ) -> dict[str, Any]:
         output = prepared.model_output
         drafts = prepared.draft_output
@@ -1322,7 +1419,9 @@ class DSparkBatchRunner:
         metadata_digest = self._metadata_digest(plan)
         output_ids_digest = self._values_digest(output.sampled_token_ids)
         next_draft_digest = self._values_digest(drafts.draft_token_ids)
-        physical_target_rows = plan.capacity * _TARGET_QUERY_BUCKET
+        target_payload = getattr(target, "payload", None)
+        target_payload = target_payload if isinstance(target_payload, dict) else {}
+        physical_target_rows = target_payload.get("target_execution_rows", plan.capacity * _TARGET_QUERY_BUCKET)
         physical_draft_rows = plan.capacity * _MAX_DRAFT_TOKENS
         payload = {
             "schema": _TRACE_SCHEMA,
@@ -1343,6 +1442,8 @@ class DSparkBatchRunner:
             "draft_counts": [len(entry.draft_token_ids) for entry in plan.requests],
             "scheduler_draft_counts": [entry.scheduler_draft_count for entry in plan.requests],
             "physical_target_rows": physical_target_rows,
+            "target_execution_capacity": target_payload.get("target_execution_capacity", plan.capacity),
+            "target_execution_slots": list(target_payload.get("target_execution_slots", ())),
             "physical_draft_rows": physical_draft_rows,
             "actual_packed_target_rows": physical_target_rows,
             "actual_packed_draft_rows": physical_draft_rows,
@@ -1366,6 +1467,17 @@ class DSparkBatchRunner:
             "draft_stage": f"{type(self.draft_stage).__module__}.{type(self.draft_stage).__qualname__}",
             "target_stage_key": list(getattr(self.target_stage, "stage_key", ())),
         }
+        if plan.active_metadata is not None:
+            active = plan.active_metadata
+            payload["active_metadata"] = {
+                "request_ids": list(active.request_ids),
+                "compact_to_logical_slots": list(active.compact_to_logical_slots),
+                "compact_to_fixed_lanes": list(active.compact_to_fixed_lanes),
+                "canonical_compact_rows": list(active.canonical_compact_rows),
+                "identities": [list(identity.as_tuple()) for identity in active.identities],
+                "logical_target_rows": int(active.target_query_start_loc[-1]),
+                "logical_draft_rows": int(active.draft_query_start_loc[-1]),
+            }
         scoped_status = getattr(self.target_stage, "scoped_recipe_status", None)
         if callable(scoped_status):
             payload["c6_scoped_recipe"] = scoped_status()

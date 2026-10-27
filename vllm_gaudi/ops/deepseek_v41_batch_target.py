@@ -130,6 +130,7 @@ class DSparkTargetBatch:
     host_pages: tuple[tuple[int, ...], ...]
     host_slot_generations: tuple[int, ...]
     host_round_generation: int
+    state_capacity: int | None = None
 
     @property
     def request_offsets(self) -> tuple[int, ...]:
@@ -175,6 +176,7 @@ class DSparkTargetBatch:
             host_pages=self.host_pages,
             host_slot_generations=self.host_slot_generations,
             host_round_generation=self.host_round_generation,
+            state_capacity=self.state_capacity,
         )
 
     @classmethod
@@ -184,6 +186,7 @@ class DSparkTargetBatch:
                       pages,
                       *,
                       batch_capacity: int | None = None,
+                      state_capacity: int | None = None,
                       device="cpu") -> "DSparkTargetBatch":
         """Build the target contract from CPU ``DSparkBatchMetadata`` output.
 
@@ -349,9 +352,11 @@ class DSparkTargetBatch:
             else:
                 raise ValueError("target_padding_mask must be flat or [batch_capacity, 6]")
 
+        owner_capacity = capacity if state_capacity is None else state_capacity
+        validate_dspark_capacity(owner_capacity, allow_serial=True, name="target state capacity")
         active_slots = [slot for active, slot in zip(request_active, request_slots, strict=True) if active]
         if (len(set(active_slots)) != len(active_slots)
-                or any(slot < 0 or slot >= capacity for slot in active_slots)):
+                or any(slot < 0 or slot >= owner_capacity for slot in active_slots)):
             raise ValueError("active request_slots must be distinct nonnegative owners")
         for index, (active, slot, generation) in enumerate(
                 zip(request_active, request_slots, generations, strict=True)):
@@ -361,7 +366,7 @@ class DSparkTargetBatch:
                 raise ValueError("active slot_generations must be nonnegative")
         canonical_slots = (batch_capacity is not None or capacity != TARGET_REQUESTS
                            or (active_length > 0 and not all(request_active)))
-        if canonical_slots:
+        if canonical_slots and state_capacity is None:
             for index, (active, slot) in enumerate(zip(request_active, request_slots, strict=True)):
                 if active and slot != index:
                     raise ValueError("canonical target lanes require active device slot == lane index")
@@ -441,6 +446,7 @@ class DSparkTargetBatch:
             host_pages=host_pages,
             host_slot_generations=tuple(generations),
             host_round_generation=round_generation,
+            state_capacity=state_capacity,
         )
 
     def stage_inputs(self):
@@ -676,6 +682,48 @@ def compressor_sequence_slot_publish_read(
     return history, score_history
 
 
+
+def compressor_sequence_runtime_slot_publish_read(
+    history_bank: torch.Tensor,
+    score_bank: torch.Tensor,
+    slot: torch.Tensor,
+    kv: torch.Tensor,
+    score: torch.Tensor,
+    positions: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Publish a C6 execution lane to a runtime-selected persistent slot.
+
+    The host metadata owns slot/generation validation. Invalid tensor slots
+    produce no writes and zero reads, so padded execution lanes cannot touch
+    another request. Slot values stay on device and do not specialize graphs.
+    """
+    if (not isinstance(slot, torch.Tensor) or slot.ndim != 0
+            or slot.dtype not in (torch.int32, torch.int64) or slot.device != history_bank.device):
+        raise ValueError("runtime compressor slot must be a device integer scalar")
+    if (history_bank.ndim != 2 or history_bank.shape[1] != 512 or score_bank.shape != history_bank.shape
+            or history_bank.shape[0] % _HISTORY_ROWS):
+        raise ValueError("compressor slot bank must be [capacity*8, 512]")
+    if kv.shape != (6, 512) or score.shape != kv.shape or positions.shape != (6,):
+        raise ValueError("runtime compressor requires C6 values and positions")
+    from vllm_gaudi.ops.deepseek_v41_batch_attention import read_state_rows, write_state_rows
+
+    positions = positions.to(torch.int32).contiguous()
+    slot = slot.to(torch.int32)
+    valid_slot = (slot >= 0) & (slot < history_bank.shape[0] // _HISTORY_ROWS)
+    rows = torch.where(
+        valid_slot & (positions >= 0),
+        slot * _HISTORY_ROWS + positions.remainder(_HISTORY_ROWS),
+        torch.full_like(positions, -1),
+    ).contiguous()
+    done_history = write_state_rows(history_bank, kv.contiguous(), rows)
+    done_score = write_state_rows(score_bank, score.contiguous(), rows)
+    offsets = torch.arange(_HISTORY_ROWS, dtype=torch.int32, device=history_bank.device)
+    slot_rows = torch.where(valid_slot, slot * _HISTORY_ROWS + offsets, -1).contiguous()
+    history = read_state_rows(history_bank, slot_rows, done_history.amax().expand(_HISTORY_ROWS).contiguous())
+    scores = read_state_rows(score_bank, slot_rows, done_score.amax().expand(_HISTORY_ROWS).contiguous())
+    return history, scores
+
+
 def compressor_sequence_slot_torch_mix(
     history: torch.Tensor,
     score_history: torch.Tensor,
@@ -778,6 +826,7 @@ __all__ = [
     "compressor_sequence_slot_masked",
     "compressor_sequence_slot_native_mix",
     "compressor_sequence_slot_publish_read",
+    "compressor_sequence_runtime_slot_publish_read",
     "compressor_sequence_slot_torch_mix",
     "initialize_target_batch_state",
     "make_target_ticket",

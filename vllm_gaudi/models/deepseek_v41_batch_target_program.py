@@ -80,10 +80,12 @@ class _TargetAttentionCall:
     attributes.
     """
 
-    def __init__(self, attention, *, request_lengths: tuple[int, ...], request_slots: tuple[int, ...]):
+    def __init__(self, attention, *, request_lengths: tuple[int, ...], request_slots: tuple[int, ...],
+                 runtime_request_slots: bool = False):
         self.attention = attention
         self.request_lengths = tuple(request_lengths)
         self.request_slots = tuple(request_slots)
+        self.runtime_request_slots = runtime_request_slots
 
     def __call__(
         self,
@@ -99,6 +101,7 @@ class _TargetAttentionCall:
         ready_outputs,
         tile_indices=None,
     ):
+        slot_kwargs = {"runtime_request_slots": True} if self.runtime_request_slots else {}
         return self.attention.forward_batch_target(
             value,
             positions,
@@ -114,6 +117,7 @@ class _TargetAttentionCall:
             ready_outputs=ready_outputs,
             defer_output_finish=True,
             tile_indices=tile_indices,
+            **slot_kwargs,
         )
 
 
@@ -203,7 +207,8 @@ class PreparedTargetBatchLayerGroup(nn.Module):
                  *,
                  request_lengths: tuple[int, ...],
                  request_slots: tuple[int, ...],
-                 text_input: bool = False):
+                 text_input: bool = False,
+                 runtime_request_slots: bool = False):
         super().__init__()
         if not getattr(stage, "dspark", False):
             raise ValueError("DSpark target batch requires a DSpark prepared stage")
@@ -229,6 +234,7 @@ class PreparedTargetBatchLayerGroup(nn.Module):
                 layer.attention,
                 request_lengths=self.request_lengths,
                 request_slots=self.request_slots,
+                runtime_request_slots=runtime_request_slots,
             )
             for layer in self.layers
         ) if self.slice_target_layers else ())
@@ -271,7 +277,7 @@ class PreparedTargetBatchLayerGroup(nn.Module):
 
     def _target_mla_tile_indices(self, active_lanes, device):
         """Auto-plan one N32-only tile plan for a standalone group call."""
-        if not self.slice_target_layers:
+        if not self.slice_target_layers or not getattr(self, "use_sparse_mla_plan", True):
             return None
         return _build_target_mla_tile_plan(
             active_lanes,
@@ -410,7 +416,8 @@ class CompiledTargetBatchStage:
     """Compiled native/eager group sequence for one request-length pattern."""
 
     def __init__(self, stage, request_lengths: tuple[int, ...], request_slots: tuple[int, ...], *,
-                 backend: str = "hpu_backend", group_size: int = 4):
+                 backend: str = "hpu_backend", group_size: int = 4,
+                 runtime_request_slots: bool = False):
         if not getattr(stage, "dspark", False):
             raise ValueError("DSpark target batch requires a DSpark prepared stage")
         if len(stage.layers) % group_size:
@@ -434,6 +441,7 @@ class CompiledTargetBatchStage:
                 request_lengths=self.request_lengths,
                 request_slots=self.request_slots,
                 text_input=start == 0,
+                runtime_request_slots=runtime_request_slots,
             )
             for start in range(0, len(stage.layers), group_size)
         ])
@@ -449,7 +457,7 @@ class CompiledTargetBatchStage:
                 torch.compile(group, backend=backend, fullgraph=True, dynamic=False) for group in self.groups)
 
     def _target_mla_tile_indices(self, active_lanes, device):
-        if not self.slice_target_layers:
+        if not self.slice_target_layers or not getattr(self, "use_sparse_mla_plan", True):
             return None
         return _build_target_mla_tile_plan(
             active_lanes,
@@ -497,7 +505,7 @@ class CompiledTargetBatchStage:
             # bucket.  None is the full-row variant; the fixed sparse tile
             # shapes are 1/2/4/8/16 tiles.
             variant_budget = (len(_TARGET_MLA_TILE_PLAN_BUCKETS) + 1) * (
-                2 * len(self.stage.layers) + 1)
+                2 * len(self.stage.layers) + 1) * getattr(self, "execution_bucket_count", 1)
             recompile_limit = max(torch._dynamo.config.recompile_limit, variant_budget)
         else:
             recompile_limit = max(torch._dynamo.config.recompile_limit, 2 * len(self.chunks) + 1)
@@ -543,7 +551,7 @@ class DSparkTargetStage(nn.Module):
     """
 
     def __init__(self, program, request_lengths: tuple[int, ...], request_slots: tuple[int, ...], *,
-                 backend: str = "hpu_backend"):
+                 backend: str = "hpu_backend", state_capacity: int | None = None):
         super().__init__()
         self.program = program
         if len(request_lengths) != len(request_slots):
@@ -559,12 +567,17 @@ class DSparkTargetStage(nn.Module):
         configure_recipes = getattr(program, "set_c6_scoped_recipe_backend", None)
         if configure_recipes is not None:
             configure_recipes(backend)
-        self.state = initialize_target_batch_state(program, self.batch_capacity)
-        self.compiled = CompiledTargetBatchStage(program, self.request_lengths, self.request_slots, backend=backend)
+        owner_capacity = self.batch_capacity if state_capacity is None else state_capacity
+        self.state = initialize_target_batch_state(program, owner_capacity)
+        self.compiled = CompiledTargetBatchStage(
+            program, self.request_lengths, self.request_slots, backend=backend,
+            runtime_request_slots=state_capacity is not None)
 
     @classmethod
     def from_batch(cls, program, batch: DSparkTargetBatch, *, backend: str = "hpu_backend"):
-        return cls(program, batch.request_lengths, batch.host_request_slots, backend=backend)
+        state_capacity = getattr(batch, "state_capacity", None)
+        slots = (tuple(range(batch.batch_capacity)) if state_capacity is not None else batch.host_request_slots)
+        return cls(program, batch.request_lengths, slots, backend=backend, state_capacity=state_capacity)
 
     def snapshot(self, batch: DSparkTargetBatch):
         return make_target_ticket(self.program, batch)

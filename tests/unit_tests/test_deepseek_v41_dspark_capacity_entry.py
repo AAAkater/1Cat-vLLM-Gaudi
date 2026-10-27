@@ -543,3 +543,32 @@ def test_packed_round_uses_owner_preparation_instead_of_per_request_b1_bind():
     assert runner.batch_result == "model-output"
     assert runner.draft_token_ids == "draft-output"
     assert runner.pending == "batch_ready"
+
+
+@pytest.mark.parametrize("capacity", [3, 11, 32, 64])
+def test_optional_native_b1_backend_keeps_configured_multi_request_capacity(capacity):
+    runner = _candidate_runner({"first": _decode_request(), "last": _decode_request()})
+    runner.dspark_batch_capacity = capacity
+    runner.model = SimpleNamespace(native=True)
+    runner.dspark_compact_native_single = True
+    assert not runner._dspark_batch_candidate(_scheduled("last"))
+    assert runner._dspark_batch_candidate(_scheduled("first", "last"))
+    assert runner.dspark_batch_capacity == capacity
+    runner.dspark_compact_native_single = False
+    assert runner._dspark_batch_candidate(_scheduled("last"))
+
+
+@pytest.mark.parametrize("field", ["device_round_inputs", "device_round_queue", "device_round_tail"])
+def test_optional_native_b1_backend_preserves_queued_round_owners(field):
+    runner = _candidate_runner({"request": _decode_request()})
+    runner.model = SimpleNamespace(native=True)
+    runner.dspark_compact_native_single = True
+    setattr(runner, field, [object()] if field == "device_round_tail" else object())
+    assert runner._dspark_batch_candidate(_scheduled("request"))
+
+
+def test_optional_native_b1_backend_requires_actual_native_runtime():
+    runner = _candidate_runner({"request": _decode_request()})
+    runner.model = SimpleNamespace(native=False)
+    runner.dspark_compact_native_single = True
+    assert runner._dspark_batch_candidate(_scheduled("request"))

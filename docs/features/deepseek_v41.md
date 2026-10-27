@@ -565,3 +565,53 @@ See the [TP8 source and hardware-server handoff](../dev_guide/deepseek_v41_tp8_h
 for pinned dependencies, CPU-only concurrency preparation, deployment gates and
 remaining batch execution work. TP8 DSpark still requires one active request;
 the metadata prototype does not enable batched serving.
+
+## DSpark active request metadata
+
+The TP8 DSpark batch runner keeps an active host metadata view alongside the
+fixed target and draft layouts. Each active row carries
+`(request_id, logical_slot, slot_generation, round_generation)`. Scheduler order
+and execution row order have explicit maps to the stable logical slots that own
+KV, compressor and draft state. Ownership is checked before execution and before
+publication; a stale slot generation fails before publishing output.
+
+This adapter leaves target/draft tensor shapes, model state banks, snapshots and
+scheduler drafting budgets unchanged. It does not qualify compact device
+execution. The round trace includes the active identities and their maps in the
+cross-rank consistency digest.
+
+The adapter is enabled by default. For compatibility diagnostics, the fixed
+metadata path can be selected with the boolean additional configuration value
+`dsv41_dspark_active_metadata=false`:
+
+```text
+--additional-config '{"dsv41_dspark_active_metadata":false}'
+```
+
+Merge that key with any other additional configuration supplied to the launcher.
+
+### Target execution buckets
+
+The DSpark batch runtime can select target execution buckets independently of
+the persistent request-state capacity. The configured buckets are warmed before
+serving. A request count without a smaller configured bucket uses the existing
+full-capacity target stage, so custom concurrency counts remain supported.
+Compressor and SWA ownership use stable logical slots; target aux states and
+verification IDs are scattered back to the fixed layout consumed by draft.
+Draft execution still uses the configured capacity.
+
+`dsv41_dspark_target_buckets` is a boolean additional configuration key, enabled
+by default for the batch runner. Set it to `false` to retain the prior target
+stage. `dsv41_dspark_target_warmup_buckets` selects power-of-two target buckets;
+the full-capacity fallback is always included. A short diagnostic may select
+`[1]` to warm only the compact single-request target alongside that fallback.
+The default list is `[1, 2, 4, 8, 16, 32, 64]`, filtered to the configured capacity.
+Runtime request IDs and logical-slot sets are not graph-cache keys.
+
+The optional boolean `dsv41_dspark_compact_native_single` selects existing native
+replay for an eligible single decode request, while keeping the configured
+multi-request capacity and packed execution for multiple owners. It defaults
+to `false`. The runtime retains request-slot and draft-ring handoffs when
+switching between these execution backends. Queued device-round controls and
+models without native replay keep the existing packed policy. DSpark and its
+speculative-token configuration remain enabled.

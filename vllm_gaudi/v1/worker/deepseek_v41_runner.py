@@ -1161,6 +1161,17 @@ class V41ModelRunner:
 
     def _initialize_dspark_batch_runner(self, capacity):
         target_stage, draft_stage = self.model.initialize_dspark_batch(capacity)
+        additional = getattr(getattr(self, "vllm_config", None), "additional_config", {}) or {}
+        native_single = additional.get("dsv41_dspark_compact_native_single", False)
+        if type(native_single) is not bool:
+            raise TypeError("dsv41_dspark_compact_native_single must be a boolean")
+        self.dspark_compact_native_single = native_single
+        configure_buckets = getattr(target_stage, "configure_execution_buckets", None)
+        if callable(configure_buckets):
+            configure_buckets(
+                additional.get("dsv41_dspark_target_buckets", True),
+                buckets=additional.get("dsv41_dspark_target_warmup_buckets", (1, 2, 4, 8, 16, 32, 64)),
+            )
         state = getattr(self.model, "batch_state", None)
         slots = getattr(state, "slots", None)
         if (getattr(state, "capacity", None) != capacity or getattr(slots, "capacity", None) != capacity):
@@ -1177,6 +1188,8 @@ class V41ModelRunner:
             trace=DSparkBatchTrace(rank=rank, tp_rank=self.model.tp_rank, pp_rank=self.model.pp_rank),
             slots=slots,
             batch_capacity=capacity,
+            use_active_metadata=(getattr(getattr(self, "vllm_config", None), "additional_config", {}) or {}).get(
+                "dsv41_dspark_active_metadata", True),
         )
         self.dspark_batch_capacity = capacity
 
@@ -2343,7 +2356,8 @@ class V41ModelRunner:
 
         A mixed round containing any prefill request deliberately falls back to
         the serial path for that prefill phase. Once every active request is in
-        steady decode, one request in any physical slot is still packed.
+        steady decode, requests use packed execution unless the optional
+        native B1 backend is selected for an eligible single owner.
         """
         if self.dspark_batch_runner is None:
             return False
@@ -2356,6 +2370,14 @@ class V41ModelRunner:
             if (request is None or not 1 <= count <= 6 or request.num_computed_tokens < request.decode_start
                     or request.mm_features):
                 return False
+        # The native B1 backend uses the same persistent-slot handoff as
+        # prefill. Queued device rounds retain their existing owner policy.
+        if (active == 1 and getattr(self, "dspark_compact_native_single", False)
+                and getattr(getattr(self, "model", None), "native", False)
+                and getattr(self, "device_round_inputs", None) is None
+                and getattr(self, "device_round_queue", None) is None
+                and not getattr(self, "device_round_tail", ())):
+            return False
         return True
 
     def _dspark_b2_candidate(self, scheduled):

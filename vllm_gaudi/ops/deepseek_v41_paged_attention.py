@@ -2761,7 +2761,8 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
         index_done = write_state_rows(self.cache.index, pack_fp4(index, 32), rows)
         return main_done, index_done
 
-    def _compress_batch_target(self, value, positions, slots, pages, row_valid, request_lengths, request_slots):
+    def _compress_batch_target(self, value, positions, slots, pages, row_valid, request_lengths, request_slots,
+                               *, runtime_request_slots=False):
         """Compress fixed ``[N,6]`` C1/C6 spans with lane-local ordering.
 
         The masked sequence op consumes exactly six physical rows per request
@@ -2791,6 +2792,7 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
             from vllm_gaudi.ops.deepseek_v41_batch_target import (
                 compressor_sequence_slot_native_mix,
                 compressor_sequence_slot_publish_read,
+                compressor_sequence_runtime_slot_publish_read,
                 compressor_sequence_slot_torch_mix,
                 select_compressor_norm_by_request_length,
             )
@@ -2798,10 +2800,12 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
             native_norms, compiled_norms = [], []
             for request_index, slot in enumerate(request_slots):
                 start = request_index * 6
-                history, score_history = compressor_sequence_slot_publish_read(
+                publish_read = (compressor_sequence_runtime_slot_publish_read if runtime_request_slots
+                                else compressor_sequence_slot_publish_read)
+                history, score_history = publish_read(
                     state.kv_history,
                     state.score_history,
-                    slot,
+                    slots[start] if runtime_request_slots else slot,
                     kv[start:start + 6],
                     score[start:start + 6],
                     positions[start:start + 6],
@@ -3005,6 +3009,7 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
         ready_outputs=(),
         defer_output_finish=False,
         tile_indices=None,
+        runtime_request_slots=False,
     ):
         """Packed C1/C6 target attention with per-lane state and page ownership.
 
@@ -3064,7 +3069,8 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
         if self.ratio:
             if self.owns_kv:
                 main_done, index_done = self._compress_batch_target(
-                    value, positions, slots, pages, active, request_lengths, request_slots
+                    value, positions, slots, pages, active, request_lengths, request_slots,
+                    runtime_request_slots=runtime_request_slots,
                 )
             if self.owns_index:
                 q, weights = self._prepare_index_queries(value, qr, safe_positions, request_batch=True)
