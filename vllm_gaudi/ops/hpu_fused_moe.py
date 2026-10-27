@@ -30,6 +30,7 @@ from vllm.model_executor.layers.fused_moe.router.zero_expert_router import (
 import vllm_gaudi.envs as gaudi_envs
 from vllm_gaudi.extension.ops import VllmMixtureOfExpertsOp
 from vllm_gaudi.extension.runtime import get_config
+from vllm_gaudi.ops.hpu_glm5next_moe import resolve_glm_clamp_config
 from vllm_gaudi.utils import has_quant_config
 from vllm_gaudi.v1.worker.hpu_dp_utils import dispatch_hidden_states, dispatch_tensor, get_hpu_dp_metadata
 
@@ -299,6 +300,64 @@ def _swigluoai_moe(
     return _unfused_swigluoai_moe(layer, x, topk_ids, topk_weights, alpha=alpha, beta=beta, limit=limit)
 
 
+def _apply_moe_activation_path(
+    layer,
+    x: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    activation: str,
+    *,
+    minimax_alpha: float,
+    minimax_beta: float,
+    minimax_limit: float | None,
+) -> torch.Tensor:
+    """Apply HPU's clamp-aware unfused paths or the ordinary fused MoE op.
+
+    GLM leaves the upstream activation at ``silu`` and carries the clamp in
+    ``swiglu_limit``.  It must use alpha=1, beta=0 rather than MiniMax's cached
+    SwiGLU-OAI defaults.  The helper returns a rank-local partial, preserving the
+    existing MoERunner dispatch/reduce contract.
+    """
+    glm_clamp = resolve_glm_clamp_config(layer, activation)
+    if glm_clamp is not None:
+        w13 = getattr(layer, "w13_weight", None)
+        w2 = getattr(layer, "w2_weight", None)
+        if w13 is None or w2 is None or w13.dtype not in (torch.bfloat16, torch.float16) or w2.dtype != w13.dtype:
+            raise NotImplementedError(
+                "HPU's GLM clamped SiLU fallback requires matching BF16/FP16 "
+                "layer.w13_weight and layer.w2_weight tensors"
+            )
+        return _swigluoai_moe(
+            layer,
+            x,
+            topk_ids,
+            topk_weights,
+            alpha=glm_clamp.alpha,
+            beta=glm_clamp.beta,
+            limit=glm_clamp.limit,
+        )
+
+    if activation == _SWIGLU_OAI_ACTIVATION:
+        # Preserve the existing MiniMax-M3 configuration and defaults exactly.
+        return _swigluoai_moe(
+            layer,
+            x,
+            topk_ids,
+            topk_weights,
+            alpha=minimax_alpha,
+            beta=minimax_beta,
+            limit=minimax_limit,
+        )
+
+    return layer.moe_op(
+        x,
+        topk_ids,
+        topk_weights,
+        permuted_weights=True,
+        activation=activation,
+    )
+
+
 def model_has_quant_config() -> bool:
     """Whether the active model runs with a MoE quantization config.
 
@@ -508,26 +567,16 @@ class HPUUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         topk_weights = topk_weights.view(-1, topk_weights.shape[-1])
 
         activation = _normalize_moe_activation(layer.activation)
-        if activation == _SWIGLU_OAI_ACTIVATION:
-            # Habana fused MoE lacks SwiGLU-OAI; compute the experts unfused
-            # (dense), or gather-only routed experts at low-conc decode.
-            output = _swigluoai_moe(
-                layer,
-                x,
-                topk_ids,
-                topk_weights,
-                alpha=self.swiglu_alpha,
-                beta=self.swiglu_beta,
-                limit=self.swiglu_limit,
-            )
-        else:
-            output = layer.moe_op(
-                x,
-                topk_ids,
-                topk_weights,
-                permuted_weights=True,
-                activation=activation,
-            )
+        output = _apply_moe_activation_path(
+            layer,
+            x,
+            topk_ids,
+            topk_weights,
+            activation,
+            minimax_alpha=self.swiglu_alpha,
+            minimax_beta=self.swiglu_beta,
+            minimax_limit=self.swiglu_limit,
+        )
         if layer.moe_config.dp_size > 1 or layer.moe_config.is_sequence_parallel:
             return output.view(*(output.size(0), *input_shape[1:]))
         else:
@@ -601,26 +650,16 @@ class HPUUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
             return gpt_oss_out.view(*input_shape)
 
         activation = _normalize_moe_activation(layer.activation)
-        if activation == _SWIGLU_OAI_ACTIVATION:
-            # Habana fused MoE lacks SwiGLU-OAI; compute the experts unfused
-            # (dense), or gather-only routed experts at low-conc decode.
-            output = _swigluoai_moe(
-                layer,
-                x,
-                topk_ids,
-                topk_weights,
-                alpha=self.swiglu_alpha,
-                beta=self.swiglu_beta,
-                limit=self.swiglu_limit,
-            )
-        else:
-            output = layer.moe_op(
-                x,
-                topk_ids,
-                topk_weights,
-                permuted_weights=True,
-                activation=activation,
-            )
+        output = _apply_moe_activation_path(
+            layer,
+            x,
+            topk_ids,
+            topk_weights,
+            activation,
+            minimax_alpha=self.swiglu_alpha,
+            minimax_beta=self.swiglu_beta,
+            minimax_limit=self.swiglu_limit,
+        )
         if layer.moe_config.dp_size > 1 or layer.moe_config.is_sequence_parallel:
             return output.view(*(output.size(0), *input_shape[1:]))
         else:

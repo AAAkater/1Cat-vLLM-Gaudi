@@ -144,7 +144,10 @@ class HPUMLAAttention(MLAAttention):
 
         if not is_prefill:
             # decode
-            q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+            if self.qk_rope_head_dim == 0:
+                q_nope, q_pe = q, q.new_zeros(*q.shape[:-1], 0)
+            else:
+                q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
             # Convert from (B, N, P) to (N, B, P)
             q_nope = q_nope.transpose(0, 1)
             # Multiply (N, B, P) x (N, P, L) -> (N, B, L)
@@ -154,7 +157,13 @@ class HPUMLAAttention(MLAAttention):
 
         slot_mapping = attn_metadata.slot_mapping.flatten() if attn_metadata.slot_mapping is not None else None
 
-        latent_vec_k = torch.concat((k_c_normed, k_pe.view(*k_c_normed.shape[:-1], self.qk_rope_head_dim)), dim=-1)
+        if self.qk_rope_head_dim == 0:
+            latent_vec_k = k_c_normed
+        else:
+            latent_vec_k = torch.concat(
+                (k_c_normed, k_pe.view(*k_c_normed.shape[:-1], self.qk_rope_head_dim)),
+                dim=-1,
+            )
         latent_vec_k = latent_vec_k.view(-1, self.qk_rope_head_dim + self.kv_lora_rank)
 
         # write the latent and rope to kv cache
@@ -278,6 +287,11 @@ class HPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
         # accept-and-ignore the kwarg to keep the constructor signature in sync
         # with the base MultiHeadLatentAttentionWrapper / deepseek_v2 call site.
         allow_short_prefill_indexer_scoring_skip: bool = False,
+        # GLM-5.3-Flash opts into the upstream fused q/kv RMSNorm path. The
+        # flag does not mean q_c is pre-normalized; upstream skips q_a_layernorm
+        # and applies both norms in fused_q_kv_rmsnorm. HPU uses the equivalent
+        # separate RMSNorm path so each input is still normalized exactly once.
+        fuse_qkv_rmsnorm: bool = False,
     ) -> None:
         # Skip MultiHeadLatentAttentionWrapper.__init__() because it creates
         # MLAAttention → FlashAttnPrefillBackend which crashes on HPU.
@@ -313,6 +327,8 @@ class HPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
         # DSA sparse attention is not implemented on HPU: sparse layers run as
         # dense MLA and the indexer must never be invoked (its kernels and the
         # DeepseekV32IndexerBackend are CUDA-only).
+        self._requested_fuse_qkv_rmsnorm = fuse_qkv_rmsnorm
+        self.fuse_qkv_rmsnorm = False
         self.skip_topk = skip_topk or self.is_sparse
         # vllm#45964 (DCP query replication) added `self.dcp_q_replicate`, which
         # the base MultiHeadLatentAttentionWrapper.forward (inherited here, since
@@ -348,3 +364,47 @@ class HPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
             indexer=self.indexer,
             non_causal_multi_token_decode=non_causal_multi_token_decode,
         )
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        llama_4_scaling: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if self.qk_rope_head_dim != 0:
+            return super().forward(positions, hidden_states, llama_4_scaling)
+        return self._forward_no_rope(hidden_states, llama_4_scaling)
+
+    def _forward_no_rope(
+        self,
+        hidden_states: torch.Tensor,
+        llama_4_scaling: torch.Tensor | None,
+    ) -> torch.Tensor:
+        # The upstream forward splits kv_lora into [kv_lora_rank, 0] and then
+        # invokes rotary with an empty q/k slice. Both are unsupported on some
+        # HPU kernels, so the NoPE path projects and normalizes without either.
+        if self.q_lora_rank is not None:
+            qkv_lora = self.fused_qkv_a_proj(hidden_states)[0]
+            q_c, kv_c = qkv_lora.split([self.q_lora_rank, self.kv_lora_rank], dim=-1)
+            q_c = self.q_a_layernorm(q_c)
+            q_proj_input = q_c
+        else:
+            kv_c = self.kv_a_proj_with_mqa(hidden_states)[0]
+            q_proj_input = hidden_states
+
+        kv_c_normed = self.kv_a_layernorm(kv_c)
+        q_proj = self.q_b_proj if self.q_lora_rank is not None else self.q_proj
+        q = q_proj(q_proj_input)[0].view(-1, self.num_heads, self.qk_head_dim)
+        k_pe = kv_c_normed.new_zeros(*kv_c_normed.shape[:-1], 0)
+
+        if llama_4_scaling is not None:
+            q *= llama_4_scaling
+        attn_out = self.mla_attn(
+            q,
+            kv_c_normed,
+            k_pe,
+            output_shape=(hidden_states.shape[0], self.num_heads * self.v_head_dim),
+        )
+        if self.g_proj is not None:
+            attn_out = attn_out * self.g_proj(hidden_states)[0].sigmoid()
+        return self.o_proj(attn_out)[0]

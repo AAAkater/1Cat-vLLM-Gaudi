@@ -132,7 +132,8 @@ def get_features():
         Value(
             'flatten_input',
             Any(ModelType('qwen3_moe'), ModelType('qwen3_5'), ModelType('qwen3_5_text'), ModelType('granitemoe'),
-                ModelType('glm4_moe'), ModelType('gemma4'), ModelType('nemotron_h'), ModelType('deepseek_v4'))),
+                ModelType('glm4_moe'), ModelType('glm5_next'), ModelType('glm5_next_text'), ModelType('gemma4'),
+                ModelType('nemotron_h'), ModelType('deepseek_v4'))),
         Value('high_level_profiler_enabled', False, env_var='VLLM_PROFILER_ENABLED', env_var_type=boolean),
         Value('track_graph_compilation', False, env_var='PT_HPU_METRICS_GC_DETAILS', env_var_type=boolean),
         Value('per_token_kv_scaling_support',

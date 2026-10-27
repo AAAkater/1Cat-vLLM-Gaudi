@@ -363,6 +363,7 @@ def _patch_batched_count_greater_than() -> None:
 
 _GRANITE_LEGACY_LAYER_ALIASES = {
     "full_attention": "attention",
+    "deepseek_sparse_attention": "attention",
     "linear_attention": "mamba",
 }
 
@@ -521,12 +522,9 @@ def _hpu_get_num_layers_by_block_type(self, parallel_config, block_type="attenti
         # Hybrid model Qwen3Next Qwen3.5 Series
         layer_types_value = getattr(self.hf_text_config, "layer_types", None)
         if layer_types_value is not None:
-            if block_type == "attention":
-                return sum(t == "full_attention" for t in layer_types_value[start:end])
-            elif block_type == "linear_attention":
-                return sum(t == "linear_attention" for t in layer_types_value[start:end])
-            else:
-                return sum(t == block_type for t in layer_types_value[start:end])
+            aliases = _GRANITE_LEGACY_LAYER_ALIASES
+            normalized_block_type = aliases.get(block_type, block_type)
+            return sum(aliases.get(t, t) == normalized_block_type for t in layer_types_value[start:end])
 
         if layers_block_type_value is None and attn_type_list is None and layer_types_value is None:
             raise ValueError("The model is an hybrid without a layers_block_type or an "

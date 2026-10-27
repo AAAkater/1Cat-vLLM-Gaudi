@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 from functools import partial
 from typing import Optional
 
@@ -6,6 +7,7 @@ from vllm_gaudi import envs
 from torch.nn.parameter import Parameter
 from vllm.model_executor.layers.fused_moe.layer import FusedMoEFactory as FusedMoE
 
+from vllm.config import get_current_vllm_config_or_none
 from vllm.model_executor.layers.quantization import fp8
 from vllm.model_executor.layers.quantization.fp8 import (Fp8LinearMethod as OrigFp8LinearMethod, Fp8MoEMethod,
                                                          Fp8Config)
@@ -19,6 +21,12 @@ import vllm_gaudi.extension.ops as hpu_ops
 from vllm_gaudi.extension.ops import (VllmMixtureOfExpertsOpFP8PerChannel, VllmMixtureOfExpertsOpFP8)
 from vllm_gaudi.extension.runtime import get_config
 from vllm_gaudi.ops.hpu_fused_moe import (_normalize_moe_activation, model_has_quant_config, select_experts_from_routed)
+from vllm_gaudi.ops.hpu_glm5next_moe import (
+    Glm53Fp8MoeSpec,
+    _resolve_option,
+    require_fp8_clamped_moe_supported,
+)
+from vllm_gaudi.ops.hpu_glm5next_fp8_moe import glm53_fp8_moe
 from vllm_gaudi.v1.worker.hpu_dp_utils import dispatch_hidden_states, dispatch_tensor, get_hpu_dp_metadata
 
 from vllm.model_executor.kernels.linear import _POSSIBLE_FP8_BLOCK_KERNELS, _POSSIBLE_FP8_KERNELS
@@ -234,9 +242,88 @@ class HPUFp8OnlineLinearMethod(OrigFp8PerTensorOnlineLinearMethod):
         return output.narrow(0, 0, input_2d.shape[0]).reshape(output_shape)
 
 
+@dataclass(frozen=True)
+class _PreparedGlm53Fp8Moe:
+    spec: Glm53Fp8MoeSpec
+    # Keep the actual bindings, so a reload that replaces parameters must run
+    # process_weights_after_loading again. The core validates scale values.
+    tensors: tuple[torch.Tensor, ...]
+    expert_map: torch.Tensor | None
+    expert_map_snapshot: torch.Tensor | None
+
+
+def _glm53_fp8_tensors(layer):
+    try:
+        return (layer.w13_weight, layer.w13_weight_scale_inv, layer.w2_weight, layer.w2_weight_scale_inv)
+    except AttributeError as exc:
+        raise ValueError("GLM53 FP8 candidate requires loaded raw expert weights and block scales") from exc
+
+
+def _prepare_glm53_fp8_moe(layer, spec):
+    """Validate loaded raw blocks without rewriting weights or binding native MoE."""
+    tensors = _glm53_fp8_tensors(layer)
+    e, h, i = spec.local_experts, spec.hidden_size, spec.intermediate_size
+    shapes = ((e, 2 * i, h), (e, 2 * i // 128, h // 128), (e, h, i), (e, h // 128, i // 128))
+    names = ("w13_weight", "w13_weight_scale_inv", "w2_weight", "w2_weight_scale_inv")
+    if not all(isinstance(tensor, torch.Tensor) for tensor in tensors):
+        raise ValueError("GLM53 FP8 candidate requires loaded raw expert tensor weights and block scales")
+    device = tensors[0].device
+    for index, (name, tensor, shape) in enumerate(zip(names, tensors, shapes)):
+        dtype = torch.float32 if index % 2 else torch.float8_e4m3fn
+        if tensor.shape != shape or tensor.dtype != dtype or not tensor.is_contiguous() or tensor.device != device:
+            raise ValueError(f"GLM53 FP8 candidate requires contiguous {name} {shape} {dtype} on {device}; "
+                             f"got {tuple(tensor.shape)} {tensor.dtype} on {tensor.device}")
+        if index % 2 and (not torch.isfinite(tensor).all().item() or not (tensor > 0).all().item()):
+            raise ValueError(f"GLM53 FP8 candidate requires finite positive {name}")
+    if getattr(layer, "weight_block_size", None) not in ([128, 128], (128, 128)):
+        raise ValueError("GLM53 FP8 candidate requires loaded raw [128,128] blocks, without scale refinement")
+    if any(getattr(layer, name, None) is not None for name in ("w13_input_scale", "w2_input_scale")):
+        raise ValueError("GLM53 FP8 candidate requires dynamic activation scales")
+    expert_map = getattr(layer, "expert_map", None)
+    if expert_map is None:
+        if spec.ep_size != 1:
+            raise ValueError("GLM53 FP8 candidate requires an explicit contiguous expert_map for EP")
+    else:
+        if not isinstance(expert_map, torch.Tensor) or expert_map.dtype not in (torch.int32, torch.int64):
+            raise ValueError("GLM53 FP8 candidate requires an integer contiguous global-to-local expert_map")
+        expected = torch.full((spec.global_experts,), -1, dtype=expert_map.dtype, device=expert_map.device)
+        start = spec.ep_rank * spec.local_experts
+        expected[start:start + spec.local_experts] = torch.arange(
+            spec.local_experts, dtype=expert_map.dtype, device=expert_map.device)
+        if not torch.equal(expert_map, expected):
+            raise ValueError("GLM53 FP8 candidate requires the contiguous global-to-local expert_map")
+    return _PreparedGlm53Fp8Moe(
+        spec, tensors, expert_map, expert_map.clone() if expert_map is not None else None)
+
+
+def _require_glm53_fp8_eager(x):
+    if torch.compiler.is_compiling() or torch.jit.is_tracing() or torch.jit.is_scripting():
+        raise NotImplementedError("GLM53 FP8 candidate is eager-only; compilation/tracing is unsupported")
+    if x.device.type == "hpu" and torch.hpu.is_current_stream_capturing():
+        raise NotImplementedError("GLM53 FP8 candidate is eager-only; HPU graph capture is unsupported")
+
+
 class HPUFp8MoEMethod(Fp8MoEMethod):
 
     def __init__(self, quant_config: Fp8Config, layer: torch.nn.Module):
+        # Configuration eligibility is separate from HPU numerical validation.
+        # In particular, do not inspect the not-yet-loaded expert tensors here.
+        self._glm53_fp8_capability = {}
+        if _resolve_option(layer, "swiglu_limit") is not None:
+            config = get_current_vllm_config_or_none()
+            model_config = getattr(config, "model_config", None)
+            text_config = getattr(model_config, "hf_text_config", None)
+            if text_config is None:
+                text_config = getattr(model_config, "hf_config", None)
+            self._glm53_fp8_capability = dict(
+                is_gaudi2=hpu_ops.is_hpu_gaudi2,
+                scale_adjustment=get_config().scale_adjustment,
+                enforce_eager=getattr(model_config, "enforce_eager", False),
+                force_channel_fp8=envs.VLLM_HPU_FORCE_CHANNEL_FP8,
+                model_type=getattr(text_config, "model_type", None),
+            )
+        self._glm53_fp8_spec = require_fp8_clamped_moe_supported(
+            layer, quant_config, **self._glm53_fp8_capability)
         super().__init__(quant_config, layer)
 
         # Disable marlin
@@ -255,13 +342,35 @@ class HPUFp8MoEMethod(Fp8MoEMethod):
     def is_monolithic(self) -> bool:
         return True
 
+    def _check_glm53_fp8_candidate(self, layer):
+        capability = dict(getattr(self, "_glm53_fp8_capability", {}))
+        if capability:
+            # The loader reads live runtime flags too; never accept stale flags
+            # after construction while skipping the FN range conversion.
+            capability.update(is_gaudi2=hpu_ops.is_hpu_gaudi2,
+                              scale_adjustment=get_config().scale_adjustment,
+                              force_channel_fp8=envs.VLLM_HPU_FORCE_CHANNEL_FP8)
+        return require_fp8_clamped_moe_supported(layer, getattr(self, "quant_config", None), **capability)
+
     def create_weights(self, *args, **kwargs) -> None:
+        if getattr(self, "_glm53_fp8_spec", None) is not None:
+            layer = args[0] if args else kwargs['layer']
+            self._check_glm53_fp8_candidate(layer)
+            layer._hpu_glm53_fp8_prepared = None
         if hpu_ops.is_hpu_gaudi2:
             kwargs['weight_loader'] = hpu_ops.gaudi_weight_wrapper(kwargs.get('weight_loader'))
         kwargs['weight_loader'] = hpu_ops.synced_weight_loader(kwargs.get('weight_loader'))
         super().create_weights(*args, **kwargs)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        # Invalidate before validating, including failed reload attempts.
+        layer._hpu_glm53_fp8_prepared = None
+        spec = self._check_glm53_fp8_candidate(layer)
+        if spec is not None:
+            if spec != getattr(self, "_glm53_fp8_spec", None):
+                raise RuntimeError("GLM53 FP8 candidate configuration changed after construction")
+            layer._hpu_glm53_fp8_prepared = _prepare_glm53_fp8_moe(layer, spec)
+            return
         num_experts = layer.local_num_experts
         ep_shift = layer.moe_config.ep_rank * num_experts
 
@@ -304,6 +413,19 @@ class HPUFp8MoEMethod(Fp8MoEMethod):
         router_logits: torch.Tensor,
         **kwargs,
     ) -> torch.Tensor:
+        spec = getattr(self, "_glm53_fp8_spec", None)
+        if spec is not None:
+            _require_glm53_fp8_eager(x)
+            prepared = getattr(layer, "_hpu_glm53_fp8_prepared", None)
+            if (prepared is None or prepared.spec != self._check_glm53_fp8_candidate(layer)
+                    or any(old is not new for old, new in zip(prepared.tensors, _glm53_fp8_tensors(layer)))
+                    or prepared.expert_map is not getattr(layer, "expert_map", None)
+                    or (prepared.expert_map is not None
+                        and not torch.equal(prepared.expert_map, prepared.expert_map_snapshot))):
+                raise RuntimeError("GLM53 FP8 candidate requires process_weights_after_loading after loading/rebinding")
+        else:
+            # A lifecycle bypass must never send a clamped layer to native MoE.
+            require_fp8_clamped_moe_supported(layer)
         is_sequence_parallel = layer.moe_config.is_sequence_parallel
         input_shape = x.shape
         x = x.view(-1, x.shape[-1])
@@ -354,13 +476,27 @@ class HPUFp8MoEMethod(Fp8MoEMethod):
         topk_ids = topk_ids.view(-1, topk_ids.shape[-1])
         topk_weights = topk_weights.view(-1, topk_weights.shape[-1])
 
-        output = layer.moe_op(
-            x,
-            topk_ids,
-            topk_weights,
-            permuted_weights=True,
-            activation=_normalize_moe_activation(layer.activation),
-        )
+        if spec is not None:
+            # The native op normally performs this deferred input dispatch.
+            # The candidate skips native MoE, so pair it with the same gather.
+            if layer.moe_config.dp_size > 1 and self.has_moe_quant_config and self.use_dispatch_fn:
+                x = dispatch_hidden_states(x, is_sequence_parallel=is_sequence_parallel)
+            output = glm53_fp8_moe(
+                x, topk_ids, topk_weights, *prepared.tensors,
+                ep_rank=spec.ep_rank,
+                global_num_experts=spec.global_experts,
+                swiglu_limit=spec.limit,
+                block_size=(128, 128),
+                fp8_max=240.0,
+            )
+        else:
+            output = layer.moe_op(
+                x,
+                topk_ids,
+                topk_weights,
+                permuted_weights=True,
+                activation=_normalize_moe_activation(layer.activation),
+            )
         return output.view(*(output.size(0), *input_shape[1:]))
 
 

@@ -301,15 +301,22 @@ class HPUMLAImpl(MLACommonImpl[HPUAttentionMetadata], torch.nn.Module):
             latent_vec_k = current
         # =========================== #
 
-        k_c_normed, k_pe = latent_vec_k.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
-        k_pe = k_pe.view(-1, 1, self.qk_rope_head_dim)
+        if self.qk_rope_head_dim == 0:
+            k_c_normed = latent_vec_k
+            k_pe = None
+        else:
+            k_c_normed, k_pe = latent_vec_k.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+            k_pe = k_pe.view(-1, 1, self.qk_rope_head_dim)
 
         kv_nope = self.kv_b_proj(k_c_normed)[0]\
             .view(-1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
         k_nope, v = kv_nope\
             .split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
 
-        k = torch.cat((k_nope, k_pe.expand((*k_nope.shape[:-1], -1))), dim=-1)
+        if k_pe is None:
+            k = k_nope
+        else:
+            k = torch.cat((k_nope, k_pe.expand((*k_nope.shape[:-1], -1))), dim=-1)
 
         if not self.use_merged_prefill:
             assert attn_metadata.seq_lens_tensor is not None, \
@@ -356,7 +363,7 @@ class HPUMLAImpl(MLACommonImpl[HPUAttentionMetadata], torch.nn.Module):
                 HPUPagedAttention.split_kv_cache(k_cache, self.num_kv_heads, self.head_size)
         if isinstance(k_cache, tuple):
             k_cache = k_cache[0]  # Use only key_cache for MLA
-        query = torch.cat([q_nope, q_pe], dim=-1)
+        query = q_nope if q_pe is None or q_pe.shape[-1] == 0 else torch.cat([q_nope, q_pe], dim=-1)
         key_cache = k_cache.unsqueeze(1) if k_cache is not None else None
         value_cache = None
         output = HPUPagedAttention.forward_decode(query=query,

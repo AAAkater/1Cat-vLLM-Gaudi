@@ -220,6 +220,22 @@ except (ImportError, AttributeError):
     pass
 
 
+_GLM5_NEXT_MODEL_TYPES = ("glm5_next", "glm5_next_text")
+_GLM5_NEXT_ARCHITECTURES = ("Glm5NextForCausalLM", "Glm5NextForConditionalGeneration")
+
+
+def _is_glm5_next_model_type(model_type: str) -> bool:
+    return model_type in _GLM5_NEXT_MODEL_TYPES
+
+
+def _is_glm5_next_config(config) -> bool:
+    model_type = getattr(config, "model_type", "")
+    if _is_glm5_next_model_type(model_type):
+        return True
+    architectures = getattr(config, "architectures", None) or ()
+    return any(architecture in architectures for architecture in _GLM5_NEXT_ARCHITECTURES)
+
+
 def _zero_compact_gdn_slot(
     state_tensors: Iterable[torch.Tensor],
     base_slot: int,
@@ -926,16 +942,26 @@ def maybe_set_mamba_kv_cache_groups_ids(model, kv_cache_config: KVCacheConfig):
 
     mamba_like_arch = [
         "GraniteMoeHybridForCausalLM", "Qwen3_5MoeForConditionalGeneration", "Qwen3_5ForConditionalGeneration",
-        "Qwen3NextForCausalLM", "NemotronHForCausalLM"
+        "Qwen3NextForCausalLM", "NemotronHForCausalLM", *_GLM5_NEXT_ARCHITECTURES
     ]
     if not any(arch in getattr(model.config, 'architectures', []) for arch in mamba_like_arch):
         return
+    is_glm5_next = _is_glm5_next_config(model.config)
     mamba_like_layer = ['.mixer', '.linear_attn']
+    if is_glm5_next:
+        mamba_like_layer.append('.self_attn')
     compact_gdn_group_ids = [
         group_idx for group_idx, group in enumerate(kv_cache_config.kv_cache_groups)
         if isinstance(group.kv_cache_spec, MambaSpec) and group.kv_cache_spec.mamba_type in _GDN_MAMBA_TYPES
     ]
     compact_gdn_offsets = {group_idx: offset for offset, group_idx in enumerate(compact_gdn_group_ids)}
+
+    def _cache_group_idx_tensor(module, group_idx: int) -> torch.Tensor:
+        try:
+            device = next(module.parameters()).device
+        except StopIteration:
+            device = torch.device("hpu")
+        return torch.tensor(group_idx, dtype=torch.long, device=device)
 
     def _get_decoder_layer_by_idx(model_obj, idx: int):
         # Qwen3.5 multimodal path: model.language_model.model.layers
@@ -981,6 +1007,19 @@ def maybe_set_mamba_kv_cache_groups_ids(model, kv_cache_config: KVCacheConfig):
                     layer.linear_attn.cache_group_idx = torch.tensor(group_idx, dtype=torch.long, device="hpu")
                     layer.linear_attn.compact_state_group_offset = compact_gdn_offsets.get(group_idx)
                     layer.linear_attn.compact_state_group_count = len(compact_gdn_group_ids)
+            elif layer_name.endswith('.self_attn'):
+                # GLM-5.3 KDA registers under "...layers.N.self_attn"; dense
+                # MLA registers one level deeper at "...self_attn.attn".
+                layer_idx = int(layer_name.split('.')[-2])
+                layer = _get_decoder_layer_by_idx(model, layer_idx)
+                attn = getattr(layer, "self_attn", None) if layer is not None else None
+                if is_glm5_next and not hasattr(attn, "cache_group_idx"):
+                    raise RuntimeError("GLM-5.3 KDA cache mapping is missing self_attn.cache_group_idx; "
+                                       "refusing to fall back to cache group row 0")
+                if attn is not None and hasattr(attn, "cache_group_idx"):
+                    attn.cache_group_idx = _cache_group_idx_tensor(attn, group_idx)
+                    attn.compact_state_group_offset = compact_gdn_offsets.get(group_idx)
+                    attn.compact_state_group_count = len(compact_gdn_group_ids)
 
 
 def maybe_set_chunked_attention_layers(model_runner):
@@ -1024,6 +1063,8 @@ def _needs_compile_validation_warmup(model_type: str) -> bool:
         "qwen3_5_moe",
         "gemma4",
         "deepseek_v4",
+        "glm5_next",
+        "glm5_next_text",
     )
 
 
@@ -1226,6 +1267,7 @@ def apply_model_specific_patches(model_runner):
     is_llama4 = is_hpu_llama4_model(model_runner.model)
     model_type = getattr(model_runner.vllm_config.model_config.hf_config, "model_type", "")
     is_qwen_moe = model_type in ("qwen3_moe", "qwen3_5", "qwen3_5_text", "qwen3_5_moe")
+    is_glm5_next = _is_glm5_next_model_type(model_type)
 
     if model_type == "deepseek_v4":
         promoted_rope_buffers = _promote_deepseek_v4_rope_buffers(model_runner.model)
@@ -1273,6 +1315,16 @@ def apply_model_specific_patches(model_runner):
             )
 
     model_runner._has_heterogeneous_layers = is_llama4 or _needs_compile_validation_warmup(model_type)
+    if is_glm5_next:
+        # PT_COMPILE_ONLY_MODE does not materialize a lazily built cat(), so
+        # build the merged KDA convolution weights eagerly after weight loading
+        # and before the runner enters warmup.
+        from vllm_gaudi.models.glm5next_kda import init_merged_conv_weights
+
+        merged_conv_layers = init_merged_conv_weights(model_runner.model)
+        if merged_conv_layers == 0:
+            raise RuntimeError("GLM-5.3 model has no HPU KDA layers to initialize merged convolution weights")
+        logger.info("GLM-5.3: merged conv weights built eagerly for %d KDA layers", merged_conv_layers)
     if is_llama4:
         apply_hpu_llama4_post_load_patches(model_runner.model)
     if is_qwen_moe:
