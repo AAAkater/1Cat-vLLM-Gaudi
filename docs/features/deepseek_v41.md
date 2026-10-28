@@ -670,6 +670,7 @@ qualification before performance claims:
 | `dsv41_dspark_draft_packed_inputs` | `false` | Upload the per-round draft control, proposal, slot, activity, sidecar and lane inputs through three fixed typed host-to-device copies |
 | `dsv41_dspark_separate_query_pass` | `false` | Exclude separate draft input rows from the synchronous scheduler admission budget |
 | `dsv41_dspark_target_packed_lane_math` | `false` | Run target mHC, FFN norm, MoE, output projection, final norm and vocabulary head once over all fixed target rows instead of once per active lane |
+| `dsv41_dspark_target_grouped_moe` | `false` | Group packed target MoE routes by expert; requires `dsv41_dspark_target_packed_lane_math=true` |
 
 Packed target lane math keeps the packed target attention call and replaces
 the per-lane C6 mHC/norm/MoE/output-finish loop with one pass over all
@@ -679,6 +680,23 @@ the large-row mHC operators and the request-batch fused N256 FP8 expert body
 in tiles of at most 64 rows. Results are not bit-identical to the C6 lane
 path; inactive rows are masked exactly as before. Output qualification is
 still open, so treat it as a diagnostic option.
+
+Grouped target MoE is a separate diagnostic opt-in and defaults to `false`.
+It requires packed target lane math plus every target layer's N256 FP8 and
+fused MoE configuration, native top-6 routing, `topk=6`, and the prepared
+W13/W2 q16 and s16 tensors together with `lookup`. When
+`w13_fp8_channel` is non-`None`, normal scales and
+`VLLM_HPU_DSV41_PREFILL_COLUMN_INTERLEAVE=1` are also required. The non-channel
+path does not require those two settings. Startup fails for an enabled stage
+if any target layer lacks a required capability; it does not silently fall
+back to the fused per-row expert body.
+
+The grouped path reuses the bucketed prompt expert plans with static
+occupancy, decoding each selected expert's weights once for all routed target
+rows. Its route ordering, FP8 scale handling and accumulation order differ
+from the fused N256 target body, so outputs need not be bit-identical. Model,
+numerical and serving qualification of this grouped target path is not
+complete.
 
 Query compaction preserves the masked compressor, mHC/MoE, Engram, output
 projection, auxiliary states and verification layout. It is not full target

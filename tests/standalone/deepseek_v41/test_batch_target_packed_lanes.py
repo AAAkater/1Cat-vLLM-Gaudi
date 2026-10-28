@@ -154,11 +154,128 @@ def test_packed_recipes_run_eagerly_off_hpu():
     assert torch.count_nonzero(pre_mix[~active]).item() == 0
 
 
-def test_packed_moe_falls_back_off_hpu():
+class _HpuRecipeValue:
+
+    def __init__(self, value):
+        self.value = value
+        self.device = SimpleNamespace(type="hpu")
+
+
+def _recipe_harness(eager):
+    recipes = program_module.PackedTargetRecipes()
+    recipes._FUNCTIONS = {"test": eager}
+    return recipes
+
+
+def test_packed_recipes_fall_back_if_compile_construction_fails(monkeypatch):
+    eager_calls = []
+
+    def eager(value):
+        eager_calls.append(value.value)
+        return value.value * 3
+
+    compile_calls = []
+
+    def unavailable(function, **kwargs):
+        compile_calls.append((function, kwargs))
+        raise RuntimeError("hpu_backend unavailable")
+
+    monkeypatch.setattr(program_module.torch, "compile", unavailable)
+    recipes = _recipe_harness(eager)
+    value = _HpuRecipeValue(4)
+
+    assert recipes.run("test", value) == 12
+    assert not recipes._compiled
+    assert len(compile_calls) == 1
+    assert compile_calls[0] == (eager, {"backend": "hpu_backend", "fullgraph": True, "dynamic": False})
+    assert recipes.status() == {
+        "compiled": [],
+        "calls": 0,
+        "disabled_reason": "test: RuntimeError: hpu_backend unavailable",
+        "grouped_moe": False,
+    }
+
+    assert recipes.run("test", value) == 12
+    assert eager_calls == [4, 4]
+    assert len(compile_calls) == 1
+
+
+def test_packed_recipes_fall_back_if_first_compiled_call_fails(monkeypatch):
+    eager_calls = []
+
+    def eager(value):
+        eager_calls.append(value.value)
+        return value.value * 3
+
+    compile_calls = []
+    compiled_calls = []
+
+    def failing_compile(function, **kwargs):
+        compile_calls.append((function, kwargs))
+
+        def fail(value):
+            compiled_calls.append(value.value)
+            raise RuntimeError("first graph execution failed")
+
+        return fail
+
+    monkeypatch.setattr(program_module.torch, "compile", failing_compile)
+    recipes = _recipe_harness(eager)
+    value = _HpuRecipeValue(5)
+
+    assert recipes.run("test", value) == 15
+    assert len(compile_calls) == 1
+    assert compiled_calls == [5]
+    assert recipes.status() == {
+        "compiled": ["test"],
+        "calls": 0,
+        "disabled_reason": "test: RuntimeError: first graph execution failed",
+        "grouped_moe": False,
+    }
+
+    assert recipes.run("test", value) == 15
+    assert eager_calls == [5, 5]
+    assert len(compile_calls) == 1
+    assert compiled_calls == [5]
+
+
+def test_packed_recipes_cache_successful_compile(monkeypatch):
+    eager_calls = []
+
+    def eager(value):
+        eager_calls.append(value.value)
+        return value.value * 3
+
+    compile_calls = []
+    compiled_calls = []
+
+    def recording_compile(function, **kwargs):
+        compile_calls.append((function, kwargs))
+
+        def run(value):
+            compiled_calls.append(value.value)
+            return function(value)
+
+        return run
+
+    monkeypatch.setattr(program_module.torch, "compile", recording_compile)
+    recipes = _recipe_harness(eager)
+
+    assert recipes.run("test", _HpuRecipeValue(6)) == 18
+    assert recipes.run("test", _HpuRecipeValue(7)) == 21
+    assert len(compile_calls) == 1
+    assert compile_calls[0] == (eager, {"backend": "hpu_backend", "fullgraph": True, "dynamic": False})
+    assert compiled_calls == [6, 7]
+    assert eager_calls == [6, 7]
+    assert recipes.status() == {"compiled": ["test"], "calls": 2, "disabled_reason": None, "grouped_moe": False}
+
+
+def test_packed_moe_falls_back_off_hpu_without_grouped():
     seen = []
 
     class _MoE:
         n256_fp8 = True
+        n256_fused = True
         router_top6 = True
         topk = 6
 
@@ -167,9 +284,44 @@ def test_packed_moe_falls_back_off_hpu():
             return value * 2
 
     value = torch.ones(12, 4)
-    assert torch.equal(program_module.packed_target_moe(_MoE(), value, torch.zeros(12, dtype=torch.bool)),
-                       value * 2)
+    image_mask = torch.zeros(12, dtype=torch.bool)
+    assert torch.equal(program_module.packed_target_moe(_MoE(), value, image_mask, grouped=False), value * 2)
     assert seen == [{"decode": True}]
+
+
+class _GroupedCapabilityMoE:
+
+    def __init__(self):
+        self.n256_fp8 = True
+        self.n256_fused = True
+        self.router_top6 = True
+        self.topk = 6
+        self.calls = []
+
+    def __call__(self, value, image_mask, **kwargs):
+        self.calls.append((value, image_mask, kwargs))
+        return value
+
+
+@pytest.mark.parametrize("attribute", ["n256_fp8", "n256_fused", "router_top6", "topk"])
+def test_grouped_packed_moe_rejects_missing_capability_without_ordinary_fallback(attribute):
+    moe = _GroupedCapabilityMoE()
+    delattr(moe, attribute)
+    value = SimpleNamespace(device=SimpleNamespace(type="hpu"))
+
+    with pytest.raises(RuntimeError, match="Grouped packed target MoE requires HPU"):
+        program_module.packed_target_moe(moe, value, None, grouped=True)
+    assert moe.calls == []
+
+
+def test_grouped_packed_moe_rejects_non_hpu_without_ordinary_fallback():
+    moe = _GroupedCapabilityMoE()
+    value = torch.ones(12, 4)
+    image_mask = torch.zeros(12, dtype=torch.bool)
+
+    with pytest.raises(RuntimeError, match="Grouped packed target MoE requires HPU"):
+        program_module.packed_target_moe(moe, value, image_mask, grouped=True)
+    assert moe.calls == []
 
 
 class _HeadProgram:

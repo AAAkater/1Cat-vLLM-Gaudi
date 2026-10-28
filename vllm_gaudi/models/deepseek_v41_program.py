@@ -1716,6 +1716,8 @@ def packed_target_moe(moe, value, image_mask, gather=None, *, grouped=False):
     if not (getattr(moe, "n256_fp8", False) and getattr(moe, "n256_fused", False)
             and getattr(moe, "router_top6", False) and getattr(moe, "topk", 0) == 6
             and value.device.type == "hpu"):
+        if grouped:
+            raise RuntimeError("Grouped packed target MoE requires HPU, N256 FP8/fused experts and top-6 routing")
         return moe(value, image_mask, decode=True)
     w = moe.weights
     gate_logits = moe._router_logits(value)
@@ -1777,10 +1779,10 @@ class PackedTargetRecipes:
         if self.disabled_reason is not None or args[0].device.type != "hpu":
             return function(*args)
         compiled = self._compiled.get(name)
-        if compiled is None:
-            compiled = torch.compile(function, backend=self.backend, fullgraph=True, dynamic=False)
-            self._compiled[name] = compiled
         try:
+            if compiled is None:
+                compiled = torch.compile(function, backend=self.backend, fullgraph=True, dynamic=False)
+                self._compiled[name] = compiled
             result = compiled(*args)
         except Exception as error:  # pragma: no cover - HPU failure policy
             self.disabled_reason = f"{name}: {type(error).__name__}: {error}"

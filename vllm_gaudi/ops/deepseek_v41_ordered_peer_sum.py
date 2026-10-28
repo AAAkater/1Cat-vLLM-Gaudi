@@ -55,9 +55,10 @@ def _compiled_rank_sum(shards):
     """
     state = _rank_sum_graph
     if state["disabled_reason"] is None and shards.device.type == "hpu":
-        if state["compiled"] is None:
-            state["compiled"] = torch.compile(ordered_rank_sum, backend="hpu_backend", fullgraph=True, dynamic=False)
         try:
+            if state["compiled"] is None:
+                compiled = torch.compile(ordered_rank_sum, backend="hpu_backend", fullgraph=True, dynamic=False)
+                state["compiled"] = compiled
             return state["compiled"](shards)
         except Exception as error:  # pragma: no cover - HPU failure policy
             state["disabled_reason"] = f"{type(error).__name__}: {error}"

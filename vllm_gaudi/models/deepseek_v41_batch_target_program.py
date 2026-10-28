@@ -35,6 +35,73 @@ from vllm_gaudi.ops.deepseek_v41_batch_target import (
 # 24 tiles is equivalent to the full-row path.
 _TARGET_MLA_TILE_PLAN_BUCKETS = (1, 2, 4, 8, 16, 24)
 _AUTO_TARGET_MLA_TILE_PLAN = object()
+_GROUPED_MOE_REQUIRED_FLAGS = ("n256_fp8", "n256_fused", "router_top6")
+_GROUPED_MOE_REQUIRED_EXPERT_FIELDS = ("w13_q16", "w2_q16", "w13_s16", "w2_s16")
+
+
+def validate_grouped_moe_capabilities(program, *, column_interleave: bool | None = None) -> None:
+    """Fail when grouped target MoE cannot take its expert-bucketed path.
+
+    Validate the grouped path at configuration time, before target state or
+    warmup setup, so an enabled option is rejected early instead of failing
+    partway through execution when a required capability is absent.
+
+    ``column_interleave`` is injectable for tests.  Runtime callers leave it
+    unset and use the same environment switch as the bucketed prompt plans.
+    """
+    if column_interleave is None:
+        from vllm_gaudi import envs
+
+        column_interleave = envs.VLLM_HPU_DSV41_PREFILL_COLUMN_INTERLEAVE
+
+    layers = getattr(program, "layers", None)
+    if layers is None:
+        raise ValueError("target grouped MoE requires program.layers")
+    try:
+        layers = tuple(layers)
+    except TypeError as error:
+        raise ValueError("target grouped MoE requires iterable program.layers") from error
+    if not layers:
+        raise ValueError("target grouped MoE requires at least one program.layers entry")
+
+    failures = []
+    for index, layer in enumerate(layers):
+        layer_id = getattr(layer, "layer", index)
+        moe = getattr(layer, "moe", None)
+        if moe is None:
+            failures.append(f"layer {layer_id}: moe is missing")
+            continue
+
+        missing = [f"moe.{name}=true" for name in _GROUPED_MOE_REQUIRED_FLAGS
+                   if not getattr(moe, name, False)]
+        if getattr(moe, "topk", None) != 6:
+            missing.append("moe.topk=6")
+        if getattr(moe, "lookup", None) is None:
+            missing.append("moe.lookup")
+        if not hasattr(moe, "normal_scales"):
+            missing.append("moe.normal_scales")
+
+        weights = getattr(moe, "weights", None)
+        experts = getattr(weights, "experts", None)
+        if experts is None:
+            missing.append("moe.weights.experts")
+        else:
+            missing.extend(f"moe.weights.experts.{name}" for name in _GROUPED_MOE_REQUIRED_EXPERT_FIELDS
+                           if getattr(experts, name, None) is None)
+            if not hasattr(experts, "w13_fp8_channel"):
+                missing.append("moe.weights.experts.w13_fp8_channel")
+            channel13 = getattr(experts, "w13_fp8_channel", None)
+            if channel13 is not None:
+                if not getattr(moe, "normal_scales", False):
+                    missing.append("moe.normal_scales=true for experts.w13_fp8_channel")
+                if not column_interleave:
+                    missing.append("VLLM_HPU_DSV41_PREFILL_COLUMN_INTERLEAVE=true for experts.w13_fp8_channel")
+
+        if missing:
+            failures.append(f"layer {layer_id}: " + ", ".join(missing))
+
+    if failures:
+        raise ValueError("target grouped MoE capability validation failed: " + "; ".join(failures))
 
 
 def _build_target_mla_tile_plan(active_lanes, *, capacity: int, rows: int, device):
@@ -731,6 +798,8 @@ class DSparkTargetStage(nn.Module):
             raise TypeError("target grouped MoE must be a boolean")
         if packed_grouped_moe and not packed_lane_math:
             raise ValueError("target grouped MoE requires packed lane math")
+        if packed_grouped_moe:
+            validate_grouped_moe_capabilities(program)
         self.program = program
         self.ragged_compressor = ragged_compressor
         self.packed_lane_math = packed_lane_math
@@ -823,4 +892,5 @@ __all__ = [
     "CompiledTargetBatchStage",
     "DSparkTargetStage",
     "PreparedTargetBatchLayerGroup",
+    "validate_grouped_moe_capabilities",
 ]
