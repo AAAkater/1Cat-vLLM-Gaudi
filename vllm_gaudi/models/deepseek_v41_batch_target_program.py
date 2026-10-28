@@ -16,6 +16,7 @@ import torch._dynamo
 from torch import nn
 
 from vllm_gaudi.models.deepseek_v41_program import (
+    PackedTargetRecipes,
     PreparedInput,
     decode_bf16_identity,
     final_collapse_rms_norm,
@@ -211,6 +212,59 @@ class _TargetAttentionFinishAdapter:
         return torch.cat(finished, dim=0), selected, candidates, main_done, index_done
 
 
+class _PackedTargetAttention:
+    """One packed attention call followed by one batch-wide output finish.
+
+    Used by the opt-in packed target lane math.  The raw attention wrapper is
+    the same compiled fixed-capacity boundary as the lane path; the output
+    projection and its TP reduction run once over all rows (eager), and the
+    row-owner mask replaces the host active-lane loop.
+    """
+
+    def __init__(self, raw_attention, attention, tile_indices=None, query_indices=None, query_valid=None):
+        self.raw_attention = raw_attention
+        self.attention = attention
+        self.tile_indices = tile_indices
+        self.query_indices = query_indices
+        self.query_valid = query_valid
+
+    def __call__(
+        self,
+        value,
+        positions,
+        slots,
+        pages,
+        selected,
+        candidates,
+        main_done,
+        index_done,
+        row_valid,
+        ready_outputs,
+    ):
+        query_kwargs = ({} if self.query_indices is None else
+                        {"query_indices": self.query_indices, "query_valid": self.query_valid})
+        raw_output, selected, candidates, main_done, index_done = self.raw_attention(
+            value,
+            positions,
+            slots,
+            pages,
+            selected,
+            candidates,
+            main_done,
+            index_done,
+            row_valid,
+            ready_outputs,
+            tile_indices=self.tile_indices,
+            **query_kwargs,
+        )
+        if raw_output.shape[0] != positions.numel():
+            raise ValueError("packed target attention returned a different row count")
+        active = row_valid.to(torch.bool) & (slots >= 0)
+        partial = self.attention.project_output_target_rows(raw_output, positions)
+        finished = self.attention.reduce_output_target_rows(partial, active)
+        return finished, selected, candidates, main_done, index_done
+
+
 class PreparedTargetBatchLayerGroup(nn.Module):
     """Decoder layers sharing one fixed ``6*N`` target bucket."""
 
@@ -223,7 +277,9 @@ class PreparedTargetBatchLayerGroup(nn.Module):
                  request_slots: tuple[int, ...],
                  text_input: bool = False,
                  runtime_request_slots: bool = False,
-                 ragged_compressor: bool = False):
+                 ragged_compressor: bool = False,
+                 packed_lane_math: bool = False,
+                 packed_recipes: PackedTargetRecipes | None = None):
         super().__init__()
         if not getattr(stage, "dspark", False):
             raise ValueError("DSpark target batch requires a DSpark prepared stage")
@@ -261,6 +317,14 @@ class PreparedTargetBatchLayerGroup(nn.Module):
         self.attention_wrappers = self.attention_calls
         self.output_finish_wrappers = self.output_finish_calls
         self.attention_wrappers_compiled = False
+        # Opt-in batch-wide mHC/MoE/finish math (one pass over all 6*N rows).
+        # It requires the same C6 slice contract so the raw packed attention
+        # wrapper and fixed row layout are shared with the lane path.
+        if packed_lane_math and not self.slice_target_layers:
+            raise ValueError("packed target lane math requires layers with the fixed C6 slice contract")
+        self.packed_lane_math = bool(packed_lane_math)
+        self.packed_recipes = (packed_recipes if packed_recipes is not None else
+                               PackedTargetRecipes() if self.packed_lane_math else None)
         self.input = PreparedInput(stage.weights.embed, stage.tp_rank, stage.reduce) if text_input else None
         self.final = bool(getattr(stage, "is_last_stage", stage.pp_rank == 1)) and stop == len(stage.layers)
         self.norm = getattr(stage.weights, "norm", None) if self.final else None
@@ -284,10 +348,13 @@ class PreparedTargetBatchLayerGroup(nn.Module):
             torch.compile(wrapper, backend=backend, fullgraph=True, dynamic=False)
             for wrapper in self.attention_calls
         )
-        self.output_finish_wrappers = tuple(
+        # Packed lane math never calls the six-row finish wrappers.
+        self.output_finish_wrappers = (self.output_finish_calls if self.packed_lane_math else tuple(
             torch.compile(wrapper, backend=backend, fullgraph=True, dynamic=False)
             for wrapper in self.output_finish_calls
-        )
+        ))
+        if self.packed_recipes is not None:
+            self.packed_recipes.backend = backend
         self.attention_wrappers_compiled = True
         return self.attention_wrappers
 
@@ -340,6 +407,11 @@ class PreparedTargetBatchLayerGroup(nn.Module):
         selections = list(selections)
         main_ready = list(main_ready)
         index_ready = list(index_ready)
+        if self.packed_lane_math:
+            return self._forward_packed(residual, pre_mix, positions, image_mask, engram_rows, slots, pages,
+                                        row_valid, selections, candidates, main_ready, index_ready,
+                                        tile_indices=tile_indices, query_indices=query_indices,
+                                        query_valid=query_valid)
         target_states = []
         collapse_handoffs = (tuple({} for _ in range(self.batch_capacity))
                              if self.slice_target_layers and self.preserve_layer_rounding else None)
@@ -433,13 +505,71 @@ class PreparedTargetBatchLayerGroup(nn.Module):
             aux = torch.where(mask, aux, torch.zeros_like(aux))
         return value, pre_mix, aux, tuple(selections), candidates, tuple(main_ready), tuple(index_ready)
 
+    def _forward_packed(self, residual, pre_mix, positions, image_mask, engram_rows, slots, pages, row_valid,
+                        selections, candidates, main_ready, index_ready, *, tile_indices, query_indices,
+                        query_valid):
+        """Packed lane math: every layer runs once over all fixed rows.
+
+        No host active-lane loop: inactive lanes are excluded by the same
+        row-owner mask the lane path applies after each layer, so the work and
+        launches per layer do not depend on the active request count.
+        """
+        target_states = []
+        for layer_index, (layer, (index_source, kv_source)) in enumerate(
+                zip(self.layers, self.mapping, strict=True)):
+            rows = engram_rows[0 if layer.layer == 1 else 1] if layer.layer in (1, 14) and engram_rows else None
+            selection = selections[index_source] if index_source >= 0 else selections[0]
+            main_done = main_ready[kv_source] if kv_source >= 0 else main_ready[0]
+            index_done = index_ready[kv_source] if kv_source >= 0 else index_ready[0]
+            target_attention = _PackedTargetAttention(
+                self.attention_wrappers[layer_index],
+                layer.attention,
+                tile_indices=tile_indices,
+                query_indices=query_indices,
+                query_valid=query_valid,
+            )
+            result = layer.forward_batch_target_packed(
+                residual,
+                pre_mix,
+                positions,
+                image_mask,
+                rows,
+                slots,
+                pages,
+                selection,
+                candidates,
+                main_done,
+                index_done,
+                row_valid,
+                self.request_lengths,
+                self.request_slots,
+                target_attention=target_attention,
+                recipes=self.packed_recipes,
+            )
+            residual, pre_mix, selection, candidates, main_done, index_done, target = result
+            if index_source >= 0:
+                selections[index_source] = selection
+                main_ready[kv_source], index_ready[kv_source] = main_done, index_done
+            if target is not None:
+                target_states.append(target)
+        if not self.final:
+            return residual, pre_mix, None, tuple(selections), candidates, tuple(main_ready), tuple(index_ready)
+        value = final_collapse_rms_norm(residual, pre_mix, self.norm.weight, self.eps)
+        aux = torch.cat(target_states, -1) if target_states else None
+        mask = row_valid[:, None]
+        value = torch.where(mask, value, torch.zeros_like(value))
+        if aux is not None:
+            aux = torch.where(mask, aux, torch.zeros_like(aux))
+        return value, pre_mix, aux, tuple(selections), candidates, tuple(main_ready), tuple(index_ready)
+
 
 class CompiledTargetBatchStage:
     """Compiled native/eager group sequence for one request-length pattern."""
 
     def __init__(self, stage, request_lengths: tuple[int, ...], request_slots: tuple[int, ...], *,
                  backend: str = "hpu_backend", group_size: int = 4,
-                 runtime_request_slots: bool = False, ragged_compressor: bool = False):
+                 runtime_request_slots: bool = False, ragged_compressor: bool = False,
+                 packed_lane_math: bool = False, packed_grouped_moe: bool = False):
         if not getattr(stage, "dspark", False):
             raise ValueError("DSpark target batch requires a DSpark prepared stage")
         if len(stage.layers) % group_size:
@@ -455,6 +585,13 @@ class CompiledTargetBatchStage:
         self.logical_request_lengths = tuple(request_lengths)
         self.request_lengths = (TARGET_ROWS_PER_REQUEST, ) * self.batch_capacity
         self.request_slots = tuple(int(slot) for slot in request_slots)
+        self.packed_lane_math = bool(packed_lane_math)
+        if packed_grouped_moe and not self.packed_lane_math:
+            raise ValueError("target grouped MoE requires packed lane math")
+        # One recipe set per stage: its compiled callables are shared by all
+        # layers (weights are explicit arguments).
+        self.packed_recipes = (PackedTargetRecipes(backend, grouped_moe=bool(packed_grouped_moe))
+                               if self.packed_lane_math else None)
         self.groups = nn.ModuleList([
             PreparedTargetBatchLayerGroup(
                 stage,
@@ -465,6 +602,8 @@ class CompiledTargetBatchStage:
                 text_input=start == 0,
                 runtime_request_slots=runtime_request_slots,
                 ragged_compressor=ragged_compressor,
+                packed_lane_math=self.packed_lane_math,
+                packed_recipes=self.packed_recipes,
             )
             for start in range(0, len(stage.layers), group_size)
         ])
@@ -581,12 +720,20 @@ class DSparkTargetStage(nn.Module):
     """
 
     def __init__(self, program, request_lengths: tuple[int, ...], request_slots: tuple[int, ...], *,
-                 backend: str = "hpu_backend", state_capacity: int | None = None, ragged_compressor: bool = False):
+                 backend: str = "hpu_backend", state_capacity: int | None = None, ragged_compressor: bool = False,
+                 packed_lane_math: bool = False, packed_grouped_moe: bool = False):
         super().__init__()
         if type(ragged_compressor) is not bool:
             raise TypeError("target ragged compressor must be a boolean")
+        if type(packed_lane_math) is not bool:
+            raise TypeError("target packed lane math must be a boolean")
+        if type(packed_grouped_moe) is not bool:
+            raise TypeError("target grouped MoE must be a boolean")
+        if packed_grouped_moe and not packed_lane_math:
+            raise ValueError("target grouped MoE requires packed lane math")
         self.program = program
         self.ragged_compressor = ragged_compressor
+        self.packed_lane_math = packed_lane_math
         if len(request_lengths) != len(request_slots):
             raise ValueError("target request lengths and slots must describe the same capacity")
         self.batch_capacity = len(request_slots)
@@ -603,6 +750,10 @@ class DSparkTargetStage(nn.Module):
         owner_capacity = self.batch_capacity if state_capacity is None else state_capacity
         self.state = initialize_target_batch_state(program, owner_capacity)
         ragged_kwargs = {"ragged_compressor": True} if ragged_compressor else {}
+        if packed_lane_math:
+            ragged_kwargs["packed_lane_math"] = True
+        if packed_grouped_moe:
+            ragged_kwargs["packed_grouped_moe"] = True
         self.compiled = CompiledTargetBatchStage(
             program, self.request_lengths, self.request_slots, backend=backend,
             runtime_request_slots=state_capacity is not None, **ragged_kwargs)

@@ -1188,6 +1188,20 @@ class V41ModelRunner:
             configure_ragged(ragged_compressor)
         elif ragged_compressor:
             raise RuntimeError("dsv41_dspark_target_ragged_compressor requires packed DSpark target stages")
+        packed_lane_math = additional.get("dsv41_dspark_target_packed_lane_math", False)
+        if type(packed_lane_math) is not bool:
+            raise TypeError("dsv41_dspark_target_packed_lane_math must be a boolean")
+        grouped_moe = additional.get("dsv41_dspark_target_grouped_moe", False)
+        if type(grouped_moe) is not bool:
+            raise TypeError("dsv41_dspark_target_grouped_moe must be a boolean")
+        configure_packed_lanes = getattr(target_stage, "configure_packed_lane_math", None)
+        if callable(configure_packed_lanes):
+            if grouped_moe:
+                configure_packed_lanes(packed_lane_math, grouped_moe=True)
+            else:
+                configure_packed_lanes(packed_lane_math)
+        elif packed_lane_math or grouped_moe:
+            raise RuntimeError("dsv41_dspark_target_packed_lane_math requires packed DSpark target stages")
         configure_finish = getattr(target_stage, "configure_device_finish", None)
         if callable(configure_finish):
             configure_finish(additional.get("dsv41_dspark_device_target_finish", False))

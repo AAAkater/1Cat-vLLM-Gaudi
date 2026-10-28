@@ -13,6 +13,8 @@ from vllm_gaudi.compilation.deepseek_v41_frontend_cache import persistent_tensor
 _ROW_BUCKETS = (64, 128, 192, 256)
 _FP8_ROW_BUCKETS = tuple(range(32, 257, 32))
 _executors = {}
+# Packed DSpark target rows use their own plans (see run_bucketed_target).
+_target_executors = {}
 
 
 def expert_bucket_width(rows, quantum=64):
@@ -76,6 +78,19 @@ def device_bucketed_route_blocks(ids, experts=384, quantum=64):
     return (*descriptors, torch.stack(occupied))
 
 
+def static_occupied_blocks(descriptors, buckets, quantum, tokens):
+    """Upper bound of occupied blocks per bucket without reading the counts.
+
+    Every capacity block may be occupied, except in a bucket whose smallest
+    member count exceeds the token count: one token selects an expert at most
+    once, so such a bucket is always empty.
+    """
+    return [
+        int(descriptors[index * 2 + 1].shape[0]) if rows - quantum + 1 <= tokens else 0
+        for index, rows in enumerate(buckets)
+    ]
+
+
 @functools.lru_cache(maxsize=32)
 def _compiled_routes(signature):
     entry = FunctionType(device_bucketed_route_blocks.__code__.replace(co_name=f"expert_buckets_{signature}"),
@@ -85,8 +100,16 @@ def _compiled_routes(signature):
 
 class _BucketedPrefillPlans:
 
-    def __init__(self, *, maximum_shapes=None):
+    def __init__(self, *, maximum_shapes=None, static_occupancy=False):
         from vllm_gaudi.ops.deepseek_v41_prefill_capacity import PREFILL_COMPUTE_BUCKETS
+
+        # Static occupancy replays every capacity block of each reachable
+        # bucket instead of reading the occupied counts back to the host.
+        # Empty blocks carry expert -1 and slot -1 (zero route weight, written
+        # only to the sentinel row), exactly like the padding inside an
+        # occupied group, so the result is unchanged; only the host read and
+        # the occupancy-dependent tail plans disappear.
+        self.static_occupancy = bool(static_occupancy)
 
         # Keep the finite warmed geometries across long/short requests. A
         # two-shape LRU evicts startup's prepared plans before their users
@@ -178,7 +201,10 @@ class _BucketedPrefillPlans:
         quantum = 32 if single_fp8 and not fixed_pair_tail else 64
         buckets = _FP8_ROW_BUCKETS if quantum == 32 else _ROW_BUCKETS
         desc = _compiled_routes((ids.shape[0], q13.shape[0], quantum))(ids, q13.shape[0], quantum)
-        active = [int(count) for count in desc[-1].cpu().tolist()]
+        if self.static_occupancy:
+            active = static_occupied_blocks(desc, buckets, quantum, ids.shape[0])
+        else:
+            active = [int(count) for count in desc[-1].cpu().tolist()]
         weights = (q13, q2, s13, s2, lookup, channel13) if single_fp8 else (q13, q2, s13, s2, lookup)
 
         def layout(v):
@@ -262,10 +288,25 @@ def run_bucketed_prefill(value, ids, routing, q13, q2, s13, s2, lookup, normal_s
     return executor(value, ids, routing, q13, q2, s13, s2, lookup, normal_scales, channel13)
 
 
+def run_bucketed_target(value, ids, routing, q13, q2, s13, s2, lookup, normal_scales, channel13=None):
+    """Grouped experts for packed DSpark target rows without a host occupancy read.
+
+    Uses the qualified prompt expert arithmetic (route-ordered reduction),
+    with static-occupancy plans held apart from the prompt plans so target
+    shapes never evict a warmed prompt geometry.
+    """
+    executor = _target_executors.get(value.device)
+    if executor is None:
+        executor = _BucketedPrefillPlans(static_occupancy=True)
+        _target_executors[value.device] = executor
+    return executor(value, ids, routing, q13, q2, s13, s2, lookup, normal_scales, channel13)
+
+
 def invalidate_bucketed_prefill_plans():
-    for executor in _executors.values():
+    for executor in (*_executors.values(), *_target_executors.values()):
         executor.close()
     _executors.clear()
+    _target_executors.clear()
 
 
 def bucketed_prefill_plan_stats():
@@ -278,3 +319,14 @@ def bucketed_prefill_plan_stats():
                 preparation_ms=sum(executor.preparation_ms for executor in _executors.values()),
                 workspace_bytes=sum(e.workspace.numel() * e.workspace.element_size() for e in _executors.values()
                                     if e.workspace is not None))
+
+
+def bucketed_target_plan_stats():
+    """Static-occupancy target plans (separate from the prompt plan stats)."""
+    plans = [plan for executor in _target_executors.values() for family in executor.plans.values()
+             for plan in family.values()]
+    return dict(plans=len(plans),
+                recipes=sum(p.recipes for p in plans),
+                replays=sum(p.replays for p in plans),
+                preparation_count=sum(executor.preparation_count for executor in _target_executors.values()),
+                preparation_ms=sum(executor.preparation_ms for executor in _target_executors.values()))

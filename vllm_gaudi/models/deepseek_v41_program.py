@@ -1607,6 +1607,196 @@ def post_attention_rows(
     )
 
 
+# Packed target lane math (opt-in ``dsv41_dspark_target_packed_lane_math``).
+#
+# The default target stage runs the mHC/norm/MoE/output-finish math once per
+# active lane on six rows so it repeats the serial C6 arithmetic exactly.  On
+# TP8 every lane then costs a full set of per-layer launches and collectives,
+# so a packed round grows linearly with the active request count.  The helpers
+# below run the same row-independent math once over all ``6*B`` rows.  They use
+# the large-M (prompt) arithmetic: the generic FP32 mHC control, the native
+# large-M collapse/post operators, and the N256 FP8 expert body tiled at 128
+# rows.  Results are therefore not bit-identical to the C6 lane path (HPU
+# kernels dispatch by row count); they are the same arithmetic as a prompt
+# chunk of the same rows.  None of them uses the prefill region cache, so the
+# warmed prompt geometries are never evicted or frozen out by target rows.
+
+
+def _packed_collapse(residual, previous_pre):
+    """Collapse four mHC streams to BF16 for any row count."""
+    if (gaudi_envs.VLLM_HPU_DSV41_PREFILL_MHC_POST and residual.device.type == "hpu"
+            and residual.dtype == torch.bfloat16 and residual.ndim == 3
+            and residual.shape[1:] == (4, 5120) and 1 <= residual.shape[0] <= 16384
+            and previous_pre.dtype == torch.float32):
+        return torch.ops.custom_op.custom_deepseek_v41_prefill_mhc_collapse_gaudi2(
+            residual.contiguous(), previous_pre.contiguous())
+    return (residual.float() * previous_pre.unsqueeze(-1)).sum(1).to(residual.dtype)
+
+
+def _packed_hc_post(value, residual, post, comb):
+    """Large-M mHC post update (same operator as prompt chunks, no region cache)."""
+    if gaudi_envs.VLLM_HPU_DSV41_PREFILL_MHC_POST and value.device.type == "hpu":
+        return torch.ops.custom_op.custom_deepseek_v41_prefill_mhc_post_gaudi2(
+            value.contiguous(), residual.contiguous(), post.contiguous(), comb.contiguous())
+    return hc_post(value, residual, post, comb)
+
+
+def packed_target_attention_input(residual, pre_mix, hc_fn, hc_scale, hc_base, hc_packed, norm_weight, eps, hc_eps,
+                                  iterations):
+    """mHC attention input and attention RMSNorm for all packed target rows.
+
+    Pure tensor function: every layer weight is an explicit argument so one
+    compiled graph serves all target layers of the same row count.
+    """
+    collapsed = _packed_collapse(residual, pre_mix)
+    value, new_pre, post, comb = hc_pre(
+        residual,
+        pre_mix,
+        hc_fn,
+        hc_scale,
+        hc_base,
+        eps,
+        hc_eps,
+        iterations,
+        packed_fn=hc_packed,
+        prefill=True,
+        collapsed_input=collapsed,
+    )
+    return rms_norm(value, norm_weight, eps), new_pre, post, comb
+
+
+def packed_target_ffn_input(attention, residual, new_pre, post, comb, hc_fn, hc_scale, hc_base, hc_packed,
+                            norm_weight, eps, hc_eps, iterations):
+    """Attention mHC post, FFN mHC input and FFN RMSNorm for all packed rows."""
+    residual = _packed_hc_post(attention, residual, post, comb)
+    collapsed = _packed_collapse(residual, new_pre)
+    value, pre_mix, post, comb = hc_pre(
+        residual,
+        new_pre,
+        hc_fn,
+        hc_scale,
+        hc_base,
+        eps,
+        hc_eps,
+        iterations,
+        packed_fn=hc_packed,
+        prefill=True,
+        collapsed_input=collapsed,
+    )
+    return residual, rms_norm(value, norm_weight, eps), pre_mix, post, comb
+
+
+def packed_target_ffn_output(value, residual, post, comb, pre_mix, active):
+    """FFN mHC post plus the fixed-capacity row mask."""
+    residual = _packed_hc_post(value, residual, post, comb)
+    residual = residual.masked_fill(~active[:, None, None], 0)
+    return residual, pre_mix.masked_fill(~active[:, None], 0)
+
+
+# The ordinary request-batch fused N256 expert body accepts B1..B64 rows.
+PACKED_TARGET_EXPERT_TILE = 64
+
+
+def packed_target_moe(moe, value, image_mask, gather=None, *, grouped=False):
+    """Routed + shared experts for packed target rows, then one TP reduction.
+
+    Router: large-M softplus/sqrt + native top-6.  Experts: the ordinary
+    request-batch fused N256 FP8 body in tiles of at most 64 rows.  The
+    unfused large-M compound body is a prompt kernel: it converts the routed
+    weights per call and measured 44/83/172 ms for 6/48/192 rows on one card,
+    against 1.9/5.9 ms for the fused batch body, whose 6- and 48-row outputs
+    were bit-identical to the C6 lane MoE.  Never builds a grouped prefill
+    plan (that reads expert counts back to the host).  With ``gather`` the TP
+    sum keeps the six-row native arithmetic for every row count
+    (``ordered_rows_reduce``).  ``grouped`` replaces the per-row fused expert
+    body by the prompt expert plans grouped by expert (each selected expert's
+    weights are decoded once for all its rows), with static occupancy so no
+    route count is read back to the host (``run_bucketed_target``).
+    """
+    if not (getattr(moe, "n256_fp8", False) and getattr(moe, "n256_fused", False)
+            and getattr(moe, "router_top6", False) and getattr(moe, "topk", 0) == 6
+            and value.device.type == "hpu"):
+        return moe(value, image_mask, decode=True)
+    w = moe.weights
+    gate_logits = moe._router_logits(value)
+    ids, routing = torch.ops.custom_op.custom_deepseek_v41_router_top6_gaudi2(
+        F.softplus(gate_logits).sqrt(), w.gate.bias, w.gate.bias_vl, image_mask)
+    del gate_logits
+    rows = value.shape[0]
+    if grouped:
+        from vllm_gaudi.ops.deepseek_v41_prefill_buckets import run_bucketed_target
+
+        experts = w.experts
+        output = run_bucketed_target(value, ids, routing, experts.w13_q16, experts.w2_q16, experts.w13_s16,
+                                     experts.w2_s16, moe.lookup, moe.normal_scales, experts.w13_fp8_channel)
+    else:
+        pieces = [
+            moe._forward_n256_fp8(value[start:start + PACKED_TARGET_EXPERT_TILE],
+                                  ids[start:start + PACKED_TARGET_EXPERT_TILE],
+                                  routing[start:start + PACKED_TARGET_EXPERT_TILE],
+                                  ordinary_decode=True, decode=True)
+            for start in range(0, rows, PACKED_TARGET_EXPERT_TILE)
+        ]
+        output = pieces[0] if len(pieces) == 1 else torch.cat(pieces)
+    shared = moe.shared_expert(value)
+    partial = (output.float() + shared.float()).to(value.dtype)
+    if gather is None:
+        return moe.reduce(partial)
+    from vllm_gaudi.ops.deepseek_v41_ordered_peer_sum import ordered_rows_reduce
+
+    return ordered_rows_reduce(partial, moe.reduce, gather, moe.tensor_parallel_size)
+
+
+class PackedTargetRecipes:
+    """Compiled pure-tensor recipes for the packed target lane math.
+
+    One fullgraph callable per helper; Dynamo specializes on row count, so
+    each target execution bucket compiles once and every layer reuses it.
+    Compilation or execution failure disables the recipes for the process and
+    the caller continues eagerly with the same helpers (same arithmetic).
+    """
+
+    _FUNCTIONS = {
+        "attention_input": packed_target_attention_input,
+        "ffn_input": packed_target_ffn_input,
+        "ffn_output": packed_target_ffn_output,
+    }
+
+    def __init__(self, backend: str = "hpu_backend", *, grouped_moe: bool = False):
+        if type(grouped_moe) is not bool:
+            raise TypeError("packed target grouped MoE must be a boolean")
+        self.backend = backend
+        # Opt-in expert-grouped MoE for the packed rows (see packed_target_moe).
+        self.grouped_moe = grouped_moe
+        self._compiled = {}
+        self.disabled_reason = None
+        self.calls = 0
+
+    def run(self, name, *args):
+        function = self._FUNCTIONS[name]
+        if self.disabled_reason is not None or args[0].device.type != "hpu":
+            return function(*args)
+        compiled = self._compiled.get(name)
+        if compiled is None:
+            compiled = torch.compile(function, backend=self.backend, fullgraph=True, dynamic=False)
+            self._compiled[name] = compiled
+        try:
+            result = compiled(*args)
+        except Exception as error:  # pragma: no cover - HPU failure policy
+            self.disabled_reason = f"{name}: {type(error).__name__}: {error}"
+            from vllm_gaudi.extension.logger import logger as runtime_logger
+
+            runtime_logger().warning("Disabling packed target recipes; continuing eagerly: %s",
+                                     self.disabled_reason)
+            return function(*args)
+        self.calls += 1
+        return result
+
+    def status(self):
+        return {"compiled": sorted(self._compiled), "calls": self.calls, "disabled_reason": self.disabled_reason,
+                "grouped_moe": self.grouped_moe}
+
+
 class PreparedDecoderLayer(nn.Module):
     _target_c6_slices = True
 
@@ -2902,6 +3092,74 @@ class PreparedDecoderLayer(nn.Module):
         pre_mix = pre_mix.masked_fill(~active[:, None], 0)
         if target_state is not None:
             target_state = target_state.masked_fill(~active[:, None], 0)
+        return residual, pre_mix, selected, candidates, main_ready, index_ready, target_state
+
+    def forward_batch_target_packed(
+        self,
+        residual,
+        pre_mix,
+        positions,
+        image_mask,
+        engram_rows,
+        slots,
+        pages,
+        selected,
+        candidates,
+        main_ready,
+        index_ready,
+        row_valid,
+        request_lengths,
+        request_slots,
+        *,
+        target_attention,
+        recipes=None,
+    ):
+        """Run one packed target layer with one batch-wide mHC/MoE pass.
+
+        Attention is the same packed fixed-capacity call as the C6 lane path.
+        Engram, mHC, norms, MoE and the output projection run once over all
+        six-row lanes instead of once per active lane (see the packed target
+        lane math helpers).  Inactive rows are masked exactly as in the lane
+        path.  No host lane loop, collapse handoff or per-lane collective.
+        """
+        if self.draft:
+            raise RuntimeError("Draft layers cannot run in the target batch stage")
+        capacity = len(request_slots)
+        if capacity < 1 or residual.shape[0] != 6 * capacity or positions.numel() != 6 * capacity:
+            raise ValueError("DSpark target rows must equal six times the fixed capacity")
+        if tuple(request_lengths) != (6, ) * capacity:
+            raise ValueError("DSpark target graph is fixed at six physical rows per request")
+        if target_attention is None:
+            raise RuntimeError("DSpark packed target attention requires the target program's wrapper")
+        recipes = PackedTargetRecipes() if recipes is None else recipes
+        w = self.weights
+        active = row_valid.to(torch.bool) & (slots >= 0)
+        if hasattr(w, "engram"):
+            if engram_rows is None:
+                raise RuntimeError("Engram layer requires its completed host gather and DMA generation")
+            if engram_rows.shape[0] != residual.shape[0]:
+                raise ValueError("packed target Engram rows must match the target rows")
+            local_rows = engram_rows if engram_rows.dtype == torch.bfloat16 else unpack_swa(engram_rows, 256)
+            rows = self.all_gather(local_rows, dim=1)
+            kv = linear(rows.flatten(1), w.engram.wkv)
+            residual = engram_update(residual, kv, w.engram.q_weight, w.engram.k_weight, active & ~image_mask,
+                                     self.eps)
+            del kv, rows, local_rows
+        target_state = None
+        if self.collect_target_state:
+            target_state = draft_context_state(residual, self.attention.batch_state.swa.shape[0],
+                                               grouped_prefill=False)
+            target_state = target_state.masked_fill(~active[:, None], 0)
+        value, new_pre, post, comb = recipes.run(
+            "attention_input", residual, pre_mix, w.hc_attn_fn, w.hc_attn_scale, w.hc_attn_base,
+            self.hc_attn_fn_packed, w.attn_norm.weight, self.eps, self.hc_eps, self.iterations)
+        attention_value, selected, candidates, main_ready, index_ready = target_attention(
+            value, positions, slots, pages, selected, candidates, main_ready, index_ready, active, ())
+        residual, normalized, pre_mix, post, comb = recipes.run(
+            "ffn_input", attention_value, residual, new_pre, post, comb, w.hc_ffn_fn, w.hc_ffn_scale,
+            w.hc_ffn_base, self.hc_ffn_fn_packed, w.ffn_norm.weight, self.eps, self.hc_eps, self.iterations)
+        value = packed_target_moe(self.moe, normalized, image_mask, self.all_gather, grouped=recipes.grouped_moe)
+        residual, pre_mix = recipes.run("ffn_output", value, residual, post, comb, pre_mix, active)
         return residual, pre_mix, selected, candidates, main_ready, index_ready, target_state
 
 

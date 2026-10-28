@@ -272,8 +272,14 @@ def _next_draft_rows(value: Any, batch_size: int, name: str) -> list[list[int]]:
 
 def _target_greedy_ids(program,
                        hidden: torch.Tensor,
-                       host_active_lanes: tuple[int, ...] | None = None) -> torch.Tensor:
-    """Select target ids with request-local C6 head projections."""
+                       host_active_lanes: tuple[int, ...] | None = None,
+                       *,
+                       packed: bool = False) -> torch.Tensor:
+    """Select target ids with request-local C6 head projections.
+
+    ``packed=True`` projects every fixed row once and zeroes inactive lanes
+    instead of one head projection and vocab exchange per active lane.
+    """
     if hidden.ndim != 2:
         raise ValueError("target hidden states must be a two-dimensional tensor")
     rows = hidden.shape[0]
@@ -301,6 +307,12 @@ def _target_greedy_ids(program,
             previous_lane = lane
         active_lanes = host_active_lanes
 
+    if packed:
+        ids = vocab_parallel_argmax(program._head_projection(hidden), program.tp_rank, program.all_gather)
+        lane_active = torch.zeros((capacity, ), dtype=torch.bool)
+        lane_active[list(active_lanes)] = True
+        row_active = lane_active.repeat_interleave(_TARGET_QUERY_BUCKET).to(hidden.device, non_blocking=True)
+        return torch.where(row_active, ids.to(torch.int64), torch.zeros_like(ids, dtype=torch.int64))
     target_ids = torch.zeros((rows, ), dtype=torch.int64, device=hidden.device)
     for lane in active_lanes:
         start = lane * _TARGET_QUERY_BUCKET
@@ -644,6 +656,10 @@ class DSparkPackedTargetStages:
         self.execution_buckets = (self.batch_capacity,)
         self.query_bucketing = False
         self.ragged_compressor = False
+        # Opt-in batch-wide target mHC/MoE/finish/head (no per-lane loops).
+        self.packed_lane_math = False
+        # Opt-in expert-grouped MoE inside packed lane math.
+        self.packed_grouped_moe = False
         self.device_finish = False
         # Opt-in stable (N,B) snapshot storage; None keeps the legacy snapshot.
         self.device_owner_layout = False
@@ -747,6 +763,38 @@ class DSparkPackedTargetStages:
         self.query_bucketing = enabled
         self.query_buckets = tuple(buckets)
 
+    def configure_packed_lane_math(self, enabled, grouped_moe=False):
+        """Run target mHC/MoE/finish/head once over all lanes (default off).
+
+        Replaces the canonical full-capacity stage before warmup so every
+        execution bucket and query stage is built with the same option.
+        ``grouped_moe`` additionally groups the routed experts by expert.
+        """
+        from vllm_gaudi.models.deepseek_v41_batch_target_program import DSparkTargetStage
+
+        if type(enabled) is not bool:
+            raise TypeError("dsv41_dspark_target_packed_lane_math must be a boolean")
+        if type(grouped_moe) is not bool:
+            raise TypeError("dsv41_dspark_target_grouped_moe must be a boolean")
+        if grouped_moe and not enabled:
+            raise ValueError("dsv41_dspark_target_grouped_moe requires dsv41_dspark_target_packed_lane_math")
+        if getattr(self, "observed_query_keys", ()) or getattr(self, "query_stages", {}):
+            raise RuntimeError("target packed lane math must be configured before warmup")
+        if (enabled, grouped_moe) == (getattr(self, "packed_lane_math", False),
+                                      getattr(self, "packed_grouped_moe", False)):
+            return
+        previous = self.stage.compiled
+        extra = {"packed_grouped_moe": True} if grouped_moe else {}
+        stage = DSparkTargetStage(self.program, (6, ) * self.batch_capacity, self.stage_key,
+                                  backend=self._backend, packed_lane_math=enabled, **extra)
+        for name in ("execution_bucket_count", "use_sparse_mla_plan"):
+            if hasattr(previous, name):
+                setattr(stage.compiled, name, getattr(previous, name))
+        self.packed_lane_math = enabled
+        self.packed_grouped_moe = grouped_moe
+        self.stage = stage
+        self.stages = {self.stage_key: stage}
+
     def configure_ragged_compressor(self, enabled):
         from vllm_gaudi.ops.deepseek_v41_target_ragged import validate_target_ragged_compressor
 
@@ -773,6 +821,10 @@ class DSparkPackedTargetStages:
             key = (capacity, query_rows)
             if key not in self.query_stages:
                 ragged = {"ragged_compressor": True} if getattr(self, "ragged_compressor", False) else {}
+                if getattr(self, "packed_lane_math", False):
+                    ragged["packed_lane_math"] = True
+                if getattr(self, "packed_grouped_moe", False):
+                    ragged["packed_grouped_moe"] = True
                 stage = DSparkTargetStage(
                     self.program, (6, ) * capacity, tuple(range(capacity)), backend=self._backend,
                     state_capacity=self.batch_capacity, **ragged)
@@ -786,9 +838,12 @@ class DSparkPackedTargetStages:
             return self.stage
         key = tuple(range(capacity))
         if key not in self.stages:
+            packed = {"packed_lane_math": True} if getattr(self, "packed_lane_math", False) else {}
+            if getattr(self, "packed_grouped_moe", False):
+                packed["packed_grouped_moe"] = True
             stage = DSparkTargetStage(
                 self.program, (6,) * capacity, key, backend=self._backend,
-                state_capacity=self.batch_capacity,
+                state_capacity=self.batch_capacity, **packed,
             )
             stage.compiled.execution_bucket_count = len(self.execution_buckets)
             stage.compiled.use_sparse_mla_plan = False
@@ -847,7 +902,10 @@ class DSparkPackedTargetStages:
             hidden, aux = stage(self.hidden_seed[:rows], self.pre_mix_seed[:rows], batch, engram_rows)
             if profile is not None:
                 profile.mark("target.head_projection")
-            target_ids = _target_greedy_ids(self.program, hidden, batch.host_active_lanes)
+            if getattr(self, "packed_lane_math", False):
+                target_ids = _target_greedy_ids(self.program, hidden, batch.host_active_lanes, packed=True)
+            else:
+                target_ids = _target_greedy_ids(self.program, hidden, batch.host_active_lanes)
             if compact:
                 expanded_ids = torch.zeros((self.batch_capacity, 6), dtype=target_ids.dtype, device=self.device)
                 expanded_ids.index_copy_(0, source_indices, target_ids.reshape(execution_capacity, 6)[:active_count])

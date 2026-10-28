@@ -669,6 +669,16 @@ qualification before performance claims:
 | `dsv41_dspark_fused_target_restore` | `false` | Restore the target accepted prefix inside the packed draft transaction graph; requires the device owner layout |
 | `dsv41_dspark_draft_packed_inputs` | `false` | Upload the per-round draft control, proposal, slot, activity, sidecar and lane inputs through three fixed typed host-to-device copies |
 | `dsv41_dspark_separate_query_pass` | `false` | Exclude separate draft input rows from the synchronous scheduler admission budget |
+| `dsv41_dspark_target_packed_lane_math` | `false` | Run target mHC, FFN norm, MoE, output projection, final norm and vocabulary head once over all fixed target rows instead of once per active lane |
+
+Packed target lane math keeps the packed target attention call and replaces
+the per-lane C6 mHC/norm/MoE/output-finish loop with one pass over all
+fixed target rows, so per-layer launches and tensor-parallel reductions no
+longer scale with the active request count. It uses the row-count dispatch of
+the large-row mHC operators and the request-batch fused N256 FP8 expert body
+in tiles of at most 64 rows. Results are not bit-identical to the C6 lane
+path; inactive rows are masked exactly as before. Output qualification is
+still open, so treat it as a diagnostic option.
 
 Query compaction preserves the masked compressor, mHC/MoE, Engram, output
 projection, auxiliary states and verification layout. It is not full target

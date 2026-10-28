@@ -1759,6 +1759,31 @@ class PagedCSA2Attention(FusedCompressorInput, FusedQKVInput, nn.Module):
         )
         return torch.where(active[:, None], result, torch.zeros_like(result))
 
+    def project_output_target_rows(self, output, positions):
+        """Inverse RoPE and wo_a/wo_b for any packed target row count.
+
+        Packed target lane math uses this once for all ``6*B`` rows instead
+        of one six-row finish per active lane.  RoPE keeps the request-batch
+        native operator (64-row chunks), so each row has the same rotary
+        arithmetic as the lane path; the output projection uses the row-count
+        dispatch of an ordinary prompt chunk.  Returns the TP-partial rows.
+        """
+        output = self._rope(output, positions.clamp_min(0), inverse=True, request_batch=True)
+        output = output.reshape(-1, self.groups, self.heads // self.groups * 512)
+        return self.project_output_consumer(self.project_output(output))
+
+    def reduce_output_target_rows(self, partial, active):
+        """Reduce packed target output rows once and apply the row-owner mask.
+
+        Uses the six-row native reduction arithmetic for every row count (see
+        ``ordered_rows_reduce``); the generic all-reduce would round rows by
+        their buffer offset.
+        """
+        from vllm_gaudi.ops.deepseek_v41_ordered_peer_sum import ordered_rows_reduce
+
+        result = ordered_rows_reduce(partial, self.reduce, self.gather, self.tensor_parallel_size)
+        return torch.where(active[:, None], result, torch.zeros_like(result))
+
     def _finish_projected_output(self, output, ready_outputs=(), *, decode=False, deferred_output=False):
         """Consume an already inverse-rotated and wo_a-projected row."""
         partial = self.project_output_consumer(output)
